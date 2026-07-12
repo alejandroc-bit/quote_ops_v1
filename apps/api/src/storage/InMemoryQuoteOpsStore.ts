@@ -3,6 +3,7 @@ import {
   buildApprovalEnvelope,
   summarizeWorkflowRun,
   type ApplianceHeartbeat,
+  type AgentRun,
   type ApprovalDecision,
   type ApprovalEnvelope,
   type QuoteOpsStore,
@@ -19,6 +20,8 @@ export function createInMemoryQuoteOpsStore(): QuoteOpsStore {
   const workflowRuns = new Map<string, StoredWorkflowRun>();
   const approvalDecisions = new Map<string, ApprovalDecision>();
   const heartbeats: ApplianceHeartbeat[] = [];
+  const agentRuns = new Map<string, AgentRun>();
+  const agentSteps = new Map<string, import("./QuoteOpsStore.js").StepEvent[]>();
 
   return {
     async saveWorkflowRun(run) {
@@ -79,6 +82,49 @@ export function createInMemoryQuoteOpsStore(): QuoteOpsStore {
     },
     async listHeartbeats() {
       return [...heartbeats];
+    },
+    async createRun(run) {
+      const now = new Date().toISOString();
+      agentRuns.set(run.run_id, { ...run, created_at: now, updated_at: now });
+    },
+    async updateRunStatus(runId, status, summary) {
+      const current = agentRuns.get(runId);
+      if (!current) throw new Error(`agent run not found: ${runId}`);
+      agentRuns.set(runId, {
+        ...current,
+        status,
+        summary,
+        updated_at: new Date().toISOString()
+      });
+    },
+    async appendStep(step) {
+      const steps = agentSteps.get(step.run_id) ?? [];
+      if (steps.some((candidate) => candidate.seq === step.seq)) {
+        throw new Error(`duplicate quote step sequence: ${step.run_id}:${step.seq}`);
+      }
+      agentSteps.set(step.run_id, [...steps, structuredClone(step)]);
+    },
+    async listRuns(limit = 50) {
+      return Array.from(agentRuns.values())
+        .sort((left, right) => right.updated_at.localeCompare(left.updated_at))
+        .slice(0, Math.max(1, Math.min(200, Math.floor(limit))));
+    },
+    async getRun(runId) {
+      return agentRuns.get(runId) ?? null;
+    },
+    async getSteps(runId) {
+      return [...(agentSteps.get(runId) ?? [])].sort((left, right) => left.seq - right.seq);
+    },
+    async claimRunForResume(runId) {
+      const current = agentRuns.get(runId);
+      if (!current || current.status !== "waiting_approval") return false;
+      agentRuns.set(runId, {
+        ...current,
+        status: "running",
+        summary: "Approval resume claimed",
+        updated_at: new Date().toISOString()
+      });
+      return true;
     }
   };
 }

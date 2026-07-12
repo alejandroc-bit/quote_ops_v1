@@ -5,11 +5,32 @@ import {
   buildRfqFromEmail,
   RfqExtractionError,
   runMailboxIntakeOnce,
+  parseIntakeEmailMessage,
   xlsxToDraftLanes,
   type IntakeEmail,
   type MailboxOutcome,
   type MailboxSource
 } from "../src/index";
+
+it("preserves RFC Message-ID and References separately from the mailbox UID", async () => {
+  const parsed = await parseIntakeEmailMessage(
+    "uid-77",
+    Buffer.from([
+      "From: Buyer <buyer@example.com>",
+      "To: quotes@example.com",
+      "Subject: Freight quote",
+      "Message-ID: <rfq-123@example.com>",
+      "References: <older@example.com>",
+      "Date: Sun, 12 Jul 2026 12:00:00 +0000",
+      "",
+      "Please quote this lane"
+    ].join("\r\n"))
+  );
+
+  expect(parsed.message_id).toBe("uid-77");
+  expect(parsed.rfc_message_id).toBe("<rfq-123@example.com>");
+  expect(parsed.references).toEqual(["<older@example.com>"]);
+});
 
 const baseProfile = {
   payload_capacity_kg: 24000,
@@ -179,6 +200,56 @@ class FakeMailbox implements MailboxSource {
 }
 
 describe("runMailboxIntakeOnce", () => {
+  it("invokes the new graph runtime directly when it is injected", async () => {
+    const invoked: unknown[] = [];
+    let licenseChecks = 0;
+    const mailbox = new FakeMailbox({ "msg-graph": email() });
+    const result = await runMailboxIntakeOnce({
+      env: { QUOTEOPS_CLIENT_ID: "cliente-demo" } as NodeJS.ProcessEnv,
+      fetch: (async () => { throw new Error("network should not be used"); }) as typeof fetch,
+      manifest,
+      mailbox,
+      graphRuntime: {
+        invoke: async (input) => {
+          invoked.push(input);
+          return { run_id: input.run_id } as never;
+        }
+      },
+      authorizeGraphRun: async () => { licenseChecks += 1; },
+      log: () => undefined
+    });
+
+    expect(result.processed).toEqual(["msg-graph"]);
+    expect(invoked).toEqual([
+      expect.objectContaining({
+        channel: "email",
+        message: expect.objectContaining({ message_id: "msg-1" })
+      })
+    ]);
+    expect(mailbox.finished["msg-graph"]).toBe("processed");
+    expect(licenseChecks).toBe(1);
+  });
+
+  it("fails closed before graph execution when mailbox licensing fails", async () => {
+    let invokes = 0;
+    const mailbox = new FakeMailbox({ "msg-unlicensed": email() });
+    await expect(
+      runMailboxIntakeOnce({
+        env: { QUOTEOPS_CLIENT_ID: "cliente-demo" } as NodeJS.ProcessEnv,
+        manifest,
+        mailbox,
+        graphRuntime: {
+          invoke: async () => { invokes += 1; return {} as never; }
+        },
+        authorizeGraphRun: async () => { throw new Error("appliance_locked:license_file_missing"); },
+        log: () => undefined
+      })
+    ).rejects.toThrow("appliance_locked:license_file_missing");
+
+    expect(invokes).toBe(0);
+    expect(mailbox.finished["msg-unlicensed"]).toBe("error");
+  });
+
   it("processes authorized senders and ignores unauthorized domains", async () => {
     const posted: unknown[] = [];
     const mailbox = new FakeMailbox({

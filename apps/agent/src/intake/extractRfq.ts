@@ -10,6 +10,8 @@ export type IntakeAttachment = {
 
 export type IntakeEmail = {
   message_id: string;
+  rfc_message_id?: string | null;
+  references?: string[];
   from_name: string;
   from_email: string;
   subject: string;

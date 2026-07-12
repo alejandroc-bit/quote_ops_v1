@@ -7,7 +7,9 @@ import {
   runQuoteWorkflow,
   type QuoteWorkflowInput,
   type QuoteWorkflowState,
-  type QuoteWorkflowTools
+  type QuoteWorkflowTools,
+  type QuoteAgentRuntime,
+  type AgentGraphResult
 } from "@quoteops/agent";
 import type { Rfq } from "@quoteops/contracts";
 import {
@@ -28,6 +30,7 @@ import type { QuoteManifest } from "@quoteops/quote-core";
 import { createInMemoryQuoteOpsStore } from "./storage/InMemoryQuoteOpsStore.js";
 import { createQuoteOpsStore } from "./storage/createQuoteOpsStore.js";
 import {
+  assertApplianceLicensed,
   applianceLockedResponse,
   type ApplianceLicenseState
 } from "./activation/applianceLicense.js";
@@ -53,6 +56,7 @@ export type QuoteOpsApiDependencies = {
   defaultTools: QuoteWorkflowTools;
   defaultManifest: Promise<QuoteManifest | null>;
   store: QuoteOpsStore;
+  graphRuntime: Pick<QuoteAgentRuntime, "resume">;
 };
 
 export type SetupStepId =
@@ -81,6 +85,7 @@ export function createQuoteOpsApi(
   const app = express();
   const store = dependencies.store ?? createQuoteOpsStore();
   const workflowRunner = dependencies.workflowRunner ?? runQuoteWorkflow;
+  const graphRuntime = dependencies.graphRuntime;
   const defaultTools = dependencies.defaultTools ?? createApplianceWorkflowTools();
   // a function, not a cached promise, so the mtime-aware loader re-reads the
   // manifest after the onboarding CLI adds a vehicle profile (no restart needed)
@@ -161,6 +166,59 @@ export function createQuoteOpsApi(
 
   app.get("/api/rfqs", asyncRoute(async (_req, res) => {
     res.json({ items: await store.listWorkflowRuns() });
+  }));
+
+  app.get("/api/runs", asyncRoute(async (req, res) => {
+    const rawLimit = Array.isArray(req.query.limit) ? req.query.limit[0] : req.query.limit;
+    const parsedLimit = rawLimit === undefined ? 50 : Number(rawLimit);
+    const limit = Number.isFinite(parsedLimit)
+      ? Math.max(1, Math.min(200, Math.floor(parsedLimit)))
+      : 50;
+    res.json({ runs: await store.listRuns(limit) });
+  }));
+
+  app.get("/api/runs/:runId", asyncRoute(async (req, res) => {
+    const runId = getRunIdParam(req, res);
+    if (!runId) return;
+    const [run, steps] = await Promise.all([store.getRun(runId), store.getSteps(runId)]);
+    if (!run) {
+      res.status(404).json({ error: "run_not_found" });
+      return;
+    }
+    res.json({ run, steps });
+  }));
+
+  app.get("/api/runs/:runId/stream", asyncRoute(async (req, res) => {
+    const runId = getRunIdParam(req, res);
+    if (!runId) return;
+    const initialRun = await store.getRun(runId);
+    if (!initialRun) {
+      res.status(404).json({ error: "run_not_found" });
+      return;
+    }
+
+    res.status(200);
+    res.setHeader("content-type", "text/event-stream; charset=utf-8");
+    res.setHeader("cache-control", "no-cache, no-transform");
+    res.setHeader("connection", "keep-alive");
+    res.flushHeaders();
+    let lastSeq = 0;
+    let closed = false;
+    req.on("close", () => { closed = true; });
+    while (!closed) {
+      const [run, steps] = await Promise.all([store.getRun(runId), store.getSteps(runId)]);
+      for (const step of steps.filter((candidate) => candidate.seq > lastSeq)) {
+        res.write(`event: step\ndata: ${JSON.stringify(step)}\n\n`);
+        lastSeq = Math.max(lastSeq, step.seq);
+      }
+      if (!run || run.status === "done" || run.status === "error") {
+        res.write(`event: done\ndata: ${JSON.stringify({ run_id: runId, status: run?.status ?? "error" })}\n\n`);
+        res.end();
+        return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 1_000));
+    }
+    if (!res.writableEnded) res.end();
   }));
 
   app.get("/api/rfqs/:runId", asyncRoute(async (req, res) => {
@@ -276,6 +334,37 @@ export function createQuoteOpsApi(
   app.post("/api/approvals/:runId/decision", asyncRoute(async (req, res) => {
     const runId = getRunIdParam(req, res);
     if (!runId) return;
+
+    const agentRun = await store.getRun(runId);
+    if (agentRun) {
+      if (agentRun.status !== "waiting_approval") {
+        res.status(409).json({ error: "run_not_waiting_approval" });
+        return;
+      }
+      const manifest = await resolveManifest();
+      const clientId = manifest?.client_id ?? optionalEnv(process.env.QUOTEOPS_CLIENT_ID) ?? null;
+      if (!(await enforceApplianceLicense({ env: process.env, clientId, res }))) return;
+      if (!graphRuntime) {
+        res.status(409).json({ error: "graph_runtime_unavailable" });
+        return;
+      }
+      const decision = parseApprovalDecision(req.body);
+      if (!(await store.claimRunForResume(runId))) {
+        res.status(409).json({ error: "run_not_waiting_approval" });
+        return;
+      }
+      const result: AgentGraphResult = await graphRuntime.resume(runId, {
+        action: decision.action,
+        ...(decision.rate_mxn !== undefined ? { rate_mxn: decision.rate_mxn } : {})
+      }, { alreadyClaimed: true });
+      await store.saveApprovalDecision(runId, decision);
+      res.json({
+        run_id: runId,
+        approval_decision: decision,
+        response_sent: result.response_sent
+      });
+      return;
+    }
 
     const run = await store.getWorkflowRun(runId);
     if (!run) {
@@ -838,6 +927,21 @@ async function buildApplianceLicenseState({
       reason: message.includes("expired") ? "license_expired" : "license_invalid"
     };
   }
+}
+
+export async function assertApplianceLicenseForClient({
+  env,
+  clientId
+}: {
+  env: NodeJS.ProcessEnv;
+  clientId: string | null;
+}): Promise<void> {
+  const state = await buildApplianceLicenseState({
+    env,
+    clientId,
+    installationId: optionalEnv(env.QUOTEOPS_INSTALLATION_ID) ?? null
+  });
+  assertApplianceLicensed(state);
 }
 
 async function hasConfiguredSecrets(env: NodeJS.ProcessEnv): Promise<boolean> {

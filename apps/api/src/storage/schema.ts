@@ -31,6 +31,26 @@ create table if not exists heartbeats (
   received_at timestamptz not null
 );
 
+create table if not exists quote_runs (
+  run_id text primary key,
+  channel text not null check (channel in ('email', 'whatsapp')),
+  status text not null check (status in ('running', 'waiting_approval', 'done', 'error')),
+  summary text not null,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+create table if not exists quote_run_steps (
+  run_id text not null references quote_runs(run_id) on delete cascade,
+  seq integer not null,
+  node text not null,
+  status text not null check (status in ('start', 'end', 'error')),
+  summary text not null,
+  data jsonb,
+  ts timestamptz not null,
+  primary key (run_id, seq)
+);
+
 create table if not exists schema_migrations (
   migration_id text primary key,
   checksum text not null,
@@ -109,4 +129,6 @@ create table if not exists knowledge_ingestion_jobs (
 
 create index if not exists workflow_runs_client_updated_idx on workflow_runs(client_id, updated_at desc);
 create index if not exists heartbeats_client_received_idx on heartbeats(client_id, received_at desc);
+create index if not exists quote_runs_updated_idx on quote_runs(updated_at desc);
+create index if not exists quote_run_steps_run_seq_idx on quote_run_steps(run_id, seq);
 `;

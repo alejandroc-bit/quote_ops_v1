@@ -1,5 +1,6 @@
 import type { AuditEvent } from "@quoteops/audit";
 import type { Rfq } from "@quoteops/contracts";
+import type { TmsCanonicalAvailabilityZone, TmsCanonicalUnit } from "@quoteops/contracts";
 import type { CriteriaNode, RetrievedCriteria } from "@quoteops/criteria";
 import type {
   HistoricalContext,
@@ -49,6 +50,10 @@ export type QuoteWorkflowTools = {
   }): Promise<QuoteWritebackResult>;
   /** Optional: fresh unit yields from the TMS for the manifest overlay. */
   getUnitPerformance?(): Promise<Array<{ unit_type: string; kpl_yield: number; real_cost_per_km: number }>>;
+  /** Optional: canonical TMS inventory used as grounded classification context. */
+  getUnits?(): Promise<TmsCanonicalUnit[]>;
+  /** Optional: deterministic origin availability used by bulk operability validation. */
+  getAvailabilityZones?(): Promise<TmsCanonicalAvailabilityZone[]>;
   /** Optional: retrieve commercial-criteria excerpts from the local vector store. */
   retrieveKnowledge?(
     query: string,

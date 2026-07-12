@@ -2,6 +2,7 @@ import { readFile } from "node:fs/promises";
 import { parse as parseYaml } from "yaml";
 import { loadAgentRuntimeConfig, type AgentRuntimeConfig } from "@quoteops/connectors";
 import type { QuoteManifest } from "@quoteops/quote-core";
+import type { QuoteAgentRuntime } from "../graph/runtime.js";
 import {
   buildRfqFromEmail,
   RfqExtractionError,
@@ -22,6 +23,8 @@ export type MailboxIntakeOptions = {
   mailbox?: MailboxSource;
   now?: () => Date;
   log?: (message: string) => void;
+  graphRuntime?: Pick<QuoteAgentRuntime, "invoke">;
+  authorizeGraphRun?: () => Promise<void>;
 };
 
 export type MailboxIntakeResult = {
@@ -71,6 +74,18 @@ export async function runMailboxIntakeOnce(
 
       try {
         const rfqId = generateRfqId(now());
+        if (options.graphRuntime) {
+          if (!options.authorizeGraphRun) {
+            throw new Error("appliance_locked:mailbox_license_guard_missing");
+          }
+          await options.authorizeGraphRun();
+          const runId = `run-${rfqId.toLowerCase()}`;
+          await options.graphRuntime.invoke({ run_id: runId, channel: "email", message: email });
+          await mailbox.finish(uid, "processed");
+          result.processed.push(uid);
+          log(`processed ${uid} as ${runId} through LangGraph`);
+          continue;
+        }
         const rfq = await buildRfqFromEmail({ email, manifest, model, rfqId });
         const response = await fetchFn(`${apiUrl}/api/rfqs`, {
           method: "POST",
@@ -108,7 +123,9 @@ export async function runMailboxIntakeOnce(
 }
 
 export async function startMailboxIntake(
-  env: NodeJS.ProcessEnv = process.env
+  env: NodeJS.ProcessEnv = process.env,
+  graphRuntime?: Pick<QuoteAgentRuntime, "invoke">,
+  authorizeGraphRun?: () => Promise<void>
 ): Promise<NodeJS.Timeout | null> {
   const agentConfig = await tryLoadAgentConfig(env);
   const config = agentConfig?.mailbox ?? null;
@@ -123,7 +140,7 @@ export async function startMailboxIntake(
 
   const intervalMs = config.poll_interval_ms;
   const timer = setInterval(() => {
-    runMailboxIntakeOnce({ env }).catch((error) => {
+    runMailboxIntakeOnce({ env, graphRuntime, authorizeGraphRun }).catch((error) => {
       console.error(
         `[mailbox-intake] poll failed: ${error instanceof Error ? error.message : error}`
       );

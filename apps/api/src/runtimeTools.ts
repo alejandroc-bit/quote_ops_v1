@@ -9,6 +9,8 @@ import {
   assertAgentToolAllowed,
   CachedTmsAdapter,
   createRedisCache,
+  createSqlCacheFromEnv,
+  createTieredCache,
   createTmsAdapterFromConfig,
   FileImportTmsAdapter,
   loadOpenRouterApiKey,
@@ -19,13 +21,16 @@ import {
   SakbeRouteAdapter,
   type AgentRuntimeConfig,
   type HistoricalSearchQuery,
+  type KeyValueCache,
   type TmsAdapter
 } from "@quoteops/connectors";
+import { z } from "zod";
 
 export type ApplianceWorkflowToolsOptions = {
   env?: NodeJS.ProcessEnv;
   now?: () => Date;
   fetch?: typeof fetch;
+  cache?: KeyValueCache | null;
 };
 
 const DEFAULT_AGENT_CONFIG_PATH = "/opt/quoteops/connectors/agent/agent-config.yaml";
@@ -39,6 +44,7 @@ export function createApplianceWorkflowTools(
   const fetchFn = options.fetch ?? fetch;
   let agentConfigPromise: Promise<AgentRuntimeConfig> | null = null;
   let tmsAdapterPromise: Promise<TmsAdapter> | null = null;
+  let cachePromise: Promise<KeyValueCache | null> | null = null;
   const routeAdapter = new SakbeRouteAdapter({
     cachePath: env.QUOTEOPS_ROUTE_CACHE_PATH || DEFAULT_ROUTE_CACHE_PATH,
     cacheMode: parseSakbeCacheMode(env.QUOTEOPS_SAKBE_CACHE_MODE),
@@ -66,8 +72,15 @@ export function createApplianceWorkflowTools(
   }
 
   async function tmsAdapter(): Promise<TmsAdapter> {
-    tmsAdapterPromise ??= createRuntimeTmsAdapter(env, fetchFn);
+    tmsAdapterPromise ??= createRuntimeTmsAdapter(env, fetchFn, await runtimeCache());
     return tmsAdapterPromise;
+  }
+
+  async function runtimeCache(): Promise<KeyValueCache | null> {
+    cachePromise ??= options.cache !== undefined
+      ? Promise.resolve(options.cache)
+      : createRuntimeCache(env);
+    return cachePromise;
   }
 
   return {
@@ -77,7 +90,21 @@ export function createApplianceWorkflowTools(
         toolName: "route.resolve"
       });
 
-      return routeAdapter.resolveRoute(input);
+      const cache = await runtimeCache();
+      const key = routeCacheKey(input);
+      if (cache) {
+        const cached = await cache.get(key);
+        if (cached) {
+          try {
+            return routeEvidenceSchema.parse(JSON.parse(cached));
+          } catch {
+            // Invalid external cache data is ignored; live/provider resolution remains authoritative.
+          }
+        }
+      }
+      const resolved = await routeAdapter.resolveRoute(input);
+      await cache?.set(key, JSON.stringify(resolved), 7 * 24 * 60 * 60);
+      return resolved;
     },
     searchHistorical: async (input) => {
       assertAgentToolAllowed({
@@ -160,6 +187,14 @@ export function createApplianceWorkflowTools(
       });
       return (await tmsAdapter()).getUnitPerformance();
     },
+    getUnits: async () => {
+      assertAgentToolAllowed({ config: await agentConfig(), toolName: "tms.searchHistorical" });
+      return (await tmsAdapter()).getUnits();
+    },
+    getAvailabilityZones: async () => {
+      assertAgentToolAllowed({ config: await agentConfig(), toolName: "tms.searchHistorical" });
+      return (await tmsAdapter()).getAvailabilityZones();
+    },
     retrieveKnowledge: async (query, clientId) => {
       try {
         assertAgentToolAllowed({ config: await agentConfig(), toolName: "knowledge.search" });
@@ -212,10 +247,11 @@ export async function resolveOverlaidManifest(
 
 async function createRuntimeTmsAdapter(
   env: NodeJS.ProcessEnv,
-  fetchFn?: typeof fetch
+  fetchFn?: typeof fetch,
+  cache?: KeyValueCache | null
 ): Promise<TmsAdapter> {
   const base = await createBaseTmsAdapter(env, fetchFn);
-  return withRedisCache(base, env);
+  return cache ? new CachedTmsAdapter(base, cache) : base;
 }
 
 async function createBaseTmsAdapter(
@@ -241,13 +277,43 @@ async function createBaseTmsAdapter(
   });
 }
 
-// Cache TMS reads in Redis when configured; a missing or unreachable Redis
-// silently leaves the adapter uncached rather than blocking quoting.
-async function withRedisCache(adapter: TmsAdapter, env: NodeJS.ProcessEnv): Promise<TmsAdapter> {
-  const url = env.REDIS_URL?.trim();
-  if (!url) return adapter;
-  const cache = await createRedisCache(url);
-  return cache ? new CachedTmsAdapter(adapter, cache) : adapter;
+// SQL is the durable client-owned tier; optional Redis is the hot tier.
+// Either cache can fail closed to pass-through without blocking quote execution.
+async function createRuntimeCache(env: NodeJS.ProcessEnv): Promise<KeyValueCache | null> {
+  const [sql, redis] = await Promise.all([
+    createSqlCacheFromEnv(env),
+    env.REDIS_URL?.trim() ? createRedisCache(env.REDIS_URL.trim()) : Promise.resolve(null)
+  ]);
+  if (redis && sql) return createTieredCache(redis, sql);
+  return redis ?? sql;
+}
+
+const routeEvidenceSchema = z
+  .object({
+    status: z.enum(["resolved", "missing", "failed"]),
+    source: z.enum(["sakbe", "manual", "tms", "mock"]),
+    km_loaded: z.number().nullable(),
+    estimated_minutes: z.number().nullable(),
+    tolls_mxn: z.number().nullable(),
+    requires_return_route: z.boolean(),
+    km_return: z.number().nullable().optional(),
+    return_tolls_mxn: z.number().nullable().optional()
+  })
+  .strict();
+
+function routeCacheKey(input: QuoteCoreInput["rfq"]): string {
+  return [
+    "sakbe-route-v1",
+    input.origin.city,
+    input.origin.state,
+    input.destination.city,
+    input.destination.state,
+    input.vehicle_profile_id,
+    input.service.route_policy,
+    input.service.return_policy
+  ]
+    .map((part) => String(part).trim().toLowerCase())
+    .join(":");
 }
 
 const manifestCache = new Map<string, { mtimeMs: number; manifest: QuoteManifest | null }>();

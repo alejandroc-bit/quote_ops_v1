@@ -63,6 +63,29 @@ export type ApplianceHeartbeat = {
   received_at: string;
 };
 
+export type AgentRunStatus = "running" | "waiting_approval" | "done" | "error";
+
+export type AgentRun = {
+  run_id: string;
+  channel: "email" | "whatsapp";
+  status: AgentRunStatus;
+  summary: string;
+  created_at: string;
+  updated_at: string;
+};
+
+export type CreateAgentRun = Pick<AgentRun, "run_id" | "channel" | "status" | "summary">;
+
+export type StepEvent = {
+  run_id: string;
+  seq: number;
+  node: string;
+  status: "start" | "end" | "error";
+  summary: string;
+  data?: unknown;
+  ts: string;
+};
+
 export type QuoteOpsStore = {
   saveWorkflowRun(run: QuoteWorkflowState): Promise<void>;
   getWorkflowRun(runId: string): Promise<QuoteWorkflowState | null>;
@@ -72,6 +95,13 @@ export type QuoteOpsStore = {
   getApprovalDecision(runId: string): Promise<ApprovalDecision | null>;
   saveHeartbeat(heartbeat: ApplianceHeartbeat): Promise<void>;
   listHeartbeats(): Promise<ApplianceHeartbeat[]>;
+  createRun(run: CreateAgentRun): Promise<void>;
+  updateRunStatus(runId: string, status: AgentRunStatus, summary: string): Promise<void>;
+  appendStep(step: StepEvent): Promise<void>;
+  listRuns(limit?: number): Promise<AgentRun[]>;
+  getRun(runId: string): Promise<AgentRun | null>;
+  getSteps(runId: string): Promise<StepEvent[]>;
+  claimRunForResume(runId: string): Promise<boolean>;
 };
 
 export type WorkflowRunProjectionOptions = {

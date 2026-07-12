@@ -1,19 +1,16 @@
 import { createServer, type ServerResponse } from "node:http";
-import { startMailboxIntake } from "./intake/mailboxPoller.js";
+import pg from "pg";
+import { startSentinel } from "./sentinel/index.js";
 
 const port = Number(process.env.PORT || 8081);
 const startedAt = new Date().toISOString();
-let mailboxIntakeActive = false;
-
-void startMailboxIntake()
-  .then((timer) => {
-    mailboxIntakeActive = timer !== null;
-  })
-  .catch((error) => {
-    console.error(
-      `[mailbox-intake] failed to start: ${error instanceof Error ? error.message : error}`
-    );
-  });
+let sentinelActive = false;
+if (process.env.DATABASE_URL) {
+  const { Pool } = pg;
+  const db = new Pool({ connectionString: process.env.DATABASE_URL });
+  startSentinel({ db, env: process.env });
+  sentinelActive = true;
+}
 
 const server = createServer((req, res) => {
   if (req.url === "/health") {
@@ -28,7 +25,7 @@ const server = createServer((req, res) => {
   sendJson(res, 200, {
     ok: true,
     service: "quoteops-agent",
-    mode: mailboxIntakeActive ? "mailbox-intake" : "idle-runtime",
+    mode: sentinelActive ? "sentinel" : "idle-runtime",
     started_at: startedAt
   });
 });

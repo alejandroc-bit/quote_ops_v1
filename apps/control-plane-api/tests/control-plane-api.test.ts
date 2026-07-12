@@ -1,22 +1,24 @@
-import { type Server } from "node:http";
-import { type AddressInfo } from "node:net";
-import { mkdtemp, rm } from "node:fs/promises";
+import { IncomingMessage, ServerResponse } from "node:http";
+import { Duplex } from "node:stream";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { createControlPlaneApi, type ControlPlaneStore } from "../src/index";
 import { createFileControlPlaneStore } from "../src/stores/fileStore";
 import {
+  createInMemoryTenantDataStore,
+  type TenantDataStore
+} from "../src/tenantData";
+import {
   generateLicenseKeyPair,
   verifyInstallationLicense,
   type InstallationLicense
 } from "@quoteops/shared";
 
-let server: Server | null = null;
 const tempDirs: string[] = [];
 
 afterEach(async () => {
-  await closeActiveServer();
   await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
 });
 
@@ -94,14 +96,11 @@ describe("minimal control-plane API", () => {
 
   it("fails closed on admin routes without a valid Supabase session", async () => {
     const api = await startApi();
-    const unauthorized = await fetch(`${api.baseUrl}/api/admin/clients`);
+    const unauthorized = await api.get("/api/admin/clients", null);
     expect(unauthorized.status).toBe(401);
 
-    await closeActiveServer();
     const disabledApi = await startApi({ verifyAdminToken: null });
-    const disabled = await fetch(`${disabledApi.baseUrl}/api/admin/clients`, {
-      headers: { authorization: `Bearer ${TEST_ADMIN_TOKEN}` }
-    });
+    const disabled = await disabledApi.get("/api/admin/clients");
     expect(disabled.status).toBe(503);
   });
 
@@ -245,6 +244,157 @@ describe("minimal control-plane API", () => {
     expect(rfqLeak.status).toBe(400);
   });
 
+  it("ingests a strict aggregate sentinel report for the token tenant", async () => {
+    const tenantData = createInMemoryTenantDataStore({
+      tokens: [{ token: "installation-token", tenant_id: "tenant-a" }]
+    });
+    const api = await startApi({ tenantData });
+
+    const accepted = await api.post(
+      "/api/sentinel/reports",
+      {
+        installation_id: "tenant-a-prod-001",
+        week_start: "2026-07-06",
+        body_md: "# Weekly sentinel\n\nNo operational details.",
+        stats: { runs: 12, errors: 1, interrupts: 2, avg_node_ms: 145.5 }
+      },
+      "Bearer installation-token"
+    );
+
+    expect(accepted.status).toBe(201);
+    expect(tenantData.sentinelReports).toEqual([
+      {
+        tenant_id: "tenant-a",
+        installation_id: "tenant-a-prod-001",
+        week_start: "2026-07-06",
+        body_md: "# Weekly sentinel\n\nNo operational details.",
+        stats: { runs: 12, errors: 1, interrupts: 2, avg_node_ms: 145.5 },
+        status: "new"
+      }
+    ]);
+
+    const unauthorized = await api.post(
+      "/api/sentinel/reports",
+      {
+        installation_id: "tenant-a-prod-001",
+        week_start: "2026-07-06",
+        body_md: "# Weekly sentinel",
+        stats: { runs: 1, errors: 0, interrupts: 0, avg_node_ms: 10 }
+      },
+      "Bearer wrong-token"
+    );
+    expect(unauthorized.status).toBe(401);
+
+    const detailLeak = await api.post(
+      "/api/sentinel/reports",
+      {
+        installation_id: "tenant-a-prod-001",
+        week_start: "2026-07-06",
+        body_md: "# Weekly sentinel",
+        stats: {
+          runs: 1,
+          errors: 0,
+          interrupts: 0,
+          avg_node_ms: 10,
+          customer_email: "customer@example.com"
+        }
+      },
+      "Bearer installation-token"
+    );
+    expect(detailLeak.status).toBe(400);
+  });
+
+  it("upserts strict daily aggregate usage without duplicating retries", async () => {
+    const tenantData = createInMemoryTenantDataStore({
+      tokens: [{ token: "usage-token", tenant_id: "tenant-b" }]
+    });
+    const api = await startApi({ tenantData });
+
+    const first = await api.post(
+      "/api/usage",
+      { day: "2026-07-12", channel: "email", quotes: 5, routes: 8 },
+      "Bearer usage-token"
+    );
+    const retry = await api.post(
+      "/api/usage",
+      { day: "2026-07-12", channel: "email", quotes: 5, routes: 8 },
+      "Bearer usage-token"
+    );
+
+    expect(first.status).toBe(202);
+    expect(retry.status).toBe(202);
+    expect(tenantData.usageEvents.get("tenant-b|2026-07-12|email")).toMatchObject({
+      quotes: 5,
+      routes: 8
+    });
+
+    const detailLeak = await api.post(
+      "/api/usage",
+      {
+        day: "2026-07-12",
+        channel: "email",
+        quotes: 5,
+        routes: 8,
+        route: { origin: "MTY", destination: "QRO" }
+      },
+      "Bearer usage-token"
+    );
+    expect(detailLeak.status).toBe(400);
+  });
+
+  it("returns the latest release and only allowlisted heartbeat settings", async () => {
+    const tenantData = createInMemoryTenantDataStore({
+      tokens: [{ token: "release-token", tenant_id: "tenant-c" }],
+      installations: [
+        {
+          tenant_id: "tenant-c",
+          installation_id: "sync-prod-001",
+          settings: {
+            pricing_model: "profitability",
+            pdf_template: "compact-v2",
+            customer_detail: { name: "must-not-leak" }
+          }
+        }
+      ],
+      releases: [
+        { version: "v1.9.0", notes: "Previous" },
+        { version: "v1.10.0", notes: "Current" }
+      ]
+    });
+    const api = await startApi({
+      tenantData,
+      now: () => new Date("2026-07-12T15:00:00.000Z")
+    });
+    await api.post("/api/admin/clients", {
+      client_id: "SYNC",
+      legal_name: "Sync Client",
+      authorized_email: "ops@sync.example"
+    });
+
+    const heartbeat = await api.post("/api/installations/sync-prod-001/heartbeat", {
+      client_id: "SYNC",
+      ai_key_status: "configured",
+      version: "v1.8.0"
+    });
+    expect(heartbeat.status).toBe(202);
+    expect(heartbeat.body).toMatchObject({
+      latest_version: "v1.10.0",
+      settings: { pricing_model: "profitability", pdf_template: "compact-v2" }
+    });
+    expect(heartbeat.body.settings).not.toHaveProperty("customer_detail");
+    expect(tenantData.installations.get("sync-prod-001")).toMatchObject({
+      version: "v1.8.0",
+      last_heartbeat_at: "2026-07-12T15:00:00.000Z"
+    });
+
+    const latest = await api.get("/api/releases/latest", "Bearer release-token");
+    expect(latest.status).toBe(200);
+    expect(latest.body).toEqual({ version: "v1.10.0", notes: "Current" });
+
+    const anonymous = await api.get("/api/releases/latest", null);
+    expect(anonymous.status).toBe(401);
+  });
+
   it("persists clients and registration tokens in the file store", async () => {
     const dir = await mkdtemp(join(tmpdir(), "quoteops-control-plane-store-"));
     tempDirs.push(dir);
@@ -262,8 +412,6 @@ describe("minimal control-plane API", () => {
       authorized_email: "ops@file.example"
     });
     await firstApi.post("/api/admin/clients/FILE/install-pack", {});
-    await closeActiveServer();
-
     const secondStore = createFileControlPlaneStore(storePath);
     const secondApi = await startApi({
       store: secondStore,
@@ -285,6 +433,34 @@ describe("minimal control-plane API", () => {
   });
 });
 
+describe("Supabase control-plane migration", () => {
+  it("enables RLS on every table with tenant and vendor-admin policies but no anon policy", async () => {
+    const sql = await readFile(
+      new URL("../../../supabase/migrations/0001_control_plane.sql", import.meta.url),
+      "utf8"
+    );
+    const tables = [
+      "tenants",
+      "profiles",
+      "installations",
+      "registration_tokens",
+      "credentials",
+      "usage_events",
+      "sentinel_reports",
+      "releases"
+    ];
+
+    for (const table of tables) {
+      expect(sql).toContain(`alter table public.${table} enable row level security;`);
+      expect(sql).toMatch(new RegExp(`create policy ${table}_[\\s\\S]*?to authenticated`, "i"));
+      expect(sql).toMatch(new RegExp(`create policy ${table}_vendor_all`, "i"));
+    }
+    expect(sql).toContain("where p.user_id = auth.uid() and p.role = 'vendor_admin'");
+    expect(sql).toContain("create policy releases_authenticated_select");
+    expect(sql).not.toMatch(/\bto\s+anon\b/i);
+  });
+});
+
 const TEST_ADMIN_TOKEN = "test-admin-token";
 
 async function startApi(options: {
@@ -294,55 +470,84 @@ async function startApi(options: {
   tokenGenerator?: () => string;
   tokenTtlMinutes?: number;
   store?: ControlPlaneStore;
+  tenantData?: TenantDataStore | null;
 } = {}) {
   const app = createControlPlaneApi({
     controlPlaneUrl: "https://quoteops-control-plane-staging.vercel.app",
     verifyAdminToken: async (token) => (token === TEST_ADMIN_TOKEN ? "ops@e2e.example" : null),
     ...options
   });
-  server = app.listen(0);
-  await new Promise<void>((resolve) => server?.once("listening", resolve));
-  const address = server.address() as AddressInfo;
-  const baseUrl = `http://127.0.0.1:${address.port}`;
 
   return {
-    baseUrl,
-    get(path: string) {
-      return jsonRequest(baseUrl, path);
+    get(path: string, authorization: string | null = `Bearer ${TEST_ADMIN_TOKEN}`) {
+      return directRequest(app, "GET", path, undefined, authorization);
     },
-    post(path: string, body: Record<string, unknown>) {
-      return jsonRequest(baseUrl, path, body);
+    post(
+      path: string,
+      body: Record<string, unknown>,
+      authorization: string | null = `Bearer ${TEST_ADMIN_TOKEN}`
+    ) {
+      return directRequest(app, "POST", path, body, authorization);
     },
     async getText(path: string) {
-      const response = await fetch(`${baseUrl}${path}`);
-      return { status: response.status, text: await response.text() };
+      const response = await directRequest(app, "GET", path, undefined, null);
+      return { status: response.status, text: response.text };
     }
   };
 }
 
-async function closeActiveServer(): Promise<void> {
-  if (!server) return;
-  await new Promise<void>((resolve, reject) => {
-    server?.close((error) => (error ? reject(error) : resolve()));
-  });
-  server = null;
-}
-
-async function jsonRequest(
-  baseUrl: string,
+async function directRequest(
+  app: ReturnType<typeof createControlPlaneApi>,
+  method: "GET" | "POST",
   path: string,
-  body?: Record<string, unknown>
-): Promise<{ status: number; body: Record<string, any> }> {
-  const response = await fetch(`${baseUrl}${path}`, {
-    method: body ? "POST" : "GET",
-    headers: {
-      "content-type": "application/json",
-      authorization: `Bearer ${TEST_ADMIN_TOKEN}`
-    },
-    ...(body ? { body: JSON.stringify(body) } : {})
+  body: Record<string, unknown> | undefined,
+  authorization: string | null
+): Promise<{ status: number; body: Record<string, any>; text: string }> {
+  const payload = body === undefined ? "" : JSON.stringify(body);
+  const socket = new Duplex({
+    read() {},
+    write(_chunk, _encoding, callback) {
+      callback();
+    }
   });
+  const req = new IncomingMessage(socket as never);
+  req.method = method;
+  req.url = path;
+  req.headers = {
+    host: "quoteops-control-plane-staging.vercel.app",
+    ...(payload
+      ? { "content-type": "application/json", "content-length": String(Buffer.byteLength(payload)) }
+      : {}),
+    ...(authorization ? { authorization } : {})
+  };
+
+  const res = new ServerResponse(req);
+  res.assignSocket(socket as never);
+  const chunks: Buffer[] = [];
+  const originalWrite = res.write.bind(res);
+  const originalEnd = res.end.bind(res);
+  res.write = ((chunk: unknown, ...args: unknown[]) => {
+    if (chunk !== undefined && chunk !== null) chunks.push(Buffer.from(chunk as never));
+    return originalWrite(chunk as never, ...(args as never[]));
+  }) as typeof res.write;
+  res.end = ((chunk?: unknown, ...args: unknown[]) => {
+    if (chunk !== undefined && chunk !== null) chunks.push(Buffer.from(chunk as never));
+    return originalEnd(chunk as never, ...(args as never[]));
+  }) as typeof res.end;
+
+  const finished = new Promise<void>((resolve, reject) => {
+    res.once("finish", resolve);
+    res.once("error", reject);
+  });
+  app(req, res);
+  if (payload) req.push(payload);
+  req.push(null);
+  await finished;
+
+  const text = Buffer.concat(chunks).toString("utf8");
   return {
-    status: response.status,
-    body: (await response.json()) as Record<string, any>
+    status: res.statusCode,
+    body: text ? (JSON.parse(text) as Record<string, any>) : {},
+    text
   };
 }

@@ -82,7 +82,8 @@ describe("redact", () => {
 
 describe("collectWeeklyStats", () => {
   it("aggregates runs, errors, interrupts, node averages and drift", async () => {
-    const result = await collectWeeklyStats(fakePool(), SINCE);
+    const pool = fakePool();
+    const result = await collectWeeklyStats(pool, SINCE);
     expect(result.runs).toBe(10);
     expect(result.interrupts).toBe(3);
     expect(result.interrupt_rate).toBeCloseTo(0.3);
@@ -91,6 +92,7 @@ describe("collectWeeklyStats", () => {
     expect(result.avg_node_ms).toEqual({ classify: 2000, quote: 500 });
     // (1000 + 3000 + 500) / 3
     expect(result.avg_node_ms_overall).toBe(1500);
+    expect(pool.query).toHaveBeenCalledWith(expect.stringContaining("waiting_approval"), [SINCE]);
   });
 
   it("redacts error summaries", async () => {

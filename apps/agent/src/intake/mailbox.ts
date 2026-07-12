@@ -63,7 +63,7 @@ export async function openConfiguredMailbox({
   const auth: ImapAuth =
     config.auth === "password"
       ? { user, pass: required(env.MAILBOX_PASSWORD, "MAILBOX_PASSWORD") }
-      : { user, accessToken: await resolveOAuthAccessToken(config, env, fetchFn) };
+      : { user, accessToken: await resolveMailboxOAuthAccessToken(config, env, fetchFn) };
 
   const client = new ImapFlow({ host, port, secure: port === 993, auth, logger: false });
   await client.connect();
@@ -87,25 +87,7 @@ class ImapMailbox implements MailboxSource {
     if (!message || !message.source) {
       throw new Error(`mailbox message ${uid} could not be fetched`);
     }
-    const parsed = await simpleParser(message.source);
-    const fromAddress = parsed.from?.value?.[0];
-    const attachments: IntakeAttachment[] = (parsed.attachments ?? [])
-      .filter((attachment) => attachment.content)
-      .map((attachment) => ({
-        filename: attachment.filename ?? "attachment",
-        mimeType: attachment.contentType ?? "application/octet-stream",
-        content: attachment.content as Buffer
-      }));
-
-    return {
-      message_id: uid,
-      from_name: fromAddress?.name?.trim() || fromAddress?.address || "",
-      from_email: (fromAddress?.address ?? "").trim().toLowerCase(),
-      subject: parsed.subject ?? "",
-      body_text: parsed.text ?? "",
-      received_at: (parsed.date ?? new Date()).toISOString(),
-      attachments
-    };
+    return parseIntakeEmailMessage(uid, message.source);
   }
 
   async finish(uid: string, outcome: MailboxOutcome): Promise<void> {
@@ -124,7 +106,39 @@ class ImapMailbox implements MailboxSource {
   }
 }
 
-async function resolveOAuthAccessToken(
+export async function parseIntakeEmailMessage(
+  uid: string,
+  source: Buffer | string
+): Promise<IntakeEmail> {
+    const parsed = await simpleParser(source);
+    const fromAddress = parsed.from?.value?.[0];
+    const attachments: IntakeAttachment[] = (parsed.attachments ?? [])
+      .filter((attachment) => attachment.content)
+      .map((attachment) => ({
+        filename: attachment.filename ?? "attachment",
+        mimeType: attachment.contentType ?? "application/octet-stream",
+        content: attachment.content as Buffer
+      }));
+
+    return {
+      message_id: uid,
+      rfc_message_id: parsed.messageId?.trim() || null,
+      references: normalizeReferences(parsed.references),
+      from_name: fromAddress?.name?.trim() || fromAddress?.address || "",
+      from_email: (fromAddress?.address ?? "").trim().toLowerCase(),
+      subject: parsed.subject ?? "",
+      body_text: parsed.text ?? "",
+      received_at: (parsed.date ?? new Date()).toISOString(),
+      attachments
+    };
+}
+
+function normalizeReferences(value: unknown): string[] {
+  const values = Array.isArray(value) ? value : typeof value === "string" ? value.split(/\s+/) : [];
+  return values.map((item) => String(item).trim()).filter(Boolean);
+}
+
+export async function resolveMailboxOAuthAccessToken(
   config: AgentMailboxConfig,
   env: NodeJS.ProcessEnv,
   fetchFn: typeof fetch
@@ -141,7 +155,10 @@ async function resolveOAuthAccessToken(
     grant_type: "refresh_token"
   });
   if (config.provider === "outlook") {
-    params.set("scope", "https://outlook.office365.com/IMAP.AccessAsUser.All offline_access");
+    params.set(
+      "scope",
+      "https://outlook.office.com/IMAP.AccessAsUser.All https://outlook.office.com/SMTP.Send offline_access"
+    );
   }
 
   const response = await fetchFn(tokenUrl, {

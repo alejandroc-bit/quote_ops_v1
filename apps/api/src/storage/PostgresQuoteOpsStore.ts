@@ -4,6 +4,8 @@ import {
   buildApprovalEnvelope,
   summarizeWorkflowRun,
   type ApplianceHeartbeat,
+  type AgentRun,
+  type AgentRunStatus,
   type ApprovalDecision,
   type ApprovalEnvelope,
   type DecisionStatus,
@@ -49,6 +51,25 @@ type ApprovalDecisionRow = {
 type HeartbeatRow = {
   payload: unknown;
   received_at: Date | string;
+};
+
+type AgentRunRow = {
+  run_id: string;
+  channel: AgentRun["channel"];
+  status: AgentRunStatus;
+  summary: string;
+  created_at: Date | string;
+  updated_at: Date | string;
+};
+
+type StepEventRow = {
+  run_id: string;
+  seq: number;
+  node: string;
+  status: import("./QuoteOpsStore.js").StepEvent["status"];
+  summary: string;
+  data: unknown;
+  ts: Date | string;
 };
 
 export class PostgresQuoteOpsStore implements QuoteOpsStore {
@@ -268,6 +289,96 @@ export class PostgresQuoteOpsStore implements QuoteOpsStore {
     }));
   }
 
+  async createRun(run: import("./QuoteOpsStore.js").CreateAgentRun): Promise<void> {
+    await this.ensureSchema();
+    await this.pool.query(
+      `insert into quote_runs (run_id, channel, status, summary)
+       values ($1, $2, $3, $4)
+       on conflict (run_id) do update set
+         channel = excluded.channel,
+         status = excluded.status,
+         summary = excluded.summary,
+         updated_at = now()`,
+      [run.run_id, run.channel, run.status, run.summary]
+    );
+  }
+
+  async updateRunStatus(runId: string, status: AgentRunStatus, summary: string): Promise<void> {
+    await this.ensureSchema();
+    const result = await this.pool.query(
+      `update quote_runs set status = $2, summary = $3, updated_at = now() where run_id = $1`,
+      [runId, status, summary]
+    );
+    if (result.rowCount === 0) throw new Error(`agent run not found: ${runId}`);
+  }
+
+  async appendStep(step: import("./QuoteOpsStore.js").StepEvent): Promise<void> {
+    await this.ensureSchema();
+    await this.pool.query(
+      `insert into quote_run_steps (run_id, seq, node, status, summary, data, ts)
+       values ($1, $2, $3, $4, $5, $6::jsonb, $7)`,
+      [
+        step.run_id,
+        step.seq,
+        step.node,
+        step.status,
+        step.summary,
+        step.data === undefined ? null : JSON.stringify(step.data),
+        step.ts
+      ]
+    );
+  }
+
+  async listRuns(limit = 50): Promise<AgentRun[]> {
+    await this.ensureSchema();
+    const result = await this.pool.query<AgentRunRow>(
+      `select run_id, channel, status, summary, created_at, updated_at
+       from quote_runs order by updated_at desc limit $1`,
+      [Math.max(1, Math.min(200, Math.floor(limit)))]
+    );
+    return result.rows.map(agentRunFromRow);
+  }
+
+  async getRun(runId: string): Promise<AgentRun | null> {
+    await this.ensureSchema();
+    const result = await this.pool.query<AgentRunRow>(
+      `select run_id, channel, status, summary, created_at, updated_at
+       from quote_runs where run_id = $1`,
+      [runId]
+    );
+    return result.rows[0] ? agentRunFromRow(result.rows[0]) : null;
+  }
+
+  async getSteps(runId: string): Promise<import("./QuoteOpsStore.js").StepEvent[]> {
+    await this.ensureSchema();
+    const result = await this.pool.query<StepEventRow>(
+      `select run_id, seq, node, status, summary, data, ts
+       from quote_run_steps where run_id = $1 order by seq asc`,
+      [runId]
+    );
+    return result.rows.map((row) => ({
+      run_id: row.run_id,
+      seq: row.seq,
+      node: row.node,
+      status: row.status,
+      summary: row.summary,
+      ...(row.data !== null ? { data: row.data } : {}),
+      ts: isoTimestamp(row.ts)
+    }));
+  }
+
+  async claimRunForResume(runId: string): Promise<boolean> {
+    await this.ensureSchema();
+    const result = await this.pool.query(
+      `update quote_runs
+          set status = 'running', summary = 'Approval resume claimed', updated_at = now()
+        where run_id = $1 and status = 'waiting_approval'
+        returning run_id`,
+      [runId]
+    );
+    return result.rowCount === 1;
+  }
+
   async end(): Promise<void> {
     if (this.ownsPool) {
       await this.pool.end();
@@ -341,4 +452,15 @@ function numberOrNull(value: string | number | null): number | null {
 
 function isoTimestamp(value: Date | string): string {
   return value instanceof Date ? value.toISOString() : new Date(value).toISOString();
+}
+
+function agentRunFromRow(row: AgentRunRow): AgentRun {
+  return {
+    run_id: row.run_id,
+    channel: row.channel,
+    status: row.status,
+    summary: row.summary,
+    created_at: isoTimestamp(row.created_at),
+    updated_at: isoTimestamp(row.updated_at)
+  };
 }
