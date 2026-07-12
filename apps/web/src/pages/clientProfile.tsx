@@ -14,11 +14,12 @@ import {
 } from "../api/controlPlaneApi";
 import { useAsyncResource } from "../api/useAsyncResource";
 import { isUpdateAvailable, parsePdfTemplate } from "../lib/portalSettings";
+import { EmptyState, InlineError, PageSkeleton } from "../UiStates";
 
 const PDF_TEMPLATE_PLACEHOLDER = `{
   "title": "Cotización de flete",
   "footer_note": "Tarifas sujetas a confirmación",
-  "accent_color": "#0f766e",
+  "accent_color": "#000000",
   "show_breakdown": true
 }`;
 
@@ -47,7 +48,7 @@ function VendorClientProfile() {
     <section aria-labelledby="client-profile-heading" className="workspace">
       <div className="workspace-heading">
         <div>
-          <p className="eyebrow">Portal cloud</p>
+          <p className="eyebrow">Portal en nube</p>
           <h2 id="client-profile-heading">Perfil del cliente</h2>
         </div>
         {clients && clients.length > 0 ? (
@@ -69,11 +70,9 @@ function VendorClientProfile() {
       </div>
 
       {error ? (
-        <div className="panel inline-error">
-          <span>{error.message}</span>
-        </div>
+        <InlineError message={error.message} />
       ) : null}
-      {loading ? <p className="muted">Cargando clientes…</p> : null}
+      {loading ? <PageSkeleton rows={3} /> : null}
 
       {client ? (
         <InstallationProfile
@@ -81,7 +80,7 @@ function VendorClientProfile() {
           key={client.client_id}
         />
       ) : !loading && !error ? (
-        <p className="muted">Todavía no hay clientes registrados.</p>
+        <EmptyState title="Sin clientes registrados" body="Crea un cliente en el registro para consultar su instalación, uso y configuración." />
       ) : null}
     </section>
   );
@@ -100,7 +99,7 @@ function TenantClientProfile({ installations }: { installations: ControlPlaneIns
     <section aria-labelledby="client-profile-heading" className="workspace">
       <div className="workspace-heading">
         <div>
-          <p className="eyebrow">Portal cloud</p>
+          <p className="eyebrow">Portal en nube</p>
           <h2 id="client-profile-heading">Perfil del cliente</h2>
         </div>
         {installations.length > 1 ? (
@@ -126,7 +125,7 @@ function TenantClientProfile({ installations }: { installations: ControlPlaneIns
           preloadedInstallation={installation}
         />
       ) : (
-        <p className="muted">Tu tenant todavía no tiene instalaciones registradas.</p>
+        <EmptyState title="Sin instalaciones" body="Tu organización todavía no tiene un appliance vinculado." />
       )}
     </section>
   );
@@ -154,12 +153,10 @@ function InstallationProfile({
 
   if (error) {
     return (
-      <div className="panel inline-error">
-        <span>{error.message}</span>
-      </div>
+      <InlineError message={error.message} />
     );
   }
-  if (loading || !data) return <p className="muted">Cargando instalación…</p>;
+  if (loading || !data) return <PageSkeleton rows={4} />;
 
   return (
     <>
@@ -179,7 +176,7 @@ function CredentialsCard({ credentials }: { credentials: ControlPlaneCredentialS
         <h3>Credenciales conectadas</h3>
       </div>
       {credentials.length === 0 ? (
-        <p className="muted">Sin metadatos de credenciales registrados.</p>
+        <EmptyState title="Sin credenciales registradas" body="El plano de control todavía no recibe estados de credenciales para esta instalación." />
       ) : (
         <div className="registry-table-wrap">
           <table className="registry-table">
@@ -241,7 +238,7 @@ function VersionCard({
           Al día con la última versión publicada ({formatVersion(release.version)}).
         </p>
       ) : (
-        <p className="muted">Sin información de versiones publicadas todavía.</p>
+        <EmptyState title="Sin versiones publicadas" body="No hay una versión disponible para comparar con este appliance." />
       )}
     </article>
   );
@@ -340,9 +337,7 @@ function SettingsCard({
       </p>
 
       {saveError ? (
-        <div className="panel inline-error">
-          <span>{saveError}</span>
-        </div>
+        <InlineError message={saveError} />
       ) : null}
       {message ? (
         <div className="panel inline-success">
@@ -365,7 +360,7 @@ function UsageCard({ usage }: { usage: ControlPlaneUsagePoint[] }) {
         <h3>Uso por día</h3>
       </div>
       {usage.length === 0 ? (
-        <p className="muted">Sin datos de uso todavía.</p>
+        <EmptyState title="Sin datos de uso" body="Los conteos agregados aparecerán después del primer pulso del appliance." />
       ) : (
         <div className="registry-table-wrap">
           <table className="registry-table">

@@ -158,7 +158,7 @@ export function createQuoteOpsApi(
     const heartbeats = await store.listHeartbeats();
     res.json({
       ok: true,
-      product_version: "quoteops-v2.0.0",
+      product_version: await resolveProductVersion(),
       workflow_runs: workflowRuns.length,
       heartbeats: heartbeats.length
     });
@@ -1299,6 +1299,15 @@ function hasAnyEnv(env: NodeJS.ProcessEnv, keys: string[]): boolean {
 
 function optionalEnv(value: string | undefined): string | undefined {
   return value && value.trim() ? value.trim() : undefined;
+}
+
+// Health reports the release the installer stamps into QUOTEOPS_VERSION;
+// dev checkouts fall back to the package.json version.
+async function resolveProductVersion(): Promise<string> {
+  const fromEnv = optionalEnv(process.env.QUOTEOPS_VERSION);
+  if (fromEnv) return fromEnv;
+  const raw = await readFile(new URL("../package.json", import.meta.url), "utf8");
+  return `v${(JSON.parse(raw) as { version: string }).version}`;
 }
 
 function parseEnvBoolean(value: string | undefined, fallback: boolean): boolean {

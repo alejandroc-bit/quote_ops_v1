@@ -9,6 +9,7 @@ import {
   Search,
   Upload
 } from "lucide-react";
+import { EmptyState } from "../UiStates";
 
 type LocalDocument = {
   id: string;
@@ -19,8 +20,8 @@ type LocalDocument = {
 export function KnowledgePage() {
   const [documents, setDocuments] = useState<LocalDocument[]>([]);
   const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
-  const [query, setQuery] = useState("margin floor");
-  const [lastSearch, setLastSearch] = useState("margin floor");
+  const [query, setQuery] = useState("margen mínimo");
+  const [lastSearch, setLastSearch] = useState("margen mínimo");
 
   const searchResults = useMemo(() => {
     const normalizedQuery = lastSearch.trim().toLowerCase();
@@ -57,23 +58,23 @@ export function KnowledgePage() {
     <section aria-labelledby="knowledge-heading" className="workspace">
       <div className="workspace-heading">
         <div>
-          <p className="eyebrow">Local RAG</p>
-          <h2 id="knowledge-heading">Knowledge staging preview</h2>
+          <p className="eyebrow">Conocimiento local</p>
+          <h2 id="knowledge-heading">Base de conocimiento</h2>
         </div>
         <div className="compact-stats">
-          <span>{documents.length} staged files</span>
-          <span>ingest API not mounted</span>
-          <span>client-owned embedding key</span>
+          <span>{documents.length} archivos preparados</span>
+          <span>API de ingesta pendiente</span>
+          <span>Llave del cliente</span>
         </div>
       </div>
 
       <article className="panel knowledge-boundary">
         <CloudOff size={20} aria-hidden />
         <div>
-          <strong>Local appliance knowledge base</strong>
+          <strong>Conocimiento dentro del appliance</strong>
           <p>
-            This screen stages local filenames only. Once the local knowledge API is mounted,
-            documents, chunks, and embeddings stay inside the client appliance.
+            Esta vista prepara nombres de archivo. Cuando se conecte la API local, los documentos,
+            fragmentos y embeddings permanecerán dentro del appliance del cliente.
           </p>
         </div>
       </article>
@@ -82,10 +83,10 @@ export function KnowledgePage() {
         <article className="panel knowledge-upload">
           <div className="panel-title">
             <Upload size={18} aria-hidden />
-            <h3>Stage criteria files</h3>
+            <h3>Preparar archivos de criterios</h3>
           </div>
           <label>
-            Criteria files
+            Archivos de criterios
             <input multiple onChange={selectFiles} type="file" />
           </label>
           <div className="selected-file-list" aria-label="Selected local files">
@@ -97,10 +98,7 @@ export function KnowledgePage() {
                 </span>
               ))
             ) : (
-              <p className="muted">
-                No files selected. This preview stages filenames only until local knowledge API
-                routes are mounted.
-              </p>
+              <EmptyState title="Sin archivos seleccionados" body="Selecciona criterios operativos para preparar su ingesta local." />
             )}
           </div>
           <button
@@ -110,38 +108,38 @@ export function KnowledgePage() {
             type="button"
           >
             <Database size={16} aria-hidden />
-            Stage local preview
+            Preparar vista local
           </button>
         </article>
 
         <article className="panel knowledge-search">
           <div className="panel-title">
             <Search size={18} aria-hidden />
-            <h3>Search criteria</h3>
+            <h3>Buscar criterios</h3>
           </div>
           <form className="search-row" onSubmit={searchKnowledge}>
             <label>
-              Local query
+              Consulta local
               <input onChange={(event) => setQuery(event.target.value)} type="search" value={query} />
             </label>
             <button className="button button-secondary" type="submit">
               <Search size={16} aria-hidden />
-              Search
+              Buscar
             </button>
           </form>
-          <div className="knowledge-results" aria-label="Local RAG search results">
+          <div className="knowledge-results" aria-label="Resultados de búsqueda local">
             {searchResults.length > 0 ? (
               searchResults.map((document) => (
                 <section className="knowledge-result" key={document.id}>
                   <BookOpen size={16} aria-hidden />
                   <div>
                     <strong>{document.filename}</strong>
-                    <small>{document.status} for local preview; not ingested yet</small>
+                    <small>{document.status === "staged" ? "Preparado" : "Listo"}; ingesta pendiente</small>
                   </div>
                 </section>
               ))
             ) : (
-              <p className="muted">No staged local filenames matched this query.</p>
+              <EmptyState title="Sin coincidencias" body="Prueba otro término o prepara archivos adicionales." />
             )}
           </div>
         </article>
@@ -149,12 +147,12 @@ export function KnowledgePage() {
         <aside className="panel knowledge-contract">
           <div className="panel-title">
             <KeyRound size={18} aria-hidden />
-            <h3>Runtime contract</h3>
+            <h3>Contrato de ejecución</h3>
           </div>
           <ul className="boundary-list boundary-list-light">
-            <li>Embedding API key is a local secret reference.</li>
-            <li>RAG output can advise approval criteria only.</li>
-            <li>The cloud receives counts and health, not documents or embeddings.</li>
+            <li>La llave de embeddings se referencia como secreto local.</li>
+            <li>El RAG solo puede orientar criterios de aprobación.</li>
+            <li>La nube recibe conteos y salud, nunca documentos ni embeddings.</li>
           </ul>
         </aside>
       </div>

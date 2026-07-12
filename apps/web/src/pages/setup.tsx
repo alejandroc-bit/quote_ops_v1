@@ -38,28 +38,28 @@ mapping:
 const setupSteps = [
   {
     icon: Boxes,
-    title: "1. Client pack",
-    body: "Inducta exports one pack per client: manifest, criteria template, TMS adapter template, installation id, and registration token."
+    title: "1. Paquete del cliente",
+    body: "Inducta genera un paquete por cliente: manifiesto, criterios, adaptador TMS, instalación y token de registro."
   },
   {
     icon: TerminalSquare,
-    title: "2. Cloud authorization",
-    body: "The client runs install.sh and signs in with the authorized email. Cloud validates the allowlist and emits a signed license."
+    title: "2. Autorización central",
+    body: "El cliente ejecuta install.sh con el correo autorizado. La nube valida el acceso y emite una licencia firmada."
   },
   {
     icon: FileKey2,
-    title: "3. Local secrets",
-    body: "AI provider, embeddings, TMS, mailbox and SAKBE keys are entered into the appliance only. Cloud receives only configured or missing status."
+    title: "3. Secretos locales",
+    body: "Las llaves de IA, embeddings, TMS, correo y SAKBE se guardan solo en el appliance. La nube recibe únicamente su estado."
   },
   {
     icon: Network,
-    title: "4. TMS adapter",
-    body: "Every TMS is normalized through a YAML adapter contract: auth, endpoints, mapping, historical pull, and quote writeback."
+    title: "4. Adaptador TMS",
+    body: "Cada TMS se normaliza mediante un contrato YAML: autenticación, endpoints, mapeo, histórico y escritura."
   },
   {
     icon: CloudCog,
-    title: "5. Control plane",
-    body: "Inducta receives active status, license state, last heartbeat, AI key status and aggregate quote counters only."
+    title: "5. Plano de control",
+    body: "Inducta recibe estado, licencia, último pulso, estado de la llave de IA y conteos agregados."
   }
 ];
 
@@ -68,17 +68,17 @@ export function SetupPage() {
     <section aria-labelledby="setup-heading" className="workspace">
       <div className="workspace-heading">
         <div>
-          <p className="eyebrow">Client onboarding</p>
-          <h2 id="setup-heading">Setup workspace</h2>
+          <p className="eyebrow">Onboarding del cliente</p>
+          <h2 id="setup-heading">Instalación del appliance</h2>
         </div>
-        <span className="status status-green">Docker installable per client</span>
+        <span className="status status-green">Docker por cliente</span>
       </div>
 
       <div className="setup-layout">
         <article className="panel setup-main">
           <div className="panel-title">
             <ServerCog size={18} aria-hidden />
-            <h3>How a new client gets installed</h3>
+            <h3>Secuencia de instalación</h3>
           </div>
           <div className="setup-steps">
             {setupSteps.map((step) => {
@@ -99,33 +99,32 @@ export function SetupPage() {
         <aside className="panel secret-boundary">
           <div className="panel-title">
             <ShieldCheck size={18} aria-hidden />
-            <h3>What stays local</h3>
+            <h3>Datos que permanecen locales</h3>
           </div>
           <ul className="boundary-list">
-            <li>AI provider and embedding API keys</li>
-            <li>TMS API keys and tokens</li>
-            <li>SAKBE and model provider keys</li>
-            <li>Raw RFQs and historical quote rows</li>
-            <li>Route evidence, approvals and full workflow state</li>
+            <li>Llaves del proveedor de IA y embeddings</li>
+            <li>Llaves y tokens del TMS</li>
+            <li>Llaves de SAKBE y del modelo</li>
+            <li>Solicitudes y filas históricas de cotización</li>
+            <li>Evidencia de ruta, aprobaciones y estado completo</li>
           </ul>
         </aside>
       </div>
 
       <div className="setup-grid">
-        <CommandCard title="Install appliance" command={installCommand} />
-        <CommandCard title="Store an AI key locally" command={secretsCommand} />
-        <CommandCard title="Run Docker" command={composeCommand} />
+        <CommandCard title="Instalar appliance" command={installCommand} />
+        <CommandCard title="Guardar llave de IA" command={secretsCommand} />
+        <CommandCard title="Iniciar Docker" command={composeCommand} />
       </div>
 
       <article className="panel adapter-contract">
         <div className="panel-title">
           <KeyRound size={18} aria-hidden />
-          <h3>TMS adapter contract</h3>
+          <h3>Contrato del adaptador TMS</h3>
         </div>
         <p className="muted">
-          This file is the replaceable adapter layer. A client with MercuryGate,
-          Beetrack, custom SAP, or a homegrown TMS changes this YAML, not the
-          quote-core code.
+          Este archivo es la capa reemplazable. Un cliente con MercuryGate, Beetrack,
+          SAP o un TMS propio modifica este YAML, no el código de Quote-core.
         </p>
         <pre>{tmsAdapterYaml}</pre>
       </article>

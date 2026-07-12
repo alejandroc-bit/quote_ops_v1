@@ -18,6 +18,7 @@ import {
   type StepEvent
 } from "../api/runsApi";
 import { useAsyncResource } from "../api/useAsyncResource";
+import { EmptyState, InlineError, PageSkeleton } from "../UiStates";
 
 export function RunsPage() {
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
@@ -41,23 +42,22 @@ function RunsListView({ onSelect }: { onSelect: (runId: string) => void }) {
           <h2 id="runs-heading">Corridas recientes</h2>
         </div>
         <div className="compact-stats">
-          <span>actualiza cada 5s</span>
+          <span>Actualización cada 5 s</span>
         </div>
       </div>
 
-      {loading && !data ? <p className="panel muted">Cargando corridas...</p> : null}
+      {loading && !data ? <PageSkeleton rows={4} /> : null}
       {error ? (
-        <div className="panel inline-error">
-          <span>{error.message}</span>
-          <button className="button button-secondary" onClick={reload} type="button">
-            Reintentar
-          </button>
-        </div>
+        <InlineError
+          message={error.message}
+          action={<button className="button button-secondary" onClick={reload} type="button">Reintentar</button>}
+        />
       ) : null}
       {!loading && !error && runs.length === 0 ? (
-        <p className="panel muted">
-          Aún no hay corridas registradas. Las cotizaciones procesadas por el agente aparecerán aquí.
-        </p>
+        <EmptyState
+          title="Sin cotizaciones aún"
+          body="Cuando el appliance procese una solicitud, aquí podrás revisar su señal, análisis, recomendación y acción."
+        />
       ) : null}
 
       {runs.length > 0 ? (
@@ -75,9 +75,17 @@ function RunsListView({ onSelect }: { onSelect: (runId: string) => void }) {
             <tbody>
               {runs.map((run) => (
                 <tr
+                  aria-label={`Abrir corrida ${run.run_id}`}
+                  data-interactive="true"
                   key={run.run_id}
                   onClick={() => onSelect(run.run_id)}
-                  style={{ cursor: "pointer" }}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter" || event.key === " ") {
+                      event.preventDefault();
+                      onSelect(run.run_id);
+                    }
+                  }}
+                  tabIndex={0}
                 >
                   <td>
                     <strong>{shortRunId(run.run_id)}</strong>
@@ -197,7 +205,7 @@ function RunDetailView({ onBack, runId }: { onBack: () => void; runId: string })
         </div>
         <div className="compact-stats">
           {run ? <span className={statusChipClass(run.status)}>{statusLabel(run.status)}</span> : null}
-          <span>{liveMode === "sse" ? "en vivo (SSE)" : "sondeo cada 3s"}</span>
+          <span>{liveMode === "sse" ? "En vivo · SSE" : "Sondeo cada 3 s"}</span>
         </div>
       </div>
 
@@ -227,10 +235,13 @@ function RunDetailView({ onBack, runId }: { onBack: () => void; runId: string })
         </div>
       ) : null}
 
-      {loading ? <p className="panel muted">Cargando pasos...</p> : null}
-      {error ? <p className="panel inline-error">{error}</p> : null}
+      {loading ? <PageSkeleton rows={5} /> : null}
+      {error ? <InlineError message={error} /> : null}
       {!loading && !error && steps.length === 0 ? (
-        <p className="panel muted">Sin pasos registrados todavía para esta corrida.</p>
+        <EmptyState
+          title="Sin eventos de control"
+          body="La corrida existe, pero todavía no registra señales del flujo operativo."
+        />
       ) : null}
 
       {steps.length > 0 ? (
@@ -241,7 +252,12 @@ function RunDetailView({ onBack, runId }: { onBack: () => void; runId: string })
           </div>
           <ol className="workflow-timeline">
             {steps.map((step, index) => (
-              <StepRow durationMs={stepDurationMs(steps, index)} key={step.seq} step={step} />
+              <StepRow
+                durationMs={stepDurationMs(steps, index)}
+                key={step.seq}
+                stage={controlStage(index, steps.length)}
+                step={step}
+              />
             ))}
           </ol>
         </article>
@@ -250,7 +266,7 @@ function RunDetailView({ onBack, runId }: { onBack: () => void; runId: string })
   );
 }
 
-function StepRow({ durationMs, step }: { durationMs: number | null; step: StepEvent }) {
+function StepRow({ durationMs, stage, step }: { durationMs: number | null; stage: string; step: StepEvent }) {
   const Icon = step.status === "start" ? Loader : step.status === "error" ? XCircle : CheckCircle2;
   const stepClass =
     step.status === "error"
@@ -263,6 +279,7 @@ function StepRow({ durationMs, step }: { durationMs: number | null; step: StepEv
     <li className={stepClass}>
       <Icon size={18} aria-hidden />
       <span>
+        <small className="control-stage">{stage}</small>
         <strong>
           {step.node} · {stepStatusLabel(step.status)}
           {durationMs !== null ? ` · ${formatDuration(durationMs)}` : ""}
@@ -272,7 +289,7 @@ function StepRow({ durationMs, step }: { durationMs: number | null; step: StepEv
         {step.data !== undefined && step.data !== null ? (
           <details>
             <summary>Ver datos</summary>
-            <pre style={{ overflowX: "auto", fontSize: "0.72rem" }}>
+            <pre className="step-data">
               {JSON.stringify(step.data, null, 2)}
             </pre>
           </details>
@@ -280,6 +297,12 @@ function StepRow({ durationMs, step }: { durationMs: number | null; step: StepEv
       </span>
     </li>
   );
+}
+
+function controlStage(index: number, total: number): string {
+  const stages = ["Señal", "Clasificación", "Análisis", "Recomendación", "Acción"];
+  const stageIndex = Math.min(stages.length - 1, Math.floor((index / Math.max(total, 1)) * stages.length));
+  return stages[stageIndex]!;
 }
 
 export const NAVIGATE_EVENT = "quoteops:navigate";

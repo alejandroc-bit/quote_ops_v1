@@ -1,4 +1,4 @@
-import { Activity } from "lucide-react";
+import { Activity, Boxes } from "lucide-react";
 import type React from "react";
 import type { LucideIcon } from "lucide-react";
 
@@ -38,12 +38,16 @@ export function AppShell<PageKey extends string>({
 
   return (
     <div className="dashboard-shell">
+      <a className="skip-link" href="#main-content">Saltar al contenido</a>
       <header className="dashboard-header">
-        <div>
-          <p className="dashboard-kicker">{productKicker}</p>
-          <h1>{headerTitle}</h1>
+        <div className="brand-lockup">
+          <span className="brand-mark" aria-hidden><Boxes size={21} /></span>
+          <div>
+            <p className="dashboard-kicker">{productKicker}</p>
+            <h1>{headerTitle}</h1>
+          </div>
         </div>
-        <div className="runtime-strip" aria-label="Runtime summary">
+        <div className="runtime-strip" aria-label="Resumen operativo">
           {runtimeItems.map((item, index) => (
             <span key={item}>
               {index === 0 ? <Activity size={16} aria-hidden /> : null}
@@ -82,7 +86,9 @@ export function AppShell<PageKey extends string>({
           })}
         </nav>
 
-        <main className="dashboard-main">{contentOverride ?? <ActiveComponent />}</main>
+        <main className="dashboard-main" id="main-content" tabIndex={-1}>
+          {contentOverride ?? <ActiveComponent />}
+        </main>
       </div>
     </div>
   );

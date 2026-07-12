@@ -9,6 +9,7 @@ import {
   Workflow
 } from "lucide-react";
 import { submitPlaygroundRfq } from "../api/quoteOpsApi";
+import { InlineError } from "../UiStates";
 
 type ChannelState = "connected" | "configured" | "needs_secret";
 
@@ -38,34 +39,34 @@ const channels: Array<{
 
 const aiNodes = [
   {
-    name: "Channel watcher",
-    owner: "Mailbox connector",
-    detail: "Polls the agent mailbox (Gmail, Outlook, or any IMAP) for RFQ emails and attachments."
+    name: "Señal",
+    owner: "Conector de correo",
+    detail: "Consulta el buzón operativo por IMAP y recibe solicitudes con sus archivos adjuntos."
   },
   {
-    name: "Intake agent",
-    owner: "AI node",
-    detail: "Classifies if the message is an RFQ, follow-up, cancellation, or noise."
+    name: "Clasificación",
+    owner: "Nodo de IA",
+    detail: "Clasifica el mensaje como cotización, seguimiento, cancelación o ruido."
   },
   {
-    name: "Parser agent",
-    owner: "AI node",
-    detail: "Extracts origin, destination, unit, weight, customer, and missing fields."
+    name: "Normalización",
+    owner: "Nodo de IA",
+    detail: "Extrae origen, destino, unidad, peso, cliente y datos faltantes."
   },
   {
-    name: "Evidence agent",
+    name: "Análisis",
     owner: "SAKBE + TMS",
-    detail: "Gets distance, tolls, historical lanes, customer context, and operating profile."
+    detail: "Consulta distancia, casetas, rutas históricas, cliente y perfil operativo."
   },
   {
-    name: "Pricing guide",
-    owner: "OpenRouter guide",
-    detail: "Explains risk and context without changing quote-core rate."
+    name: "Recomendación",
+    owner: "Guía OpenRouter",
+    detail: "Explica riesgo y contexto sin modificar la tarifa de Quote-core."
   },
   {
-    name: "Approval/comms agent",
-    owner: "Policy + outbound",
-    detail: "Blocks writeback when approval is needed and drafts the client response."
+    name: "Acción",
+    owner: "Política y salida",
+    detail: "Bloquea la escritura si requiere aprobación y prepara la respuesta al cliente."
   }
 ];
 
@@ -81,16 +82,18 @@ export function InboxPage() {
   ]);
   const [submitting, setSubmitting] = useState<"Mailbox" | null>(null);
   const [lastRun, setLastRun] = useState<string | null>(null);
+  const [intakeError, setIntakeError] = useState<string | null>(null);
 
   async function simulate(channel: "Mailbox") {
     setSubmitting(channel);
+    setIntakeError(null);
     const id = `${channel}-${Date.now()}`;
     setEvents((current) => [
       {
         id,
         channel,
-        title: `${channel} message received`,
-        detail: "Message entered the intake agent and is being normalized.",
+        title: "Mensaje recibido",
+        detail: "La señal ingresó al flujo y está en normalización.",
         status: "received"
       },
       ...current
@@ -118,20 +121,21 @@ export function InboxPage() {
           event.id === id
             ? {
                 ...event,
-                title: `${channel} RFQ queued`,
-                detail: `${result.run_id} created with status ${result.status}; approval required: ${result.approval_required ? "yes" : "no"}.`,
+                title: "Cotización en cola",
+                detail: `${result.run_id} quedó en ${result.status}; requiere aprobación: ${result.approval_required ? "sí" : "no"}.`,
                 status: "queued"
               }
             : event
         )
       );
     } catch (caught) {
+      setIntakeError(caught instanceof Error ? caught.message : String(caught));
       setEvents((current) =>
         current.map((event) =>
           event.id === id
             ? {
                 ...event,
-                title: `${channel} intake failed closed`,
+                title: "La recepción falló de forma segura",
                 detail: caught instanceof Error ? caught.message : String(caught),
                 status: "received"
               }
@@ -147,13 +151,13 @@ export function InboxPage() {
     <section aria-labelledby="inbox-heading" className="workspace">
       <div className="workspace-heading">
         <div>
-          <p className="eyebrow">RFQ communication intake</p>
-          <h2 id="inbox-heading">Inbox workspace</h2>
+          <p className="eyebrow">Entrada de solicitudes</p>
+          <h2 id="inbox-heading">Bandeja operativa</h2>
         </div>
         <div className="compact-stats">
-          <span>{channels.length} channels</span>
-          <span>{events.length} events</span>
-          <span>{lastRun ? `last ${lastRun}` : "waiting"}</span>
+          <span>{channels.length} canal</span>
+          <span>{events.length} eventos</span>
+          <span>{lastRun ? `Última ${lastRun}` : "En espera"}</span>
         </div>
       </div>
 
@@ -161,7 +165,7 @@ export function InboxPage() {
         <article className="panel channel-panel">
           <div className="panel-title">
             <Radio size={18} aria-hidden />
-            <h3>Inbound channels</h3>
+            <h3>Canales de entrada</h3>
           </div>
           {channels.map((channel) => {
             const Icon = channel.icon;
@@ -173,7 +177,7 @@ export function InboxPage() {
                   <small>{channel.address} / {channel.secret}</small>
                 </span>
                 <span className={channel.status === "needs_secret" ? "status status-amber" : "status status-green"}>
-                  {channel.status === "needs_secret" ? `needs ${channel.secret}` : channel.status}
+                  {channel.status === "needs_secret" ? `Falta ${channel.secret}` : "Configurado"}
                 </span>
               </section>
             );
@@ -186,7 +190,7 @@ export function InboxPage() {
               type="button"
             >
               <Send size={16} aria-hidden />
-              Simulate mailbox RFQ
+              {submitting ? "Procesando…" : "Simular correo de cotización"}
             </button>
           </div>
         </article>
@@ -194,7 +198,7 @@ export function InboxPage() {
         <article className="panel inbox-events">
           <div className="panel-title">
             <Mail size={18} aria-hidden />
-            <h3>Live intake events</h3>
+            <h3>Eventos de entrada</h3>
           </div>
           {events.map((event) => (
             <section className="inbox-event" key={event.id}>
@@ -208,10 +212,12 @@ export function InboxPage() {
         </article>
       </div>
 
+      {intakeError ? <InlineError message={intakeError} /> : null}
+
       <article className="panel ai-flow-panel">
         <div className="panel-title">
           <Workflow size={18} aria-hidden />
-          <h3>AI node flow</h3>
+          <h3>Flujo del sistema</h3>
         </div>
         <div className="ai-node-grid">
           {aiNodes.map((node) => (
@@ -228,9 +234,9 @@ export function InboxPage() {
       <aside className="panel control-plane-note">
         <ShieldCheck size={18} aria-hidden />
         <p>
-          Directors approve and see RFQ statistics in the client portal. Channel
-          credentials and connector health are configured during onboarding and
-          stored locally in secrets/client.env.
+          Los directores aprueban y consultan métricas de cotización. Las credenciales
+          y la salud de los conectores se configuran durante el onboarding y permanecen
+          en el archivo local secrets/client.env.
         </p>
         <CheckCircle2 size={18} aria-hidden />
       </aside>

@@ -12,43 +12,43 @@ import type { WorkflowNodeStatus } from "../api/quoteOpsApi";
 export const rfqExecutionSteps = [
   {
     id: "intakePlanner",
-    label: "RFQ received",
-    detail: "The local appliance receives the RFQ from the agent mailbox, WhatsApp, API, or Playground."
+    label: "Señal · Solicitud recibida",
+    detail: "El appliance recibe la solicitud desde correo, API o playground."
   },
   {
     id: "routeEvidence",
-    label: "SAKBE route evidence",
-    detail: "Route and toll evidence is resolved locally with the client's key."
+    label: "Clasificación · Evidencia SAKBE",
+    detail: "La ruta y las casetas se resuelven localmente con la llave del cliente."
   },
   {
     id: "quoteCore",
-    label: "Quote-core pricing",
-    detail: "Deterministic quote-core calculates the base rate. AI cannot override it."
+    label: "Análisis · Cálculo Quote-core",
+    detail: "Quote-core calcula la tarifa base; la IA no puede modificarla."
   },
   {
     id: "tmsMapping",
-    label: "Apply TMS canonical mapping",
-    detail: "Saved canonical mappings normalize raw TMS data without LLM calls in runtime."
+    label: "Análisis · Mapeo canónico TMS",
+    detail: "Los mapeos guardados normalizan el TMS sin llamadas al modelo en ejecución."
   },
   {
     id: "tmsHistorical",
-    label: "TMS historical context",
-    detail: "The appliance reads comparable quotes, lanes, liquidations, and costs locally."
+    label: "Análisis · Contexto histórico TMS",
+    detail: "El appliance consulta cotizaciones, rutas, liquidaciones y costos comparables."
   },
   {
     id: "criteriaRetriever",
-    label: "Retrieve client criteria",
-    detail: "Local RAG retrieves company criteria stored inside the client appliance."
+    label: "Recomendación · Criterios del cliente",
+    detail: "El RAG local recupera criterios almacenados dentro del appliance."
   },
   {
     id: "approvalGate",
-    label: "Approval gate",
-    detail: "Policies decide auto-approval or director review."
+    label: "Acción · Compuerta de aprobación",
+    detail: "Las políticas deciden aprobación automática o revisión directiva."
   },
   {
     id: "writeback",
-    label: "TMS writeback",
-    detail: "Approved or queued quote results write back through the configured TMS adapter."
+    label: "Acción · Escritura TMS",
+    detail: "El resultado aprobado se escribe mediante el adaptador configurado."
   }
 ] as const;
 
@@ -62,14 +62,14 @@ export function RfqExecutionTimeline({ runId, nodeStatus }: RfqExecutionTimeline
     <article className="panel rfq-execution-timeline" aria-labelledby="rfq-execution-heading">
       <div className="panel-title">
         <Activity size={18} aria-hidden />
-        <h3 id="rfq-execution-heading">RFQ execution timeline</h3>
+        <h3 id="rfq-execution-heading">Flujo de ejecución</h3>
       </div>
       <p className="system-note">
-        This execution runs inside the local Docker appliance. The cloud receives only safe
-        progress summaries, health, approval envelopes, and decisions.
+        La ejecución ocurre dentro del appliance Docker. La nube recibe solo resúmenes seguros,
+        salud, solicitudes de aprobación y decisiones.
       </p>
       <div className="timeline-run-id">
-        {runId ? <code>{runId}</code> : <small>No RFQ requested yet.</small>}
+        {runId ? <code>{runId}</code> : <small>Sin cotización activa.</small>}
       </div>
       <div className="workflow-timeline">
         {rfqExecutionSteps.map((step) => {
@@ -120,8 +120,11 @@ function statusClassName(status: WorkflowNodeStatus): string {
 }
 
 function statusLabel(status: WorkflowNodeStatus): string {
-  if (status === "review_required") return "review";
-  return status.replace("_", " ");
+  if (status === "review_required") return "Revisión";
+  if (status === "completed") return "Completado";
+  if (status === "running") return "En proceso";
+  if (status === "failed") return "Error";
+  return "Pendiente";
 }
 
 export default RfqExecutionTimeline;

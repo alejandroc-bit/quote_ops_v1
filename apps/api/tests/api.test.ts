@@ -555,6 +555,15 @@ describe("QuoteOps API", () => {
   });
 
   it("returns health with product and workflow counts", async () => {
+    const originalVersion = process.env.QUOTEOPS_VERSION;
+    testEnvRestores.push(() => {
+      if (originalVersion === undefined) {
+        delete process.env.QUOTEOPS_VERSION;
+      } else {
+        process.env.QUOTEOPS_VERSION = originalVersion;
+      }
+    });
+    delete process.env.QUOTEOPS_VERSION;
     const baseUrl = await startApi();
 
     const response = await fetch(`${baseUrl}/api/health`);
@@ -562,8 +571,13 @@ describe("QuoteOps API", () => {
 
     expect(response.status).toBe(200);
     expect(body.ok).toBe(true);
-    expect(body.product_version).toBe("quoteops-v2.0.0");
+    // no QUOTEOPS_VERSION set → falls back to the package.json version
+    expect(body.product_version).toMatch(/^v\d+\.\d+\.\d+$/);
     expect(body.workflow_runs).toBe(0);
+
+    process.env.QUOTEOPS_VERSION = "quoteops-v9.9.9";
+    const envResponse = await fetch(`${baseUrl}/api/health`);
+    expect((await envResponse.json()).product_version).toBe("quoteops-v9.9.9");
 
     await fetch(`${baseUrl}/api/rfqs`, {
       method: "POST",

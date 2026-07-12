@@ -22,6 +22,7 @@ import {
   type ControlPlaneInstallPack
 } from "../api/controlPlaneApi";
 import { useAsyncResource } from "../api/useAsyncResource";
+import { EmptyState, InlineError, PageSkeleton } from "../UiStates";
 
 type ClientForm = {
   client_id: string;
@@ -69,7 +70,7 @@ export function ClientsPage() {
       });
       const pack = await generateControlPlaneInstallPack(client.client_id);
       setInstallPack(pack);
-      setActionMessage(`Client ${client.client_id} created and install pack generated`);
+      setActionMessage(`Cliente ${client.client_id} creado; paquete de instalación listo.`);
       reload();
     });
   }
@@ -78,14 +79,14 @@ export function ClientsPage() {
     await runAction(`pack-${client.client_id}`, async () => {
       const pack = await generateControlPlaneInstallPack(client.client_id);
       setInstallPack(pack);
-      setActionMessage(`Install pack generated for ${client.client_id}`);
+      setActionMessage(`Paquete de instalación listo para ${client.client_id}.`);
     });
   }
 
   async function suspendClient(client: ControlPlaneClient) {
     await runAction(`suspend-${client.client_id}`, async () => {
       await suspendControlPlaneClient(client.client_id);
-      setActionMessage(`${client.client_id} suspended`);
+      setActionMessage(`${client.client_id} quedó suspendido.`);
       reload();
     });
   }
@@ -93,7 +94,7 @@ export function ClientsPage() {
   async function reactivateClient(client: ControlPlaneClient) {
     await runAction(`reactivate-${client.client_id}`, async () => {
       await reactivateControlPlaneClient(client.client_id);
-      setActionMessage(`${client.client_id} reactivated`);
+      setActionMessage(`${client.client_id} quedó reactivado.`);
       reload();
     });
   }
@@ -101,7 +102,7 @@ export function ClientsPage() {
   async function reissueLicense(client: ControlPlaneClient) {
     await runAction(`reissue-${client.client_id}`, async () => {
       await reissueControlPlaneLicense(client.client_id);
-      setActionMessage(`License reissued for ${client.client_id}`);
+      setActionMessage(`Licencia reemitida para ${client.client_id}.`);
       reload();
     });
   }
@@ -123,30 +124,23 @@ export function ClientsPage() {
     <section aria-labelledby="clients-heading" className="workspace">
       <div className="workspace-heading">
         <div>
-          <p className="eyebrow">Inducta control plane</p>
-          <h2 id="clients-heading">Authorized clients</h2>
+          <p className="eyebrow">Plano de control Inducta</p>
+          <h2 id="clients-heading">Clientes autorizados</h2>
         </div>
         <div className="compact-stats">
-          <span>{stats.active} active</span>
-          <span>{stats.onboarding} onboarding</span>
-          <span>{stats.suspended} suspended</span>
-          <span>{stats.quotes} quotes</span>
+          <span>{stats.active} activos</span>
+          <span>{stats.onboarding} en onboarding</span>
+          <span>{stats.suspended} suspendidos</span>
+          <span>{stats.quotes} cotizaciones</span>
         </div>
       </div>
 
       {error ? (
-        <div className="panel inline-error">
-          <span>{error.message}</span>
-          <button className="button button-secondary" onClick={reload} type="button">
-            Retry
-          </button>
-        </div>
+        <InlineError message={error.message} action={<button className="button button-secondary" onClick={reload} type="button">Reintentar</button>} />
       ) : null}
 
       {actionError ? (
-        <div className="panel inline-error">
-          <span>{actionError}</span>
-        </div>
+        <InlineError message={actionError} />
       ) : null}
 
       {actionMessage ? (
@@ -159,18 +153,18 @@ export function ClientsPage() {
         <article className="panel clients-list">
           <div className="panel-title">
             <Building2 size={18} aria-hidden />
-            <h3>Client registry</h3>
+            <h3>Registro de clientes</h3>
           </div>
           <div className="registry-table-wrap">
             <table className="registry-table">
               <thead>
                 <tr>
-                  <th>Client</th>
-                  <th>Authorized user</th>
-                  <th>Installation</th>
-                  <th>Heartbeat</th>
-                  <th>Quotes</th>
-                  <th>Actions</th>
+                  <th>Cliente</th>
+                  <th>Usuario autorizado</th>
+                  <th>Instalación</th>
+                  <th>Último pulso</th>
+                  <th>Cotizaciones</th>
+                  <th>Acciones</th>
                 </tr>
               </thead>
               <tbody>
@@ -185,12 +179,12 @@ export function ClientsPage() {
                     </td>
                     <td>
                       <span>{primaryAuthorizedUser(client)}</span>
-                      <small>cloud login allowlist</small>
+                      <small>Acceso permitido en nube</small>
                     </td>
                     <td>
                       <span>{client.installation.installation_id}</span>
                       <small>
-                        {client.installation.license_status} / AI key{" "}
+                        {client.installation.license_status} / llave de IA{" "}
                         {client.installation.ai_key_status}
                       </small>
                     </td>
@@ -199,12 +193,12 @@ export function ClientsPage() {
                       <small>{client.installation.onboarding_status}</small>
                     </td>
                     <td>
-                      <div className="quote-counters" aria-label={`${client.client_id} quote counters`}>
+                      <div className="quote-counters" aria-label={`Conteos de ${client.client_id}`}>
                         <span>{client.counters.total} total</span>
-                        <span>{client.counters.validated} validated</span>
-                        <span>{client.counters.rejected} rejected</span>
-                        <span>{client.counters.pending} pending</span>
-                        <span>{client.counters.failed} failed</span>
+                        <span>{client.counters.validated} validadas</span>
+                        <span>{client.counters.rejected} rechazadas</span>
+                        <span>{client.counters.pending} pendientes</span>
+                        <span>{client.counters.failed} fallidas</span>
                       </div>
                     </td>
                     <td>
@@ -213,44 +207,44 @@ export function ClientsPage() {
                           className="icon-button"
                           disabled={Boolean(busyAction)}
                           onClick={() => void generatePack(client)}
-                          title="Generate install pack"
+                          title="Generar paquete de instalación"
                           type="button"
                         >
                           <PackagePlus size={16} aria-hidden />
-                          <span className="sr-only">Generate install pack {client.client_id}</span>
+                          <span className="sr-only">Generar paquete de instalación {client.client_id}</span>
                         </button>
                         {client.status === "suspended" ? (
                           <button
                             className="icon-button"
                             disabled={Boolean(busyAction)}
                             onClick={() => void reactivateClient(client)}
-                            title="Reactivate client"
+                            title="Reactivar cliente"
                             type="button"
                           >
                             <PlayCircle size={16} aria-hidden />
-                            <span className="sr-only">Reactivate {client.client_id}</span>
+                            <span className="sr-only">Reactivar {client.client_id}</span>
                           </button>
                         ) : (
                           <button
                             className="icon-button"
                             disabled={Boolean(busyAction)}
                             onClick={() => void suspendClient(client)}
-                            title="Suspend client"
+                            title="Suspender cliente"
                             type="button"
                           >
                             <PauseCircle size={16} aria-hidden />
-                            <span className="sr-only">Suspend {client.client_id}</span>
+                            <span className="sr-only">Suspender {client.client_id}</span>
                           </button>
                         )}
                         <button
                           className="icon-button"
                           disabled={Boolean(busyAction)}
                           onClick={() => void reissueLicense(client)}
-                          title="Reissue license"
+                          title="Reemitir licencia"
                           type="button"
                         >
                           <RefreshCcw size={16} aria-hidden />
-                          <span className="sr-only">Reissue license {client.client_id}</span>
+                          <span className="sr-only">Reemitir licencia {client.client_id}</span>
                         </button>
                       </div>
                     </td>
@@ -259,38 +253,37 @@ export function ClientsPage() {
                 {!loading && clients.length === 0 ? (
                   <tr>
                     <td colSpan={6}>
-                      <span>No authorized clients yet</span>
-                      <small>Create the first client to generate an install pack.</small>
+                      <EmptyState title="Sin clientes autorizados" body="Crea el primer cliente para emitir su paquete privado de instalación." />
                     </td>
                   </tr>
                 ) : null}
               </tbody>
             </table>
           </div>
-          {loading ? <p className="muted">Loading control plane registry</p> : null}
+          {loading ? <PageSkeleton rows={3} /> : null}
         </article>
 
         <form className="panel onboarding-form" onSubmit={createClient}>
           <div className="panel-title">
             <UserCheck size={18} aria-hidden />
-            <h3>Create client</h3>
+            <h3>Crear cliente</h3>
           </div>
           <label>
-            Client id
+            ID del cliente
             <input
               onChange={(event) => setForm({ ...form, client_id: event.target.value })}
               value={form.client_id}
             />
           </label>
           <label>
-            Legal name
+            Razón social
             <input
               onChange={(event) => setForm({ ...form, legal_name: event.target.value })}
               value={form.legal_name}
             />
           </label>
           <label>
-            Authorized email
+            Correo autorizado
             <input
               onChange={(event) =>
                 setForm({ ...form, authorized_email: event.target.value })
@@ -305,7 +298,7 @@ export function ClientsPage() {
             type="submit"
           >
             <PackagePlus size={16} aria-hidden />
-            Create client
+            Crear cliente
           </button>
         </form>
       </div>
@@ -314,42 +307,39 @@ export function ClientsPage() {
         <article className="panel install-pack-preview">
           <div className="panel-title">
             <FileKey2 size={18} aria-hidden />
-            <h3>Generated install pack</h3>
+            <h3>Paquete de instalación</h3>
           </div>
           {installPack ? (
             <>
               <div className="install-pack-meta">
                 <span>{installPack.client_id}</span>
                 <span>{installPack.installation_id}</span>
-                <span>expires {installPack.expires_at}</span>
+                <span>Vence {installPack.expires_at}</span>
               </div>
               <p className="muted">
-                Includes client-manifest.yaml, criteria-template.yaml and
-                tms-adapter-template.yaml. Secret values are not included.
+                Incluye client-manifest.yaml, criteria-template.yaml y
+                tms-adapter-template.yaml. No contiene valores secretos.
               </p>
               <pre>{installPack.install_command}</pre>
               <small className="token-note">
-                Registration token: {installPack.registration_token}
+                Token de registro: {installPack.registration_token}
               </small>
             </>
           ) : (
-            <p className="muted">
-              Select Generate install pack or create a client to prepare the
-              first install command.
-            </p>
+            <EmptyState title="Sin paquete generado" body="Crea un cliente o genera su paquete para obtener el comando de instalación." />
           )}
         </article>
 
         <aside className="panel control-plane-note">
           <ShieldAlert size={18} aria-hidden />
           <p>
-            Cloud stores only allowlisted users, license state, heartbeat time,
-            AI key status and aggregate quote counters. RFQs, routes, TMS rows,
-            approvals and secrets stay inside the client appliance.
+            La nube conserva usuarios autorizados, licencia, último pulso, estado de la llave de IA
+            y conteos agregados. Solicitudes, rutas, filas del TMS, decisiones y secretos permanecen
+            dentro del appliance del cliente.
           </p>
           <div className="minimal-flow">
-            <span><KeyRound size={16} aria-hidden /> Login authorizes install</span>
-            <span><Activity size={16} aria-hidden /> Counters sync aggregate totals</span>
+            <span><KeyRound size={16} aria-hidden /> El acceso autoriza la instalación</span>
+            <span><Activity size={16} aria-hidden /> Solo se sincronizan totales</span>
           </div>
         </aside>
       </div>
@@ -358,22 +348,22 @@ export function ClientsPage() {
 }
 
 function primaryAuthorizedUser(client: ControlPlaneClient): string {
-  return client.authorized_users[0]?.email ?? "No authorized user";
+  return client.authorized_users[0]?.email ?? "Sin usuario autorizado";
 }
 
 function formatHeartbeat(value: string | null): string {
-  if (!value) return "not installed";
-  return new Intl.DateTimeFormat(undefined, {
+  if (!value) return "Sin instalar";
+  return new Intl.DateTimeFormat("es-MX", {
     dateStyle: "medium",
     timeStyle: "short"
   }).format(new Date(value));
 }
 
 function statusLabel(status: ControlPlaneClient["status"]): string {
-  if (status === "active") return "Active";
+  if (status === "active") return "Activo";
   if (status === "onboarding") return "Onboarding";
-  if (status === "blocked") return "Blocked";
-  return "Suspended";
+  if (status === "blocked") return "Bloqueado";
+  return "Suspendido";
 }
 
 export default ClientsPage;

@@ -13,6 +13,7 @@ import {
   type ControlPlaneInstallationDetail,
   type ControlPlanePortalProfile
 } from "./api/controlPlaneApi";
+import { InlineError, PageSkeleton } from "./UiStates";
 
 type ControlPlanePageKey = "clients" | "profile" | "sentinel" | "setup";
 
@@ -141,7 +142,7 @@ export function ControlPlaneApp() {
   const loginOverride = useMemo(() => {
     if (!session) return <LoginPage checking={!sessionChecked} />;
     if (accessLoading || !profile && !accessError) {
-      return <AccessState title="Verificando acceso" body="Cargando rol y tenant desde Supabase…" />;
+      return <AccessState title="Verificando acceso" body="Validamos el rol y el tenant autorizado." loading />;
     }
     if (accessError) {
       return <AccessState title="Acceso no disponible" body={accessError} />;
@@ -161,27 +162,25 @@ export function ControlPlaneApp() {
       ) : null}
       <AppShell
         activePage={activePage}
-        ariaLabel="Plano de control de Inducta"
+        ariaLabel="Navegación del plano de control"
         contentOverride={loginOverride}
         defaultPage={pages[0]!}
-        headerTitle="Inducta Control Plane"
+        headerTitle="Inducta · Plano de control"
         navDisabled={!session || !profile}
         pages={pages}
-        productKicker="Producto central"
-        runtimeItems={["Clientes autorizados", "Paquetes de instalación", "Solo métricas agregadas"]}
+        productKicker="Control central / datos mínimos"
+        runtimeItems={["Clientes autorizados", "Paquetes privados", "Métricas agregadas"]}
         setActivePage={setActivePage}
       />
     </>
   );
 }
 
-function AccessState({ title, body }: { title: string; body: string }) {
+function AccessState({ title, body, loading = false }: { title: string; body: string; loading?: boolean }) {
   return (
     <section className="workspace" aria-live="polite">
-      <article className="panel">
-        <h2>{title}</h2>
-        <p className="muted">{body}</p>
-      </article>
+      <div className="workspace-heading"><div><p className="eyebrow">Acceso seguro</p><h2>{title}</h2></div></div>
+      {loading ? <PageSkeleton rows={2} /> : <InlineError message={body} />}
     </section>
   );
 }
@@ -218,7 +217,7 @@ function LoginPage({ checking }: { checking: boolean }) {
     <section aria-labelledby="login-heading" className="workspace login-workspace">
       <div className="workspace-heading">
         <div>
-          <p className="eyebrow">Inducta Control Plane</p>
+          <p className="eyebrow">Plano de control Inducta</p>
           <h2 id="login-heading">Iniciar sesión</h2>
         </div>
       </div>
@@ -228,37 +227,36 @@ function LoginPage({ checking }: { checking: boolean }) {
           <KeyRound size={18} aria-hidden />
           <h3>Acceso de administración</h3>
         </div>
-        <p className="muted">
-          Ingresa un correo de administración autorizado. Enviaremos un enlace de acceso de un
-          solo uso; no necesitas contraseña.
-        </p>
+        {checking ? <PageSkeleton rows={2} /> : (
+          <>
+            <p className="muted">
+              Ingresa un correo de administración autorizado. Enviaremos un enlace de acceso de un
+              solo uso; no necesitas contraseña.
+            </p>
 
-        <form onSubmit={sendMagicLink}>
-          <label htmlFor="login-email">Correo de administración</label>
-          <input
-            disabled={checking}
-            id="login-email"
-            onChange={(event) => setEmail(event.target.value)}
-            placeholder="tu@empresa.com"
-            required
-            type="email"
-            value={email}
-          />
-          <button
-            className="button button-primary"
-            disabled={sending || checking}
-            type="submit"
-          >
-            <Mail size={16} aria-hidden />
-            {sending ? "Enviando…" : "Enviar enlace mágico"}
-          </button>
-        </form>
+            <form onSubmit={sendMagicLink}>
+              <label htmlFor="login-email">Correo de administración</label>
+              <input
+                id="login-email"
+                onChange={(event) => setEmail(event.target.value)}
+                placeholder="tu@empresa.com"
+                required
+                type="email"
+                value={email}
+              />
+              <button className="button button-primary" disabled={sending} type="submit">
+                <Mail size={16} aria-hidden />
+                {sending ? "Enviando…" : "Enviar enlace mágico"}
+              </button>
+            </form>
 
-        {message ? (
-          <p className={sent ? "login-message login-message-success" : "login-message login-message-error"}>
-            {message}
-          </p>
-        ) : null}
+            {message ? (
+              <p className={sent ? "login-message login-message-success" : "login-message login-message-error"} role={sent ? "status" : "alert"}>
+                {message}
+              </p>
+            ) : null}
+          </>
+        )}
       </article>
     </section>
   );

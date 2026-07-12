@@ -2,6 +2,7 @@ import { useCallback } from "react";
 import { ScrollText } from "lucide-react";
 import { listSentinelReports } from "../api/controlPlaneApi";
 import { useAsyncResource } from "../api/useAsyncResource";
+import { EmptyState, InlineError, PageSkeleton } from "../UiStates";
 
 export function SentinelReportsPage() {
   const loadReports = useCallback(() => listSentinelReports(), []);
@@ -18,19 +19,12 @@ export function SentinelReportsPage() {
       </div>
 
       {error ? (
-        <div className="panel inline-error">
-          <span>{error.message}</span>
-          <button className="button button-secondary" onClick={reload} type="button">
-            Reintentar
-          </button>
-        </div>
+        <InlineError message={error.message} action={<button className="button button-secondary" onClick={reload} type="button">Reintentar</button>} />
       ) : null}
-      {loading ? <p className="muted">Cargando reportes…</p> : null}
+      {loading ? <PageSkeleton rows={3} /> : null}
 
       {!loading && reports.length === 0 ? (
-        <p className="muted">
-          Todavía no hay reportes semanales. Cada appliance envía uno por semana.
-        </p>
+        <EmptyState title="Sin reportes semanales" body="Sentinel publicará el primero cuando cierre una semana operativa." />
       ) : null}
 
       {reports.map((report) => (

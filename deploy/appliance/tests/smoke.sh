@@ -135,6 +135,7 @@ for script in install.sh upgrade.sh backup.sh restore.sh secrets.sh; do
 done
 bash "$APPLIANCE_DIR/install.sh" --help | grep -q -- '--registration-token' || fail "install help missing registration token"
 bash "$APPLIANCE_DIR/install.sh" --help | grep -q -- '--control-plane-url' || fail "install help missing control plane url"
+bash "$APPLIANCE_DIR/install.sh" --help | grep -q -- '--no-pull' || fail "install help missing no-pull"
 
 SECRET_TEST_DIR="$(mktemp -d "${TMPDIR:-/tmp}/quoteops-secrets-smoke.XXXXXX")"
 TEMP_DIRS+=("$SECRET_TEST_DIR")
@@ -211,6 +212,31 @@ if install_guard_run "$INSTALL_GUARD_DIR/home-two" >/dev/null 2>&1; then
 fi
 install_guard_run "$INSTALL_GUARD_DIR/home-three" --force >/dev/null
 grep -q '^RFQ-2,LANE-2$' "$INSTALL_CONNECTORS_TARGET/tms/rfqs.csv" || fail "install.sh --force did not replace connector pack file"
+
+MOCK_DOCKER_DIR="$(mktemp -d "${TMPDIR:-/tmp}/quoteops-mock-docker.XXXXXX")"
+TEMP_DIRS+=("$MOCK_DOCKER_DIR")
+MOCK_DOCKER_LOG="$MOCK_DOCKER_DIR/docker.log"
+cat > "$MOCK_DOCKER_DIR/docker" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$MOCK_DOCKER_LOG"
+SH
+chmod +x "$MOCK_DOCKER_DIR/docker"
+PATH="$MOCK_DOCKER_DIR:$PATH" MOCK_DOCKER_LOG="$MOCK_DOCKER_LOG" \
+  bash "$APPLIANCE_DIR/install.sh" \
+    --client smoke-no-pull \
+    --manifest "$INSTALL_MANIFEST" \
+    --connectors "$INSTALL_CONNECTORS_SRC" \
+    --connectors-dir "$INSTALL_CONNECTORS_TARGET" \
+    --home "$INSTALL_GUARD_DIR/home-no-pull" \
+    --postgres-password test-password \
+    --force \
+    --no-pull >/dev/null
+grep -q '^compose version$' "$MOCK_DOCKER_LOG" || fail "install.sh --no-pull did not validate Compose v2"
+grep -q '^compose .* config$' "$MOCK_DOCKER_LOG" || fail "install.sh --no-pull did not validate compose config"
+grep -q '^compose .* up -d$' "$MOCK_DOCKER_LOG" || fail "install.sh --no-pull did not start the stack"
+if grep -q '^compose .* pull$' "$MOCK_DOCKER_LOG"; then
+  fail "install.sh --no-pull unexpectedly pulled images"
+fi
 
 if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
   WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/quoteops-appliance-smoke.XXXXXX")"

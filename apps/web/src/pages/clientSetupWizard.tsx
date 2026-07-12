@@ -10,6 +10,7 @@ import {
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import { activateAppliance, type SetupState, type SetupStepId } from "../api/quoteOpsApi";
+import { InlineError } from "../UiStates";
 
 export type ClientSetupWizardProps = {
   setup: SetupState;
@@ -23,53 +24,53 @@ const setupSteps: Array<{
 }> = [
   {
     id: "activate_license",
-    title: "Activate signed license",
-    detail: "Validate the Inducta-signed license scoped to this client and installation.",
+    title: "Activar licencia firmada",
+    detail: "Valida la licencia de Inducta para este cliente y esta instalación.",
     icon: ShieldCheck
   },
   {
     id: "configure_secrets",
-    title: "Configure secrets",
+    title: "Configurar secretos",
     detail:
-      "Store TMS, mailbox, SAKBE, model, and embedding keys locally. Secret values never go to the cloud.",
+      "Guarda localmente las llaves del TMS, correo, SAKBE, modelo y embeddings.",
     icon: KeyRound
   },
   {
     id: "connect_tms",
-    title: "Connect TMS adapter",
-    detail: "Connect the customer TMS as the operational source of truth.",
+    title: "Conectar adaptador TMS",
+    detail: "Conecta el TMS del cliente como fuente operativa de verdad.",
     icon: Database
   },
   {
     id: "map_tms",
-    title: "Map TMS data",
-    detail: "Generate and validate deterministic canonical mappings. AI is allowed only during setup.",
+    title: "Mapear datos del TMS",
+    detail: "Genera y valida mapeos determinísticos. La IA solo interviene durante la configuración.",
     icon: Database
   },
   {
     id: "connect_knowledge_base",
-    title: "Build local knowledge base",
+    title: "Crear conocimiento local",
     detail:
-      "Upload commercial criteria and ingest them into local RAG using the client's embedding key.",
+      "Carga criterios comerciales al RAG local con la llave de embeddings del cliente.",
     icon: BookOpen
   },
   {
     id: "connect_mailbox",
-    title: "Connect agent RFQ mailbox",
+    title: "Conectar buzón de cotizaciones",
     detail:
-      "Assign a mail account (Gmail, Outlook, or any IMAP server) to the agent for RFQ intake, configured locally in the appliance.",
+      "Asigna una cuenta Gmail, Outlook o IMAP para recibir solicitudes dentro del appliance.",
     icon: Mail
   },
   {
     id: "connect_sakbe",
-    title: "Connect SAKBE route evidence",
-    detail: "Validate live route evidence with the client's key or fail closed.",
+    title: "Conectar evidencia SAKBE",
+    detail: "Valida la evidencia de ruta con la llave del cliente o bloquea de forma segura.",
     icon: MapPinned
   },
   {
     id: "run_test_rfq",
-    title: "Run test RFQ",
-    detail: "Run a controlled RFQ and inspect the local workflow timeline.",
+    title: "Ejecutar cotización de prueba",
+    detail: "Procesa una solicitud controlada y revisa la línea de tiempo local.",
     icon: PlayCircle
   }
 ];
@@ -87,10 +88,10 @@ export function ClientSetupWizard({ setup }: ClientSetupWizardProps) {
     try {
       const response = await activateAppliance(email);
       setActivationMessage(
-        `License stored locally for ${response.client_id} / ${response.installation_id}`
+        `Licencia guardada localmente para ${response.client_id} / ${response.installation_id}`
       );
     } catch (error) {
-      setActivationMessage(error instanceof Error ? error.message : "Activation failed");
+      setActivationMessage(error instanceof Error ? error.message : "No se pudo activar el appliance.");
     } finally {
       setActivating(false);
     }
@@ -100,12 +101,12 @@ export function ClientSetupWizard({ setup }: ClientSetupWizardProps) {
     <section className="workspace" aria-labelledby="setup-wizard-heading">
       <div className="workspace-heading">
         <div>
-          <p className="eyebrow">Local appliance onboarding</p>
-          <h2 id="setup-wizard-heading">Finish setup before processing RFQs</h2>
+          <p className="eyebrow">Onboarding del appliance</p>
+          <h2 id="setup-wizard-heading">Completa la configuración para operar</h2>
         </div>
         <div className="compact-stats">
-          <span>{setup.activation.client_id ?? "client pending"}</span>
-          <span>{setup.activation.installation_id ?? "installation pending"}</span>
+          <span>{setup.activation.client_id ?? "Cliente pendiente"}</span>
+          <span>{setup.activation.installation_id ?? "Instalación pendiente"}</span>
           <span>{setup.activation.status}</span>
         </div>
       </div>
@@ -113,10 +114,10 @@ export function ClientSetupWizard({ setup }: ClientSetupWizardProps) {
       <article className="panel setup-boundary-note">
         <ShieldCheck size={20} aria-hidden />
         <div>
-          <strong>Secret values never go to the cloud</strong>
+          <strong>Los secretos nunca salen a la nube</strong>
           <p>
-            This portal is the local appliance view. Keys, raw RFQs, TMS rows, documents,
-            chunks, and embeddings stay on the client machine.
+            Esta es la vista del appliance. Llaves, solicitudes, filas del TMS, documentos,
+            fragmentos y embeddings permanecen en la máquina del cliente.
           </p>
         </div>
       </article>
@@ -125,10 +126,10 @@ export function ClientSetupWizard({ setup }: ClientSetupWizardProps) {
         <form className="panel activation-form" onSubmit={submitActivation}>
           <div className="panel-title">
             <ShieldCheck size={18} aria-hidden />
-            <h3>Cloud activation</h3>
+            <h3>Activación central</h3>
           </div>
           <label>
-            Authorized email
+            Correo autorizado
             <input
               onChange={(event) => setEmail(event.target.value)}
               type="email"
@@ -136,9 +137,11 @@ export function ClientSetupWizard({ setup }: ClientSetupWizardProps) {
             />
           </label>
           <button className="button button-primary" disabled={activating} type="submit">
-            {activating ? "Activating" : "Activate appliance"}
+            {activating ? "Activando…" : "Activar appliance"}
           </button>
-          {activationMessage ? <p className="muted">{activationMessage}</p> : null}
+          {activationMessage ? (
+            activationMessage.toLowerCase().includes("guardada") ? <p className="inline-success">{activationMessage}</p> : <InlineError message={activationMessage} />
+          ) : null}
         </form>
       ) : null}
 
@@ -153,7 +156,7 @@ export function ClientSetupWizard({ setup }: ClientSetupWizardProps) {
               <strong>{step.title}</strong>
               <small>{step.detail}</small>
               <span className={required ? "status status-amber" : "status status-green"}>
-                {required ? "required" : "ready"}
+                {required ? "Pendiente" : "Listo"}
               </span>
             </section>
           );

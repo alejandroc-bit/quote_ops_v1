@@ -15,66 +15,67 @@ import {
 } from "lucide-react";
 import { getHealth, type HealthSummary } from "../api/quoteOpsApi";
 import { useAsyncResource } from "../api/useAsyncResource";
+import { InlineError, PageSkeleton } from "../UiStates";
 
 const dependencyItems = [
   {
     name: "TMS",
-    status: "Configured",
-    detail: "Adapter contract mounted in local appliance",
+    status: "Configurado",
+    detail: "Contrato del adaptador montado en el appliance local",
     icon: Truck
   },
   {
-    name: "TMS mapping",
-    status: "Deterministic",
-    detail: "Canonical mapping status is kept inside the local appliance",
+    name: "Mapeo TMS",
+    status: "Determinístico",
+    detail: "El mapeo canónico permanece dentro del appliance local",
     icon: Database
   },
   {
     name: "SAKBE",
-    status: "Live mode",
-    detail: "Route and toll evidence requested through API",
+    status: "Modo en vivo",
+    detail: "Evidencia de ruta y casetas consultada por API",
     icon: Route
   },
   {
-    name: "Email",
-    status: "Draft only",
-    detail: "Outbound approval is gated by client decision",
+    name: "Correo",
+    status: "Solo borrador",
+    detail: "El envío queda bloqueado hasta la decisión del cliente",
     icon: MailCheck
   },
   {
-    name: "Model",
-    status: "Guide mode",
-    detail: "Agent can explain risk without changing quote-core",
+    name: "Modelo",
+    status: "Modo guía",
+    detail: "Explica el riesgo sin modificar Quote-core",
     icon: BrainCircuit
   },
   {
-    name: "Knowledge",
-    status: "Local RAG",
-    detail: "Criteria retrieval uses client-owned embedding keys",
+    name: "Conocimiento",
+    status: "RAG local",
+    detail: "Los criterios usan llaves de embeddings del cliente",
     icon: BookOpen
   },
   {
     name: "Quote-core",
-    status: "Healthy",
-    detail: "Deterministic pricing package loaded",
+    status: "Operativo",
+    detail: "Motor determinístico de precios cargado",
     icon: Cpu
   },
   {
-    name: "Control plane",
-    status: "Local heartbeat",
-    detail: "Client status can be mirrored to Inducta dashboard",
+    name: "Plano de control",
+    status: "Pulso local",
+    detail: "El estado del cliente se refleja en el panel de Inducta",
     icon: Cloud
   },
   {
-    name: "Backup",
-    status: "Configured",
-    detail: "Last backup is managed by appliance scripts",
+    name: "Respaldo",
+    status: "Configurado",
+    detail: "Los scripts del appliance administran el último respaldo",
     icon: ArchiveRestore
   },
   {
-    name: "License",
-    status: "Setup gated",
-    detail: "Signed activation status is surfaced by local setup state",
+    name: "Licencia",
+    status: "Controlada",
+    detail: "La configuración local valida la activación firmada",
     icon: ShieldCheck
   }
 ];
@@ -88,25 +89,25 @@ export function HealthPage() {
     <section aria-labelledby="health-heading" className="workspace">
       <div className="workspace-heading">
         <div>
-          <p className="eyebrow">System readiness</p>
-          <h2 id="health-heading">Health workspace</h2>
+          <p className="eyebrow">Disponibilidad del sistema</p>
+          <h2 id="health-heading">Estado operativo</h2>
         </div>
         <div className="compact-stats">
           <span className={health?.ok ? "status status-green" : "status status-amber"}>
-            {loading ? "Checking API" : health?.ok ? "API reporting" : "API unavailable"}
+            {loading ? "Verificando API" : health?.ok ? "API operativa" : "API no disponible"}
           </span>
-          <span>live every 5s</span>
+          <span>Actualización cada 5 s</span>
         </div>
       </div>
 
       {error ? (
-        <div className="panel inline-error">
-          <span>{error.message}</span>
-          <button className="button button-secondary" onClick={reload} type="button">
-            Retry
-          </button>
-        </div>
+        <InlineError
+          message={error.message}
+          action={<button className="button button-secondary" onClick={reload} type="button">Reintentar</button>}
+        />
       ) : null}
+
+      {loading && !health ? <PageSkeleton rows={4} /> : null}
 
       <div className="health-grid">
         {health ? <ApiHealthCard health={health} /> : null}
@@ -135,12 +136,12 @@ function ApiHealthCard({ health }: { health: HealthSummary }) {
     <article className="panel health-card">
       <div className="health-card-heading">
         <Server size={20} aria-hidden />
-        <h3>Versions</h3>
+        <h3>Versiones</h3>
         <CheckCircle2 size={18} aria-hidden />
       </div>
       <strong>{health.product_version}</strong>
       <p>
-        {health.workflow_runs} workflow runs / {health.heartbeats} heartbeats
+        {health.workflow_runs} corridas / {health.heartbeats} pulsos
       </p>
     </article>
   );

@@ -19,6 +19,7 @@ import {
   type WorkflowRunSummary
 } from "../api/quoteOpsApi";
 import { useAsyncResource } from "../api/useAsyncResource";
+import { EmptyState, InlineError, PageSkeleton } from "../UiStates";
 import { RfqExecutionTimeline } from "./rfqExecutionTimeline";
 
 type RfqFormState = {
@@ -68,8 +69,8 @@ export function RfqsPage() {
   const [activityLog, setActivityLog] = useState<ActivityEntry[]>([
     {
       id: "idle",
-      label: "Ready for RFQ",
-      detail: "The local appliance is waiting for a Playground request or TMS intake.",
+      label: "Listo para cotizar",
+      detail: "El appliance local espera una solicitud del playground o del TMS.",
       status: "completed"
     }
   ]);
@@ -139,14 +140,14 @@ export function RfqsPage() {
     setActivityLog([
       {
         id: "form",
-        label: "RFQ captured",
-        detail: `${nextForm.origin_city} to ${nextForm.destination_city} entered in the Playground.`,
+        label: "Solicitud capturada",
+        detail: `${nextForm.origin_city} a ${nextForm.destination_city} ingresó al playground.`,
         status: "completed"
       },
       {
         id: "api",
-        label: "Sending to local API",
-        detail: "POST /api/playground/rfqs is converting the form into the RFQ contract.",
+        label: "Envío a la API local",
+        detail: "POST /api/playground/rfqs convierte el formulario al contrato de cotización.",
         status: "running"
       }
     ]);
@@ -160,11 +161,11 @@ export function RfqsPage() {
         ),
         {
           id: "workflow",
-          label: response.status === "RECEIVED" ? "Workflow queued" : "Workflow completed",
+          label: response.status === "RECEIVED" ? "Flujo en cola" : "Flujo completado",
           detail:
             response.status === "RECEIVED"
-              ? `${response.run_id} was accepted by the local appliance; monitor is polling for node status.`
-              : `${response.run_id} returned ${response.status}; approval required: ${response.approval_required ? "yes" : "no"}.`,
+              ? `${response.run_id} fue aceptada; el monitor consulta el estado de cada nodo.`
+              : `${response.run_id} terminó en ${response.status}; requiere aprobación: ${response.approval_required ? "sí" : "no"}.`,
           status: "completed"
         }
       ]);
@@ -177,7 +178,7 @@ export function RfqsPage() {
         ),
         {
           id: "failed",
-          label: "RFQ failed closed",
+          label: "La solicitud falló de forma segura",
           detail: caught instanceof Error ? caught.message : String(caught),
           status: "failed"
         }
@@ -191,14 +192,14 @@ export function RfqsPage() {
     <section aria-labelledby="rfq-heading" className="workspace">
       <div className="workspace-heading">
         <div>
-          <p className="eyebrow">Live RFQ intake</p>
-          <h2 id="rfq-heading">Playground operations</h2>
+          <p className="eyebrow">Cotización en tiempo real</p>
+          <h2 id="rfq-heading">Operación de cotizaciones</h2>
         </div>
         <div className="compact-stats" aria-label="RFQ metrics">
-          <span>{rfqs.length} stored</span>
-          <span>{reviewBlocks} review block</span>
+          <span>{rfqs.length} almacenadas</span>
+          <span>{reviewBlocks} por revisar</span>
           <span>{currentAction}</span>
-          <span>live every 3s</span>
+          <span>Actualización cada 3 s</span>
         </div>
       </div>
 
@@ -206,41 +207,41 @@ export function RfqsPage() {
         <form className="panel rfq-intake" onSubmit={submitRfq}>
           <div className="panel-title">
             <FileInput size={18} aria-hidden />
-            <h3>Request RFQ</h3>
+            <h3>Crear cotización</h3>
           </div>
           <div className="form-grid">
-            <TextField form={form} label="Origin city" name="origin_city" setForm={setForm} />
-            <TextField form={form} label="Origin state" name="origin_state" setForm={setForm} />
+            <TextField form={form} label="Ciudad de origen" name="origin_city" setForm={setForm} />
+            <TextField form={form} label="Estado de origen" name="origin_state" setForm={setForm} />
             <TextField
               form={form}
-              label="Destination city"
+              label="Ciudad de destino"
               name="destination_city"
               setForm={setForm}
             />
             <TextField
               form={form}
-              label="Destination state"
+              label="Estado de destino"
               name="destination_state"
               setForm={setForm}
             />
             <TextField
               form={form}
-              label="Vehicle profile"
+              label="Perfil vehicular"
               name="vehicle_profile_id"
               setForm={setForm}
             />
             <TextField
               form={form}
-              label="Equipment"
+              label="Equipo"
               name="equipment_request"
               setForm={setForm}
             />
-            <TextField form={form} label="Weight kg" name="weight_kg" setForm={setForm} />
-            <TextField form={form} label="Cargo value" name="value_mxn" setForm={setForm} />
-            <TextField form={form} label="Commodity" name="commodity" setForm={setForm} />
+            <TextField form={form} label="Peso en kg" name="weight_kg" setForm={setForm} />
+            <TextField form={form} label="Valor de la carga" name="value_mxn" setForm={setForm} />
+            <TextField form={form} label="Mercancía" name="commodity" setForm={setForm} />
             <TextField
               form={form}
-              label="Business unit"
+              label="Unidad de negocio"
               name="business_unit_id"
               setForm={setForm}
             />
@@ -248,7 +249,7 @@ export function RfqsPage() {
           <div className="action-row">
             <button className="button button-primary" disabled={submitting} type="submit">
               <Send size={16} aria-hidden />
-              {submitting ? "Submitting" : "Submit RFQ"}
+              {submitting ? "Procesando…" : "Procesar cotización"}
             </button>
             <button
               className="button button-secondary"
@@ -260,7 +261,7 @@ export function RfqsPage() {
               }}
               type="button"
             >
-              Submit missing weight case
+              Probar caso sin peso
             </button>
           </div>
         </form>
@@ -269,9 +270,9 @@ export function RfqsPage() {
           <div className="panel-title panel-title-action">
             <span>
               <Activity size={18} aria-hidden />
-              <h3>Run monitor</h3>
+              <h3>Monitor de corrida</h3>
             </span>
-            <button className="icon-button" onClick={reload} title="Refresh RFQs" type="button">
+            <button aria-label="Actualizar cotizaciones" className="icon-button" onClick={reload} title="Actualizar cotizaciones" type="button">
               <RefreshCw size={16} aria-hidden />
             </button>
           </div>
@@ -283,7 +284,7 @@ export function RfqsPage() {
               summary={activeSummary}
             />
           ) : (
-            <p className="muted">No RFQs have been received by this appliance yet.</p>
+            <EmptyState title="Sin señal activa" body="Procesa la primera solicitud para ver su estado en tiempo real." />
           )}
           <ActivityFeed entries={activityLog} />
         </article>
@@ -291,19 +292,17 @@ export function RfqsPage() {
         <div className="panel rfq-list">
           <div className="panel-title">
             <ListChecks size={18} aria-hidden />
-            <h3>RFQ queue</h3>
+            <h3>Cola de cotizaciones</h3>
           </div>
-          {loading ? <p className="muted">Loading RFQs from API...</p> : null}
+          {loading ? <PageSkeleton rows={3} /> : null}
           {error ? (
-            <div className="inline-error">
-              <span>{error.message}</span>
-              <button className="button button-secondary" onClick={reload} type="button">
-                Retry
-              </button>
-            </div>
+            <InlineError
+              message={error.message}
+              action={<button className="button button-secondary" onClick={reload} type="button">Reintentar</button>}
+            />
           ) : null}
           {!loading && !error && rfqs.length === 0 ? (
-            <p className="muted">No RFQs are currently stored in the local appliance.</p>
+            <EmptyState title="Sin cotizaciones aún" body="Las solicitudes recibidas desde el TMS, correo o playground aparecerán aquí." />
           ) : null}
           {rfqs.map((rfq) => (
             <button
@@ -317,7 +316,7 @@ export function RfqsPage() {
                 <small>{rfq.client_id} / {rfq.run_id}</small>
               </span>
               <span className={rfq.approval_required ? "status status-amber" : "status status-blue"}>
-                {rfq.approval_required ? "Approval" : "Writeback"}
+                {rfq.approval_required ? "Aprobación" : "Escritura TMS"}
               </span>
             </button>
           ))}
@@ -375,29 +374,29 @@ function RunSnapshot({
           <h3>{summary.run_id}</h3>
         </div>
         <span className={summary.approval_required ? "status status-amber" : "status status-green"}>
-          {summary.approval_required ? "Needs approval" : "Ready"}
+          {summary.approval_required ? "Requiere aprobación" : "Lista"}
         </span>
       </div>
       <dl className="rfq-detail-grid">
         <div>
-          <dt>Receiving</dt>
-          <dd>Playground {"->"} local API</dd>
+          <dt>Recepción</dt>
+          <dd>Playground → API local</dd>
         </div>
         <div>
-          <dt>Current phase</dt>
+          <dt>Fase actual</dt>
           <dd>{phaseFromSummary(summary)}</dd>
         </div>
         <div>
-          <dt>Lane</dt>
+          <dt>Ruta</dt>
           <dd>
             {lane
-              ? `${lane.origin.city} -> ${lane.destination.city}`
-              : "Loading lane"}
+                ? `${lane.origin.city} → ${lane.destination.city}`
+                : "Cargando ruta"}
           </dd>
         </div>
         <div>
-          <dt>Weight</dt>
-          <dd>{lane?.cargo.weight_kg ? `${lane.cargo.weight_kg} kg` : "Missing"}</dd>
+          <dt>Peso</dt>
+          <dd>{lane?.cargo.weight_kg ? `${lane.cargo.weight_kg} kg` : "Sin dato"}</dd>
         </div>
         <div>
           <dt>SAKBE</dt>
@@ -405,8 +404,8 @@ function RunSnapshot({
             {detail?.route_evidence
               ? `${detail.route_evidence.status}, ${detail.route_evidence.km_loaded ?? "?"} km`
               : detailLoading
-                ? "Loading"
-                : "Pending"}
+                ? "Cargando"
+                : "Pendiente"}
           </dd>
         </div>
         <div>
@@ -416,17 +415,18 @@ function RunSnapshot({
       </dl>
       {detail?.recommendation ? (
         <p className="agent-note">
-          Agent guide: {detail.recommendation.reason}
+          Guía operativa: {detail.recommendation.reason}
         </p>
       ) : null}
-      {detailError ? <p className="inline-error">{detailError}</p> : null}
+      {detailLoading && !detail ? <PageSkeleton rows={2} /> : null}
+      {detailError ? <InlineError message={detailError} /> : null}
     </div>
   );
 }
 
 function ActivityFeed({ entries }: { entries: ActivityEntry[] }) {
   return (
-    <div className="activity-feed" aria-label="Live process activity">
+    <div className="activity-feed" aria-label="Actividad del proceso">
       {entries.map((entry) => (
         <div className={`activity-entry activity-${entry.status}`} key={entry.id}>
           {entry.status === "running" ? (
@@ -465,25 +465,25 @@ function toPlaygroundRequest(form: RfqFormState): PlaygroundRfqRequest {
 }
 
 function phaseFromSummary(summary: WorkflowRunSummary): string {
-  if (summary.approval_required) return "Approval";
-  if (summary.route_source) return "Writeback";
+  if (summary.approval_required) return "Aprobación";
+  if (summary.route_source) return "Escritura TMS";
   return summary.status;
 }
 
 function describeCurrentAction(detail: WorkflowRunDetail | null, submitting: boolean): string {
-  if (submitting) return "Submitting RFQ";
-  if (!detail) return "Waiting";
-  if (detail.approval_state?.required) return "Waiting approval";
-  if (detail.writeback_result) return `Writeback ${detail.writeback_result.status}`;
-  if (detail.recommendation) return "Agent guide complete";
-  if (detail.base_quote) return "Quote-core complete";
-  if (detail.route_evidence) return "Route resolved";
-  return "Processing";
+  if (submitting) return "Procesando solicitud";
+  if (!detail) return "En espera";
+  if (detail.approval_state?.required) return "Espera aprobación";
+  if (detail.writeback_result) return `Escritura ${detail.writeback_result.status}`;
+  if (detail.recommendation) return "Recomendación lista";
+  if (detail.base_quote) return "Cálculo listo";
+  if (detail.route_evidence) return "Ruta resuelta";
+  return "En proceso";
 }
 
 function formatCurrency(value: number | null): string {
-  if (value === null) return "Pending";
-  return `$${new Intl.NumberFormat("en-US", { maximumFractionDigits: 0 }).format(value)} MXN`;
+  if (value === null) return "Pendiente";
+  return `$${new Intl.NumberFormat("es-MX", { maximumFractionDigits: 0 }).format(value)} MXN`;
 }
 
 export default RfqsPage;

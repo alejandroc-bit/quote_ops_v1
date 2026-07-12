@@ -46,9 +46,9 @@ describe("Separated product shells", () => {
     render(<ControlPlaneApp />);
 
     expect(await screen.findByRole("heading", { name: /Iniciar sesión/i })).toBeInTheDocument();
-    expect(screen.getByLabelText(/Correo de administración/i)).toBeInTheDocument();
+    expect(await screen.findByLabelText(/Correo de administración/i)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /Enviar enlace mágico/i })).toBeInTheDocument();
-    expect(screen.queryByRole("heading", { name: /Authorized clients/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: /Clientes autorizados/i })).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: /Clientes/i })).toBeDisabled();
   });
 
@@ -66,17 +66,17 @@ describe("Separated product shells", () => {
 
     expect(await screen.findByText(/Sesión iniciada como ops@inducta.example/i)).toBeInTheDocument();
     expect(
-      screen.getByRole("heading", { name: /Authorized clients/i })
+      screen.getByRole("heading", { name: /Clientes autorizados/i })
     ).toBeInTheDocument();
     expect(
-      screen.getByRole("navigation", { name: /Plano de control de Inducta/i })
+      screen.getByRole("navigation", { name: /Navegación del plano de control/i })
     ).toBeInTheDocument();
-    expect(screen.getByRole("heading", { name: /Inducta Control Plane/i })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: /Inducta · Plano de control/i })).toBeInTheDocument();
     expect(await screen.findByText(/Autolineas NuevoMex/i)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /Clientes/i })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /Create client/i })).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: /Inbox/i })).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: /RFQs/i })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Crear cliente/i })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Bandeja/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Cotizaciones/i })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /Aprobaciones/i })).not.toBeInTheDocument();
     expect(screen.queryByText(/hero/i)).not.toBeInTheDocument();
     expect(screen.queryByText(/coming soon/i)).not.toBeInTheDocument();
@@ -118,33 +118,33 @@ describe("Separated product shells", () => {
     mockSetupState();
     render(<ClientPortalApp />);
 
-    expect(await screen.findByRole("heading", { name: /Inbox workspace/i })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: /Bandeja operativa/i })).toBeInTheDocument();
     expect(
-      screen.getByRole("navigation", { name: /Client appliance portal/i })
+      screen.getByRole("navigation", { name: /Navegación del appliance/i })
     ).toBeInTheDocument();
     expect(
-      screen.getByRole("heading", { name: /QuoteOps Client Appliance Portal/i })
+      screen.getByRole("heading", { name: /QuoteOps · Operación local/i })
     ).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /Inbox/i })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /RFQs/i })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /Knowledge/i })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Bandeja/i })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Cotizaciones/i })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Conocimiento/i })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /Aprobaciones/i })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /Clients/i })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /Install/i })).not.toBeInTheDocument();
     expect(screen.queryByText(/Autolineas NuevoMex/i)).not.toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: /Knowledge/i }));
-    expect(screen.getByRole("heading", { name: /Knowledge staging preview/i })).toBeInTheDocument();
-    expect(screen.getAllByText(/client-owned embedding key/i).length).toBeGreaterThan(0);
+    fireEvent.click(screen.getByRole("button", { name: /Conocimiento/i }));
+    expect(screen.getByRole("heading", { name: /Base de conocimiento/i })).toBeInTheDocument();
+    expect(screen.getAllByText(/Llave del cliente/i).length).toBeGreaterThan(0);
   });
 
   it("blocks client operations while setup state is loading", () => {
     vi.spyOn(globalThis, "fetch").mockImplementation(async () => new Promise<Response>(() => {}));
     render(<ClientPortalApp />);
 
-    expect(screen.getByRole("heading", { name: /Checking setup state/i })).toBeInTheDocument();
-    expect(screen.queryByRole("heading", { name: /Inbox workspace/i })).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /Inbox/i })).toBeDisabled();
+    expect(screen.getByRole("heading", { name: /Verificando el entorno local/i })).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: /Bandeja operativa/i })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Bandeja/i })).toBeDisabled();
   });
 
   it("fails closed and retries when setup state cannot be fetched", async () => {
@@ -154,14 +154,14 @@ describe("Separated product shells", () => {
       .mockResolvedValueOnce(jsonResponse(defaultSetupState()));
     render(<ClientPortalApp />);
 
-    expect(await screen.findByRole("heading", { name: /Setup check failed closed/i })).toBeInTheDocument();
-    expect(screen.queryByRole("heading", { name: /Inbox workspace/i })).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /Inbox/i })).toBeDisabled();
+    expect(await screen.findByRole("heading", { name: /No pudimos verificar la configuración/i })).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: /Bandeja operativa/i })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Bandeja/i })).toBeDisabled();
 
-    fireEvent.click(screen.getByRole("button", { name: /Retry setup check/i }));
+    fireEvent.click(screen.getByRole("button", { name: /Reintentar verificación/i }));
 
-    expect(await screen.findByRole("heading", { name: /Inbox workspace/i })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /Inbox/i })).not.toBeDisabled();
+    expect(await screen.findByRole("heading", { name: /Bandeja operativa/i })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Bandeja/i })).not.toBeDisabled();
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
@@ -186,16 +186,16 @@ describe("Separated product shells", () => {
     });
     render(<ClientPortalApp />);
 
-    expect(await screen.findByText(/Activate signed license/i)).toBeInTheDocument();
-    expect(screen.getByText(/Configure secrets/i)).toBeInTheDocument();
-    expect(screen.getByText(/Connect TMS adapter/i)).toBeInTheDocument();
-    expect(screen.getByText(/Map TMS data/i)).toBeInTheDocument();
-    expect(screen.getByText(/Build local knowledge base/i)).toBeInTheDocument();
-    expect(screen.getByText(/Connect agent RFQ mailbox/i)).toBeInTheDocument();
-    expect(screen.getByText(/Connect SAKBE route evidence/i)).toBeInTheDocument();
-    expect(screen.getByText(/Run test RFQ/i)).toBeInTheDocument();
-    expect(screen.getAllByText(/Secret values never go to the cloud/i).length).toBeGreaterThan(0);
-    expect(screen.getByRole("button", { name: /Inbox/i })).toBeDisabled();
+    expect(await screen.findByText(/Activar licencia firmada/i)).toBeInTheDocument();
+    expect(screen.getByText(/Configurar secretos/i)).toBeInTheDocument();
+    expect(screen.getByText(/Conectar adaptador TMS/i)).toBeInTheDocument();
+    expect(screen.getByText(/Mapear datos del TMS/i)).toBeInTheDocument();
+    expect(screen.getByText(/Crear conocimiento local/i)).toBeInTheDocument();
+    expect(screen.getByText(/Conectar buzón de cotizaciones/i)).toBeInTheDocument();
+    expect(screen.getByText(/Conectar evidencia SAKBE/i)).toBeInTheDocument();
+    expect(screen.getByText(/Ejecutar cotización de prueba/i)).toBeInTheDocument();
+    expect(screen.getAllByText(/Los secretos nunca salen a la nube/i).length).toBeGreaterThan(0);
+    expect(screen.getByRole("button", { name: /Bandeja/i })).toBeDisabled();
   });
 });
 
@@ -204,18 +204,18 @@ describe("ClientsPage", () => {
     mockControlPlaneApi();
     render(<ClientsPage />);
 
-    expect(screen.getByRole("heading", { name: /Authorized clients/i })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: /Clientes autorizados/i })).toBeInTheDocument();
     expect(await screen.findByText(/Autolineas NuevoMex/i)).toBeInTheDocument();
     expect(screen.getByText(/Transportes Nory/i)).toBeInTheDocument();
     expect(screen.getByText(/Caruba Logistics/i)).toBeInTheDocument();
-    expect(screen.getAllByTitle(/Generate install pack/i).length).toBeGreaterThan(0);
+    expect(screen.getAllByTitle(/Generar paquete de instalación/i).length).toBeGreaterThan(0);
 
-    fireEvent.change(screen.getByLabelText(/Client id/i), { target: { value: "ACME" } });
-    fireEvent.change(screen.getByLabelText(/Legal name/i), { target: { value: "ACME Transport" } });
-    fireEvent.change(screen.getByLabelText(/Authorized email/i), {
+    fireEvent.change(screen.getByLabelText(/ID del cliente/i), { target: { value: "ACME" } });
+    fireEvent.change(screen.getByLabelText(/Razón social/i), { target: { value: "ACME Transport" } });
+    fireEvent.change(screen.getByLabelText(/Correo autorizado/i), {
       target: { value: "owner@acme.example" }
     });
-    fireEvent.click(screen.getByRole("button", { name: /Create client/i }));
+    fireEvent.click(screen.getByRole("button", { name: /Crear cliente/i }));
 
     expect(await screen.findByText(/ACME Transport/i)).toBeInTheDocument();
     expect(screen.getAllByText(/acme-prod-001/i).length).toBeGreaterThan(0);
@@ -229,14 +229,14 @@ describe("InboxPage", () => {
     const fetchMock = mockQuoteOpsApi();
     render(<InboxPage />);
 
-    expect(screen.getByRole("heading", { name: /Inbox workspace/i })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: /Bandeja operativa/i })).toBeInTheDocument();
     expect(screen.getAllByText(/MAILBOX_USER/i).length).toBeGreaterThan(0);
     expect(screen.queryByText(/WHATSAPP_ACCESS_TOKEN/i)).not.toBeInTheDocument();
-    expect(screen.getByText(/Parser agent/i)).toBeInTheDocument();
+    expect(screen.getByText(/Normalización/i)).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: /Simulate mailbox RFQ/i }));
+    fireEvent.click(screen.getByRole("button", { name: /Simular correo de cotización/i }));
 
-    expect(await screen.findByText(/Mailbox RFQ queued/i)).toBeInTheDocument();
+    expect(await screen.findByText(/Cotización en cola/i)).toBeInTheDocument();
     expect((await screen.findAllByText(/RUN-UI-NEW/i)).length).toBeGreaterThan(0);
     await waitFor(() => {
       expect(fetchMock).toHaveBeenCalledWith(
@@ -253,30 +253,30 @@ describe("RfqsPage", () => {
     render(<RfqsPage />);
 
     expect(
-      screen.getByRole("heading", { name: /Playground operations/i })
+      screen.getByRole("heading", { name: /Operación de cotizaciones/i })
     ).toBeInTheDocument();
-    expectVisibleText(/Live RFQ intake/i);
+    expectVisibleText(/Cotización en tiempo real/i);
     expect((await screen.findAllByText(/RFQ-UI-001/i)).length).toBeGreaterThan(0);
     expect(screen.getAllByText(/RUN-UI-001/i).length).toBeGreaterThan(0);
     expect(screen.getAllByText(/\$42,800 MXN/i).length).toBeGreaterThan(0);
     expect(screen.getAllByText(/sakbe/i).length).toBeGreaterThan(0);
-    expectVisibleText(/Run monitor/i);
-    expectVisibleText(/RFQ execution timeline/i);
-    expectVisibleText(/SAKBE route evidence/i);
-    expectVisibleText(/Apply TMS canonical mapping/i);
-    expectVisibleText(/Retrieve client criteria/i);
-    expectVisibleText(/The cloud receives only safe progress summaries/i);
+    expectVisibleText(/Monitor de corrida/i);
+    expectVisibleText(/Flujo de ejecución/i);
+    expectVisibleText(/Evidencia SAKBE/i);
+    expectVisibleText(/Mapeo canónico TMS/i);
+    expectVisibleText(/Criterios del cliente/i);
+    expectVisibleText(/La nube recibe solo resúmenes seguros/i);
   });
 
   it("submits a Playground RFQ through the API", async () => {
     const fetchMock = mockQuoteOpsApi();
     render(<RfqsPage />);
 
-    const weight = screen.getByLabelText(/Weight kg/i);
+    const weight = screen.getByLabelText(/Peso en kg/i);
     fireEvent.change(weight, { target: { value: "29000" } });
-    fireEvent.click(screen.getByRole("button", { name: /Submit RFQ/i }));
+    fireEvent.click(screen.getByRole("button", { name: /Procesar cotización/i }));
 
-    expect(await screen.findByText(/Workflow queued/i)).toBeInTheDocument();
+    expect(await screen.findByText(/Flujo en cola/i)).toBeInTheDocument();
     expect(await screen.findByText(/RUN-UI-NEW/i)).toBeInTheDocument();
     await waitFor(() => {
       expect(fetchMock).toHaveBeenCalledWith(
@@ -290,9 +290,9 @@ describe("RfqsPage", () => {
     const fetchMock = mockQuoteOpsApi();
     render(<RfqsPage />);
 
-    fireEvent.click(screen.getByRole("button", { name: /Submit missing weight case/i }));
+    fireEvent.click(screen.getByRole("button", { name: /Probar caso sin peso/i }));
 
-    expect(await screen.findByText(/Workflow queued/i)).toBeInTheDocument();
+    expect(await screen.findByText(/Flujo en cola/i)).toBeInTheDocument();
     await waitFor(() => {
       const playgroundCall = fetchMock.mock.calls.find(
         ([url, init]) =>
@@ -321,9 +321,9 @@ describe("RfqExecutionTimeline", () => {
       />
     );
 
-    expect(screen.getByText(/Apply TMS canonical mapping/i)).toBeInTheDocument();
-    expect(screen.getByText(/Retrieve client criteria/i)).toBeInTheDocument();
-    expect(screen.getByText(/The cloud receives only safe progress summaries/i)).toBeInTheDocument();
+    expect(screen.getByText(/Mapeo canónico TMS/i)).toBeInTheDocument();
+    expect(screen.getByText(/Criterios del cliente/i)).toBeInTheDocument();
+    expect(screen.getByText(/La nube recibe solo resúmenes seguros/i)).toBeInTheDocument();
   });
 });
 
@@ -331,14 +331,14 @@ describe("KnowledgePage", () => {
   it("shows local RAG upload and search state without cloud storage claims", () => {
     render(<KnowledgePage />);
 
-    expect(screen.getByRole("heading", { name: /Knowledge staging preview/i })).toBeInTheDocument();
-    expect(screen.getByText(/Local appliance knowledge base/i)).toBeInTheDocument();
-    expect(screen.getAllByText(/client-owned embedding key/i).length).toBeGreaterThan(0);
-    expect(screen.getByText(/Stage criteria files/i)).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /Stage local preview/i })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /Search/i })).toBeInTheDocument();
-    expect(screen.getByText(/stages local filenames only/i)).toBeInTheDocument();
-    expect(screen.getByText(/not documents or embeddings/i)).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: /Base de conocimiento/i })).toBeInTheDocument();
+    expect(screen.getByText(/Conocimiento dentro del appliance/i)).toBeInTheDocument();
+    expect(screen.getAllByText(/Llave del cliente/i).length).toBeGreaterThan(0);
+    expect(screen.getByText(/Preparar archivos de criterios/i)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Preparar vista local/i })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Buscar/i })).toBeInTheDocument();
+    expect(screen.getByText(/Esta vista prepara nombres de archivo/i)).toBeInTheDocument();
+    expect(screen.getByText(/nunca documentos ni embeddings/i)).toBeInTheDocument();
   });
 });
 
@@ -348,7 +348,7 @@ describe("ApprovalsPage", () => {
     render(<ApprovalsPage />);
 
     expect(
-      screen.getByRole("heading", { name: /Approval workspace/i })
+      screen.getByRole("heading", { name: /Centro de aprobaciones/i })
     ).toBeInTheDocument();
     expect((await screen.findAllByText(/RUN-UI-001/i)).length).toBeGreaterThan(0);
     expect(screen.getByText(/RUN-UI-002/i)).toBeInTheDocument();
@@ -356,30 +356,30 @@ describe("ApprovalsPage", () => {
     expect(screen.getByText(/historical_context_insufficient/i)).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: /RFQ-UI-001/i }));
 
-    fireEvent.click(screen.getByRole("button", { name: /View evidence/i }));
-    expect(screen.getByText(/SAKBE route evidence/i)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /Ver evidencia/i }));
+    expect(screen.getByText(/Evidencia de ruta SAKBE/i)).toBeInTheDocument();
     expect(screen.getAllByText(/sakbe/i).length).toBeGreaterThan(0);
 
     fireEvent.click(
-      screen.getByRole("button", { name: /View criteria used/i })
+      screen.getByRole("button", { name: /Ver criterios aplicados/i })
     );
     expect(screen.getAllByText(/margin floor/i).length).toBeGreaterThan(0);
 
-    const adjustment = screen.getByLabelText(/Adjusted rate/i);
+    const adjustment = screen.getByLabelText(/Tarifa ajustada/i);
     fireEvent.change(adjustment, { target: { value: "44500" } });
-    fireEvent.click(screen.getByRole("button", { name: /Apply adjustment/i }));
-    expect((await screen.findAllByText(/Adjusted by client approver/i)).length).toBeGreaterThan(0);
+    fireEvent.click(screen.getByRole("button", { name: /Aplicar ajuste/i }));
+    expect((await screen.findAllByText(/Ajustada por el cliente/i)).length).toBeGreaterThan(0);
     expect(screen.getByText(/\$44,500 MXN/i)).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: /^Approve$/i }));
-    expect((await screen.findAllByText(/Approved by client approver/i)).length).toBeGreaterThan(0);
+    fireEvent.click(screen.getByRole("button", { name: /^Aprobar$/i }));
+    expect((await screen.findAllByText(/Aprobada por el cliente/i)).length).toBeGreaterThan(0);
     expectVisibleText(/written/i);
 
-    fireEvent.click(screen.getByRole("button", { name: /Reject/i }));
-    expect((await screen.findAllByText(/Rejected for rework/i)).length).toBeGreaterThan(0);
+    fireEvent.click(screen.getByRole("button", { name: /Rechazar/i }));
+    expect((await screen.findAllByText(/Rechazada para corrección/i)).length).toBeGreaterThan(0);
 
-    fireEvent.click(screen.getByRole("button", { name: /Request review/i }));
-    expect((await screen.findAllByText(/Review requested/i)).length).toBeGreaterThan(0);
+    fireEvent.click(screen.getByRole("button", { name: /Solicitar revisión/i }));
+    expect((await screen.findAllByText(/Revisión solicitada/i)).length).toBeGreaterThan(0);
 
     await waitFor(() => {
       expect(fetchMock).toHaveBeenCalledWith(
@@ -394,14 +394,14 @@ describe("SetupPage", () => {
   it("explains Docker install, secrets, and TMS adapter contract", () => {
     render(<SetupPage />);
 
-    expect(screen.getByRole("heading", { name: /Setup workspace/i })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: /Instalación del appliance/i })).toBeInTheDocument();
     expect(screen.getAllByText(/api\/install/i).length).toBeGreaterThan(0);
     expect(screen.getAllByText(/QUOTEOPS_REGISTRATION_TOKEN/i).length).toBeGreaterThan(0);
     expect(screen.getAllByText(/AI_PROVIDER_API_KEY/i).length).toBeGreaterThan(0);
     expect(screen.getAllByText(/TMS_API_KEY/i).length).toBeGreaterThan(0);
     expect(screen.getAllByText(/docker compose/i).length).toBeGreaterThan(0);
     expect(screen.getByText(/writeback_quote/i)).toBeInTheDocument();
-    expect(screen.getByText(/Raw RFQs and historical quote rows/i)).toBeInTheDocument();
+    expect(screen.getByText(/Solicitudes y filas históricas de cotización/i)).toBeInTheDocument();
     expect(screen.queryByText(/approval envelopes/i)).not.toBeInTheDocument();
   });
 });
@@ -412,24 +412,24 @@ describe("HealthPage", () => {
     render(<HealthPage />);
 
     expect(
-      screen.getByRole("heading", { name: /Health workspace/i })
+      screen.getByRole("heading", { name: /Estado operativo/i })
     ).toBeInTheDocument();
 
     expect(await screen.findByText(/quoteops-v2\.0\.0/i)).toBeInTheDocument();
-    expect(screen.getByText(/3 workflow runs \/ 1 heartbeats/i)).toBeInTheDocument();
+    expect(screen.getByText(/3 corridas \/ 1 pulsos/i)).toBeInTheDocument();
 
     for (const service of [
       "TMS",
       "SAKBE",
-      "Email",
-      "Model",
-      "Knowledge",
+      "Correo",
+      "Modelo",
+      "Conocimiento",
       "Quote-core",
-      "Control plane",
-      "Backup",
-      "License",
-      "TMS mapping",
-      "Versions"
+      "Plano de control",
+      "Respaldo",
+      "Licencia",
+      "Mapeo TMS",
+      "Versiones"
     ]) {
       expect(screen.getByText(service)).toBeInTheDocument();
     }

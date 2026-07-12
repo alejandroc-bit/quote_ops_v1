@@ -16,23 +16,18 @@ import {
   type ApprovalEnvelope
 } from "../api/quoteOpsApi";
 import { useAsyncResource } from "../api/useAsyncResource";
+import { EmptyState, InlineError, PageSkeleton } from "../UiStates";
 
 type ApprovalStatus =
-  | "Pending approval"
-  | "Approved by client approver"
-  | "Rejected for rework"
-  | "Review requested"
-  | "Adjusted by client approver";
+  | "Pendiente de aprobación"
+  | "Aprobada por el cliente"
+  | "Rechazada para corrección"
+  | "Revisión solicitada"
+  | "Ajustada por el cliente";
 
 function formatCurrency(value: number | null) {
-  if (value === null) return "Pending";
-  return new Intl.NumberFormat("en-US", {
-    maximumFractionDigits: 0,
-    style: "currency",
-    currency: "USD"
-  })
-    .format(value)
-    .concat(" MXN");
+  if (value === null) return "Pendiente";
+  return `$${new Intl.NumberFormat("es-MX", { maximumFractionDigits: 0 }).format(value)} MXN`;
 }
 
 export function ApprovalsPage() {
@@ -42,7 +37,7 @@ export function ApprovalsPage() {
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
   const approval =
     approvals.find((candidate) => candidate.run_id === selectedRunId) ?? approvals[0] ?? null;
-  const [status, setStatus] = useState<ApprovalStatus>("Pending approval");
+  const [status, setStatus] = useState<ApprovalStatus>("Pendiente de aprobación");
   const [decisionResponse, setDecisionResponse] = useState<ApprovalDecisionResponse | null>(null);
   const [decisionError, setDecisionError] = useState<string | null>(null);
   const [submittingAction, setSubmittingAction] = useState<ApprovalDecisionAction | null>(null);
@@ -82,7 +77,7 @@ export function ApprovalsPage() {
       const response = await submitDecision(approval.run_id, {
         action,
         ...(rate_mxn ? { rate_mxn } : {}),
-        reason: action === "adjust" ? "Adjusted in client playground" : "Decision from client playground"
+        reason: action === "adjust" ? "Ajuste desde el playground del cliente" : "Decisión desde el playground del cliente"
       });
       setDecisionResponse(response);
       setStatus(statusFromAction(action));
@@ -98,26 +93,24 @@ export function ApprovalsPage() {
     <section aria-labelledby="approvals-heading" className="workspace">
       <div className="workspace-heading">
         <div>
-          <p className="eyebrow">Commercial decisions</p>
-          <h2 id="approvals-heading">Approval workspace</h2>
+          <p className="eyebrow">Decisiones comerciales</p>
+          <h2 id="approvals-heading">Centro de aprobaciones</h2>
         </div>
         <div className="compact-stats">
           <span className="status status-amber">{status}</span>
-          <span>live every 3s</span>
+          <span>Actualización cada 3 s</span>
         </div>
       </div>
 
-      {loading ? <p className="panel muted">Loading approvals from API...</p> : null}
+      {loading ? <PageSkeleton rows={3} /> : null}
       {error ? (
-        <div className="panel inline-error">
-          <span>{error.message}</span>
-          <button className="button button-secondary" onClick={reload} type="button">
-            Retry
-          </button>
-        </div>
+        <InlineError
+          message={error.message}
+          action={<button className="button button-secondary" onClick={reload} type="button">Reintentar</button>}
+        />
       ) : null}
       {!loading && !error && !approval ? (
-        <p className="panel muted">No approval envelopes are pending in the local appliance.</p>
+        <EmptyState title="Sin decisiones pendientes" body="Las cotizaciones que crucen un umbral de control aparecerán aquí antes de escribir al TMS." />
       ) : null}
       {approval ? (
         <div className="approval-layout">
@@ -162,7 +155,7 @@ function ApprovalQueue({
     <aside className="panel approval-queue">
       <div className="panel-title">
         <FileSearch size={18} aria-hidden />
-        <h3>Approval queue</h3>
+        <h3>Cola de aprobación</h3>
       </div>
       {approvals.map((approval) => (
         <button
@@ -178,7 +171,7 @@ function ApprovalQueue({
             <small>{approval.client_id} / {approval.run_id}</small>
             <small>{approval.review_reasons.join(", ") || "approval_required"}</small>
           </span>
-          <span className="status status-amber">Review</span>
+          <span className="status status-amber">Revisar</span>
         </button>
       ))}
     </aside>
@@ -220,35 +213,35 @@ function ApprovalWorkspace({
         <div className="approval-summary">
           <div>
             <p className="muted">{approval.rfq_id} / {approval.run_id}</p>
-            <h3>{approval.lane.origin} {"->"} {approval.lane.destination}</h3>
+            <h3>{approval.lane.origin} → {approval.lane.destination}</h3>
           </div>
           <div className="rate-block">
-            <span>Adjusted recommendation</span>
+            <span>Recomendación ajustada</span>
             <strong>{formatCurrency(adjustedRate || approval.recommended_rate_mxn)}</strong>
           </div>
         </div>
 
         <dl className="approval-facts">
           <div>
-            <dt>Base rate</dt>
+            <dt>Tarifa base</dt>
             <dd>{formatCurrency(approval.base_rate_mxn)}</dd>
           </div>
           <div>
-            <dt>Quote-core recommendation</dt>
+            <dt>Recomendación de Quote-core</dt>
             <dd>{formatCurrency(approval.recommended_rate_mxn)}</dd>
           </div>
           <div>
-            <dt>Approval owner</dt>
+            <dt>Responsable de aprobar</dt>
             <dd>{approval.client_id}</dd>
           </div>
           <div>
-            <dt>Decision state</dt>
+            <dt>Estado de decisión</dt>
             <dd>{status}</dd>
           </div>
         </dl>
 
         <div className="adjustment-row">
-          <label htmlFor="adjusted-rate">Adjusted rate</label>
+          <label htmlFor="adjusted-rate">Tarifa ajustada</label>
           <input
             id="adjusted-rate"
             inputMode="numeric"
@@ -262,7 +255,7 @@ function ApprovalWorkspace({
             onClick={() => onDecision("adjust", adjustedRate)}
             type="button"
           >
-            Apply adjustment
+            Aplicar ajuste
           </button>
         </div>
 
@@ -274,7 +267,7 @@ function ApprovalWorkspace({
             type="button"
           >
             <CheckCircle2 size={16} aria-hidden />
-            Approve
+            Aprobar
           </button>
           <button
             className="button button-danger"
@@ -283,7 +276,7 @@ function ApprovalWorkspace({
             type="button"
           >
             <XCircle size={16} aria-hidden />
-            Reject
+            Rechazar
           </button>
           <button
             className="button button-secondary"
@@ -292,22 +285,22 @@ function ApprovalWorkspace({
             type="button"
           >
             <RotateCcw size={16} aria-hidden />
-            Request review
+            Solicitar revisión
           </button>
         </div>
         {decisionResponse ? (
           <p className="writeback-line">
-            <span>Writeback</span>
-            <strong>{decisionResponse.writeback_result?.status ?? "skipped"}</strong>
+            <span>Escritura TMS</span>
+            <strong>{decisionResponse.writeback_result?.status ?? "omitida"}</strong>
           </p>
         ) : null}
-        {decisionError ? <p className="inline-error">{decisionError}</p> : null}
+        {decisionError ? <InlineError message={decisionError} /> : null}
       </article>
 
       <aside className="panel inspector">
         <div className="panel-title">
           <FileSearch size={18} aria-hidden />
-          <h3>Decision inspector</h3>
+          <h3>Inspector de decisión</h3>
         </div>
         <button
           className="inspector-toggle"
@@ -315,15 +308,15 @@ function ApprovalWorkspace({
           type="button"
         >
           <Eye size={16} aria-hidden />
-          View evidence
+          Ver evidencia
         </button>
         {showEvidence ? (
           <div className="inspector-box">
-            <h4>SAKBE route evidence</h4>
+            <h4>Evidencia de ruta SAKBE</h4>
             <p>
               {approval.evidence_flags.route_source ?? "route"} /{" "}
-              {approval.evidence_flags.route_resolved ? "resolved" : "unresolved"} /{" "}
-              {approval.evidence_flags.historical_layer ?? "no historical layer"}
+              {approval.evidence_flags.route_resolved ? "resuelta" : "sin resolver"} /{" "}
+              {approval.evidence_flags.historical_layer ?? "sin capa histórica"}
             </p>
           </div>
         ) : null}
@@ -334,16 +327,16 @@ function ApprovalWorkspace({
           type="button"
         >
           <History size={16} aria-hidden />
-          View criteria used
+          Ver criterios aplicados
         </button>
         {showCriteria ? (
           <div className="inspector-box">
-            <h4>Criteria used</h4>
+            <h4>Criterios aplicados</h4>
             <ul>
               {approval.review_reasons.length > 0 ? (
                 approval.review_reasons.map((reason) => <li key={reason}>{reason}</li>)
               ) : (
-                <li>margin floor satisfied</li>
+                <li>Margen mínimo satisfecho</li>
               )}
             </ul>
           </div>
@@ -351,7 +344,7 @@ function ApprovalWorkspace({
 
         <div className="risk-note">
           <AlertTriangle size={16} aria-hidden />
-          Review blocks TMS writeback until a final decision is recorded.
+          La revisión bloquea la escritura al TMS hasta registrar una decisión final.
         </div>
       </aside>
     </>
@@ -359,18 +352,18 @@ function ApprovalWorkspace({
 }
 
 function statusFromEnvelope(approval: ApprovalEnvelope): ApprovalStatus {
-  if (approval.decision_status === "approved") return "Approved by client approver";
-  if (approval.decision_status === "adjusted") return "Adjusted by client approver";
-  if (approval.decision_status === "rejected") return "Rejected for rework";
-  if (approval.decision_status === "review_requested") return "Review requested";
-  return "Pending approval";
+  if (approval.decision_status === "approved") return "Aprobada por el cliente";
+  if (approval.decision_status === "adjusted") return "Ajustada por el cliente";
+  if (approval.decision_status === "rejected") return "Rechazada para corrección";
+  if (approval.decision_status === "review_requested") return "Revisión solicitada";
+  return "Pendiente de aprobación";
 }
 
 function statusFromAction(action: ApprovalDecisionAction): ApprovalStatus {
-  if (action === "approve") return "Approved by client approver";
-  if (action === "adjust") return "Adjusted by client approver";
-  if (action === "reject") return "Rejected for rework";
-  return "Review requested";
+  if (action === "approve") return "Aprobada por el cliente";
+  if (action === "adjust") return "Ajustada por el cliente";
+  if (action === "reject") return "Rechazada para corrección";
+  return "Revisión solicitada";
 }
 
 export default ApprovalsPage;

@@ -29,6 +29,7 @@ POSTGRES_USER="${POSTGRES_USER:-quoteops}"
 POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-}"
 FORCE=0
 START_STACK=1
+PULL_IMAGES=1
 ENV_FILE_SET=0
 SECRETS_ENV_FILE_SET=0
 
@@ -60,6 +61,7 @@ Options:
   --installation-id ID     Stable appliance installation id
   --force                  Replace existing env file and manifest copy
   --skip-start             Prepare files without running docker compose up
+  --no-pull                Skip docker compose pull; validate config and start pre-loaded images
   -h, --help               Show this help
 USAGE
 }
@@ -294,6 +296,10 @@ while [[ $# -gt 0 ]]; do
       START_STACK=0
       shift
       ;;
+    --no-pull)
+      PULL_IMAGES=0
+      shift
+      ;;
     -h|--help)
       usage
       exit 0
@@ -491,7 +497,9 @@ chmod 600 "$TARGET_AGENT_CONFIG"
 
 if [[ "$START_STACK" -eq 1 ]]; then
   docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" config >/dev/null
-  docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" pull
+  if [[ "$PULL_IMAGES" -eq 1 ]]; then
+    docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" pull
+  fi
   docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" up -d
 fi
 

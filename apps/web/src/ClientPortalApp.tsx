@@ -7,8 +7,6 @@ import {
   ListTree,
   Mail,
   RefreshCw,
-  ShieldCheck,
-  TriangleAlert
 } from "lucide-react";
 import { getSetupState, type SetupState } from "./api/quoteOpsApi";
 import { AppShell, type DashboardPage } from "./AppShell";
@@ -19,49 +17,50 @@ import { InboxPage } from "./pages/inbox";
 import { KnowledgePage } from "./pages/knowledge";
 import { RfqsPage } from "./pages/rfqs";
 import { NAVIGATE_EVENT, RunsPage } from "./pages/runs";
+import { InlineError, PageSkeleton } from "./UiStates";
 
 type ClientPortalPageKey = "inbox" | "runs" | "rfqs" | "knowledge" | "approvals" | "health";
 
 const clientPortalPages: Array<DashboardPage<ClientPortalPageKey>> = [
   {
     key: "inbox",
-    label: "Inbox",
-    description: "Agent mailbox",
+    label: "Bandeja",
+    description: "Entrada de solicitudes",
     icon: Mail,
     component: InboxPage
   },
   {
     key: "runs",
-    label: "Runs",
-    description: "Paso a paso del agente",
+    label: "Corridas",
+    description: "Flujo de control",
     icon: ListTree,
     component: RunsPage
   },
   {
     key: "rfqs",
-    label: "RFQs",
-    description: "Active quoting",
+    label: "Cotizaciones",
+    description: "Operación activa",
     icon: LayoutDashboard,
     component: RfqsPage
   },
   {
     key: "knowledge",
-    label: "Knowledge",
-    description: "Local RAG",
+    label: "Conocimiento",
+    description: "Contexto local",
     icon: BookOpen,
     component: KnowledgePage
   },
   {
     key: "approvals",
     label: "Aprobaciones",
-    description: "Director decisions",
+    description: "Decisiones humanas",
     icon: ClipboardCheck,
     component: ApprovalsPage
   },
   {
     key: "health",
-    label: "Health",
-    description: "Local appliance",
+    label: "Estado",
+    description: "Appliance local",
     icon: HeartPulse,
     component: HealthPage
   }
@@ -119,7 +118,7 @@ export function ClientPortalApp() {
     if (setupError || !setup) {
       return (
         <SetupGateStatus
-          error={setupError ?? "Setup state is unavailable"}
+          error={setupError ?? "El estado de configuración no está disponible."}
           mode="error"
           onRetry={loadSetupState}
         />
@@ -132,25 +131,25 @@ export function ClientPortalApp() {
   }, [loadSetupState, setup, setupError, setupLoading, setupRequired]);
   const runtimeItems = useMemo(() => {
     const setupStatus = setupLoading
-      ? "Checking setup"
+      ? "Verificando configuración"
       : setupRequired
-        ? "Setup required"
+        ? "Configuración pendiente"
         : setupError
-          ? "Setup check unavailable"
-          : "Setup ready";
-    return ["Local appliance", setupStatus, "Quote-core 2.0.0"];
+          ? "Verificación no disponible"
+          : "Configuración lista";
+    return ["Appliance local", setupStatus, "Quote-core 2.0.0"];
   }, [setupError, setupLoading, setupRequired]);
 
   return (
     <AppShell
       activePage={activePage}
-      ariaLabel="Client appliance portal"
+      ariaLabel="Navegación del appliance"
       contentOverride={setupOverride}
       defaultPage={clientPortalPages[0]!}
-      headerTitle="QuoteOps Client Appliance Portal"
+      headerTitle="QuoteOps · Operación local"
       navDisabled={portalLocked}
       pages={clientPortalPages}
-      productKicker="Local client product"
+      productKicker="Inducta / operaciones críticas"
       runtimeItems={runtimeItems}
       setActivePage={setActivePage}
     />
@@ -172,35 +171,27 @@ function SetupGateStatus({
     <section className="workspace" aria-labelledby="setup-gate-heading">
       <div className="workspace-heading">
         <div>
-          <p className="eyebrow">Local appliance setup</p>
+          <p className="eyebrow">Configuración del appliance</p>
           <h2 id="setup-gate-heading">
-            {isError ? "Setup check failed closed" : "Checking setup state"}
+            {isError ? "No pudimos verificar la configuración" : "Verificando el entorno local"}
           </h2>
         </div>
         <div className="compact-stats">
-          <span>{isError ? "operational pages blocked" : "setup-state pending"}</span>
+          <span>{isError ? "Operación bloqueada" : "Validación en curso"}</span>
         </div>
       </div>
 
-      <article className={isError ? "panel setup-boundary-note setup-error-note" : "panel setup-boundary-note"}>
-        {isError ? <TriangleAlert size={20} aria-hidden /> : <ShieldCheck size={20} aria-hidden />}
-        <div>
-          <strong>
-            {isError ? "Cannot verify local setup state" : "Verifying local setup before RFQs"}
-          </strong>
-          <p>
-            {isError
-              ? error
-              : "Operational pages stay locked until the local appliance reports signed activation and required setup steps."}
-          </p>
-        </div>
-      </article>
+      {isError ? (
+        <InlineError message={error ?? "No se pudo verificar el entorno local."} />
+      ) : (
+        <PageSkeleton rows={3} />
+      )}
 
       {isError ? (
         <div className="action-row">
           <button className="button button-secondary" onClick={onRetry} type="button">
             <RefreshCw size={16} aria-hidden />
-            Retry setup check
+            Reintentar verificación
           </button>
         </div>
       ) : null}
