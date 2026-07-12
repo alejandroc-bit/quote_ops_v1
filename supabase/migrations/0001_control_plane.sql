@@ -75,8 +75,9 @@ create table public.sentinel_reports (
   constraint sentinel_reports_stats_aggregate_only check (
     case
       when jsonb_typeof(stats) = 'object'
-        then jsonb_object_length(stats) = 4
-          and stats ?& array['runs', 'errors', 'interrupts', 'avg_node_ms']::text[]
+        -- exactly these four keys: all present, and removing them leaves {}
+        then stats ?& array['runs', 'errors', 'interrupts', 'avg_node_ms']::text[]
+          and (stats - 'runs' - 'errors' - 'interrupts' - 'avg_node_ms') = '{}'::jsonb
       else false
     end
     and case

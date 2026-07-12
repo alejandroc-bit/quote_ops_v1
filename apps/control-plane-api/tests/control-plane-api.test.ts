@@ -914,7 +914,9 @@ describe("Supabase control-plane migration", () => {
     );
     expect(sql).not.toMatch(/create policy[^;]+\bto\s+anon\b/i);
     expect(sql).toContain("constraint sentinel_reports_stats_aggregate_only check");
-    expect(sql).toContain("jsonb_object_length(stats) = 4");
+    expect(sql).toContain(
+      "(stats - 'runs' - 'errors' - 'interrupts' - 'avg_node_ms') = '{}'::jsonb"
+    );
     expect(sql).toContain(
       "stats ?& array['runs', 'errors', 'interrupts', 'avg_node_ms']::text[]"
     );
