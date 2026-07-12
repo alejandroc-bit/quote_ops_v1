@@ -1,0 +1,74 @@
+ Container quoteops_v1-quoteops-onboard-run-ae85ec551089 Creating 
+ Container quoteops_v1-quoteops-onboard-run-ae85ec551089 Created 
+╔══════════════════════════════════════╗
+║   ___ _  _ ___  _   _ ___ _____ _   ║
+║  |_ _| \| |   \| | | / __|_   _/_\  ║
+║   | || .` | |) | |_| \__ \ | |/ _ \ ║
+║  |___|_|\_|___/ \___/|___/ |_/_/ \_\║
+║      Q U O T E   S Y S T E M        ║
+╚══════════════════════════════════════╝
+
+Bienvenido. Voy a guiarte por la puesta en marcha del appliance.
+
+▓▓ Paso 1 · Inteligencia Artificial
+│ Tu clave de IA enciende el copiloto que guía este onboarding.
+│ Se guarda cifrada localmente; el copiloto nunca ve tus otros secretos.
+
+▓▓ ¿Qué proveedor de IA usarás?
+│ 1) OpenRouter (recomendado)
+│ 2) Google Gemini
+› Elige una opción › Pega tu API key ✓ Clave guardada en OPENROUTER_API_KEY.
+… Validando clave con el copiloto…
+✓ Copiloto en línea.
+│ ⟩ Copiloto listo. Te acompaño en cada paso.
+
+▓▓ Paso 2 · Secretos del appliance
+│ ⟩ Capturamos las credenciales de correo, rutas y embeddings.
+› Correo del buzón del agente (IMAP/Gmail/Outlook) (enter para omitir) │ MAILBOX_USER: omitido.
+› Contraseña de aplicación del buzón (enter para omitir) │ MAILBOX_PASSWORD: omitido.
+› API key de SAKBE (rutas INEGI) (enter para omitir) │ INEGI_SAKBE_KEY: omitido.
+› API key de embeddings (cerebro vectorial) (enter para omitir) │ QUOTEOPS_EMBEDDING_API_KEY: omitido.
+
+▓▓ Paso 3 · Conexión al TMS
+│ ⟩ El TMS es la fuente de verdad de rendimientos, unidades, zonas e histórico.
+
+▓▓ ¿Cómo conecta el TMS del cliente?
+│ 1) Exportaciones CSV (file_import)
+│ 2) API HTTP moderna
+│ 3) Base SQL profesional (Cloud SQL / Azure SQL / otra)
+› Elige una opción │ Deja los CSV canónicos en el directorio de connectors/tms.
+✓ Configuración del TMS escrita en /opt/quoteops-v1/connectors/tms-adapter.yaml.
+
+▓▓ Paso 4 · Sincronizar unidades desde el TMS
+│ ⟩ Leo los tipos de unidad y su rendimiento del TMS y creo un perfil por cada uno.
+… Consultando rendimientos del TMS…
+✓ Recibidos 0 tipos de unidad.
+! El TMS no devolvió rendimientos; conservaré los datos físicos existentes y capturaré el modelo comercial manualmente.
+
+▓▓ Modelo de precio para T3S3_53_DRYVAN
+│ 1) Fórmula (costo + margen)
+│ 2) Rentabilidad (tabla RB)
+› Elige una opción › Margen objetivo (ej. 0.25) [0.2] › Margen mínimo (ej. 0.18) [0.12] › Palabras clave adicionales (separadas por coma) ✓ Modelo comercial actualizado para 1 perfil(es).
+
+▓▓ Paso 5 · Autorización del cliente
+│ ⟩ Definimos quién aprueba y qué dominios pueden solicitar cotizaciones.
+› Correo del aprobador › Dominios permitidos (separados por coma) › WhatsApp del aprobador (+52…) ✓ Autorización persistida en manifest y agent-config.
+
+▓▓ Paso 6 · Validación de tarifas
+│ ⟩ Calculo tres cotizaciones de muestra con quote-core para validar los parámetros.
+
+Origen → Destino                                 Unidad          Modelo   Tarifa MXN  Estado    Motivos de revisión
+-----------------------------------------------  --------------  -------  ----------  --------  -------------------
+Monterrey, Nuevo Leon → Saltillo, Coahuila       T3S3_53_DRYVAN  formula  4,902.56    APPROVED  —                  
+Monterrey, Nuevo Leon → Ciudad de Mexico, CDMX   T3S3_53_DRYVAN  formula  36,039.51   APPROVED  —                  
+Guadalajara, Jalisco → Tijuana, Baja California  T3S3_53_DRYVAN  formula  83,364.03   APPROVED  —                  
+
+› ¿Confirmas estas tres tarifas de muestra? (S/n) ✓ Tarifas de muestra confirmadas.
+
+▓▓ Paso 7 · Cerebro vectorial (criterio comercial)
+│ ⟩ Cargo los documentos de criterio comercial al almacén vectorial local.
+› ¿Ingerir los documentos de conocimiento ahora? (S/n) │ Puedes hacerlo luego con: onboard --ingest
+
+▓▓ Onboarding completo
+✓ El appliance quedó configurado. Revisa el tablero para ver el estado de readiness.
+│ Si capturaste secretos nuevos, reinicia el stack para aplicarlos: docker compose up -d
