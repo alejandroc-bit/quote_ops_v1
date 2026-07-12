@@ -7,6 +7,7 @@ export * from "./tms/historicalAnalysis.js";
 export * from "./tms/CachedTmsAdapter.js";
 export * from "./tms/overlayTmsPerformance.js";
 export * from "./cache/KeyValueCache.js";
+export * from "./cache/SqlKeyValueCache.js";
 export * from "./tms/TmsAdapterConfig.js";
 export * from "./tms/DeterministicTmsMapper.js";
 export * from "./tms/TmsSchemaDrift.js";

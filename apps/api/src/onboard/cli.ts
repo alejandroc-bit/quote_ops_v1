@@ -29,6 +29,16 @@ import {
   type Copilot,
   type ProfileCommercialLayer
 } from "./onboardConfig.js";
+import {
+  applyAuthorization,
+  buildSampleQuoteRows,
+  parseDomainList,
+  parseRbTable,
+  renderQuoteTable,
+  validateAuthorization,
+  validateMarginParams,
+  type OnboardManifest
+} from "./wizardSteps.js";
 
 type OnboardPaths = {
   secretsFile: string;

@@ -3,7 +3,7 @@ name: release-appliance-images
 on:
   push:
     tags:
-      - "quoteops-v*"
+      - "v*"
 
 permissions:
   contents: read
@@ -16,15 +16,15 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - image: quoteops-agent
+          - image: quote-ops-agent
             dockerfile: deploy/appliance/Dockerfile
             build_args: |
               QUOTEOPS_SERVICE=agent
-          - image: quoteops-api
+          - image: quote-ops-api
             dockerfile: deploy/appliance/Dockerfile
             build_args: |
               QUOTEOPS_SERVICE=api
-          - image: quoteops-web
+          - image: quote-ops-web
             dockerfile: deploy/appliance/Dockerfile.web
             build_args: ""
     steps:

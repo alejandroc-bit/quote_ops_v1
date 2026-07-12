@@ -26,6 +26,7 @@ import {
 } from "./installerScript.js";
 import { createFileControlPlaneStore } from "./stores/fileStore.js";
 import { createPostgresControlPlaneStore } from "./stores/postgresStore.js";
+import { createDefaultTenantDataStore, type TenantDataStore } from "./tenantData.js";
 
 export class ApiError extends Error {
   constructor(
@@ -74,6 +75,7 @@ export type ControlPlaneApiDependencies = {
   keyPair?: LicenseKeyPair;
   now?: () => Date;
   store?: ControlPlaneStore;
+  tenantData?: TenantDataStore | null;
   tokenGenerator?: () => string;
   tokenTtlMinutes?: number;
 };
@@ -164,6 +166,10 @@ export function createControlPlaneApi(
   const tokenGenerator =
     dependencies.tokenGenerator ?? (() => crypto.randomBytes(24).toString("base64url"));
   const tokenTtlMinutes = dependencies.tokenTtlMinutes ?? 60;
+  const tenantData =
+    dependencies.tenantData !== undefined
+      ? dependencies.tenantData
+      : createDefaultTenantDataStore();
   const configuredControlPlaneUrl =
     dependencies.controlPlaneUrl ??
     process.env.QUOTEOPS_CONTROL_PLANE_URL ??
@@ -403,13 +409,34 @@ export function createControlPlaneApi(
       return;
     }
 
+    // `version` is consumed here for the update channel; the strict minimal
+    // heartbeat parser only accepts its own allowlisted fields.
+    const { version: reportedVersion, ...heartbeatBody } = body;
     const heartbeat = parseInput(() =>
-      parseMinimalHeartbeat({ ...body, installation_id: installationId })
+      parseMinimalHeartbeat({ ...heartbeatBody, installation_id: installationId })
     );
     const client = await requireClientByInstallation(store, installationId);
     const updated = parseInput(() => applyMinimalHeartbeat(client, heartbeat, now().toISOString()));
     await store.upsertClient(updated);
-    res.status(202).json({ accepted: true, client: updated });
+
+    // Sync channel back to the appliance: newest published release + cloud settings.
+    let latestVersion: string | null = null;
+    let settings: Record<string, unknown> = {};
+    if (tenantData) {
+      await tenantData.touchInstallation(
+        installationId,
+        optionalString(reportedVersion),
+        now().toISOString()
+      );
+      latestVersion = (await tenantData.latestRelease())?.version ?? null;
+      settings = await tenantData.getInstallationSettings(installationId);
+    }
+    res.status(202).json({
+      accepted: true,
+      client: updated,
+      latest_version: latestVersion,
+      settings
+    });
   }));
 
   app.post("/api/installations/:installationId/counters", asyncRoute(async (req, res) => {
@@ -431,6 +458,55 @@ export function createControlPlaneApi(
     const updated = parseInput(() => applyQuoteCounters(client, counters));
     await store.upsertClient(updated);
     res.status(202).json({ accepted: true, client: updated });
+  }));
+
+  // Appliance ingest endpoints: Bearer = installation registration token,
+  // resolved to a tenant against the Supabase-backed tenant tables.
+  async function requireTenantToken(req: Request): Promise<{ tenant_id: string }> {
+    if (!tenantData) {
+      throw new ApiError(503, "tenant_data_unavailable", "tenant data store is not configured");
+    }
+    const token = String(req.headers.authorization ?? "").replace(/^Bearer\s+/i, "").trim();
+    const resolved = token ? await tenantData.resolveTenantByToken(token) : null;
+    if (!resolved) {
+      throw new ApiError(401, "unauthorized_installation", "invalid installation token");
+    }
+    return resolved;
+  }
+
+  app.post("/api/sentinel/reports", asyncRoute(async (req, res) => {
+    const { tenant_id } = await requireTenantToken(req);
+    const body = assertRecord(req.body);
+    await tenantData!.insertSentinelReport({
+      tenant_id,
+      installation_id: requiredString(body.installation_id, "installation_id"),
+      week_start: requiredString(body.week_start, "week_start"),
+      body_md: requiredString(body.body_md, "body_md"),
+      stats: body.stats && typeof body.stats === "object" ? (body.stats as Record<string, unknown>) : {}
+    });
+    res.status(201).json({ accepted: true });
+  }));
+
+  app.post("/api/usage", asyncRoute(async (req, res) => {
+    const { tenant_id } = await requireTenantToken(req);
+    const body = assertRecord(req.body);
+    await tenantData!.recordUsage({
+      tenant_id,
+      day: requiredString(body.day, "day"),
+      channel: requiredString(body.channel, "channel"),
+      quotes: requiredNumber(body.quotes, "quotes"),
+      routes: requiredNumber(body.routes, "routes")
+    });
+    res.status(202).json({ accepted: true });
+  }));
+
+  app.get("/api/releases/latest", asyncRoute(async (req, res) => {
+    await requireTenantToken(req);
+    const release = await tenantData!.latestRelease();
+    if (!release) {
+      throw new ApiError(404, "not_found", "no releases published");
+    }
+    res.json({ version: release.version, notes: release.notes });
   }));
 
   app.use((error: unknown, _req: Request, res: Response, _next: unknown) => {
@@ -544,6 +620,13 @@ function requiredString(value: unknown, field: string): string {
     throw new ApiError(400, "bad_request", `${field} is required`);
   }
   return value.trim();
+}
+
+function requiredNumber(value: unknown, field: string): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    throw new ApiError(400, "bad_request", `${field} must be a number`);
+  }
+  return value;
 }
 
 function optionalString(value: unknown): string | null {

@@ -44,6 +44,45 @@ export type ControlPlaneInstallPack = {
   files: Record<string, string>;
 };
 
+export type ControlPlaneRelease = {
+  version: string;
+  notes?: string | null;
+  published_at?: string | null;
+};
+
+export type ControlPlaneInstallationSettings = {
+  pricing_model?: "formula" | "profitability";
+  pdf_template?: Record<string, unknown>;
+  [key: string]: unknown;
+};
+
+export type ControlPlaneInstallationDetail = {
+  installation_id: string;
+  client_id?: string;
+  version?: string | null;
+  settings?: ControlPlaneInstallationSettings | null;
+  last_heartbeat_at?: string | null;
+};
+
+export type ControlPlaneUsagePoint = {
+  day: string;
+  quotes: number;
+  routes: number;
+};
+
+export type ControlPlaneSentinelReport = {
+  installation_id?: string;
+  week_start: string;
+  body_md: string;
+  stats?: {
+    runs?: number;
+    errors?: number;
+    interrupts?: number;
+    avg_node_ms?: number;
+  } | null;
+  created_at?: string | null;
+};
+
 type ItemsResponse<T> = {
   items: T[];
 };
@@ -123,6 +162,82 @@ export async function reissueControlPlaneLicense(clientId: string): Promise<Cont
   return response.client;
 }
 
+// ponytail: the endpoints below are being added by a parallel task — every
+// getter degrades to null/[] on 404 so the portal renders before the API lands.
+export async function getLatestRelease(): Promise<ControlPlaneRelease | null> {
+  const parsed = await controlPlaneRequestOptional<
+    ControlPlaneRelease | { release: ControlPlaneRelease | null }
+  >("/api/releases/latest");
+  if (!parsed) return null;
+  const release = "release" in parsed ? parsed.release : parsed;
+  return release && typeof release.version === "string" ? release : null;
+}
+
+export async function getInstallation(
+  installationId: string
+): Promise<ControlPlaneInstallationDetail | null> {
+  const parsed = await controlPlaneRequestOptional<
+    ControlPlaneInstallationDetail | { installation: ControlPlaneInstallationDetail }
+  >(`/api/admin/installations/${encodeURIComponent(installationId)}`);
+  if (!parsed) return null;
+  return "installation" in parsed ? parsed.installation : parsed;
+}
+
+export async function updateInstallationSettings(
+  installationId: string,
+  settings: ControlPlaneInstallationSettings
+): Promise<ControlPlaneInstallationDetail | null> {
+  const parsed = await controlPlaneRequest<
+    ControlPlaneInstallationDetail | { installation: ControlPlaneInstallationDetail }
+  >(`/api/admin/installations/${encodeURIComponent(installationId)}/settings`, {
+    method: "PATCH",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ settings })
+  });
+  if (!parsed) return null;
+  return "installation" in parsed ? parsed.installation : parsed;
+}
+
+export async function listInstallationUsage(
+  installationId: string
+): Promise<ControlPlaneUsagePoint[]> {
+  const parsed = await controlPlaneRequestOptional<
+    ItemsResponse<ControlPlaneUsagePoint> | { usage: ControlPlaneUsagePoint[] }
+  >(`/api/admin/installations/${encodeURIComponent(installationId)}/usage`);
+  if (!parsed) return [];
+  return "usage" in parsed ? parsed.usage ?? [] : parsed.items ?? [];
+}
+
+export async function listSentinelReports(
+  installationId?: string
+): Promise<ControlPlaneSentinelReport[]> {
+  const query = installationId
+    ? `?installation_id=${encodeURIComponent(installationId)}`
+    : "";
+  const parsed = await controlPlaneRequestOptional<
+    ItemsResponse<ControlPlaneSentinelReport> | { reports: ControlPlaneSentinelReport[] }
+  >(`/api/admin/sentinel-reports${query}`);
+  if (!parsed) return [];
+  const reports = "reports" in parsed ? parsed.reports ?? [] : parsed.items ?? [];
+  return [...reports].sort((a, b) => (a.week_start < b.week_start ? 1 : -1));
+}
+
+async function controlPlaneRequestOptional<T>(path: string): Promise<T | null> {
+  try {
+    return await controlPlaneRequest<T>(path);
+  } catch (error) {
+    if (error instanceof ControlPlaneHttpError && error.status === 404) return null;
+    throw error;
+  }
+}
+
+export class ControlPlaneHttpError extends Error {
+  constructor(message: string, readonly status: number) {
+    super(message);
+    this.name = "ControlPlaneHttpError";
+  }
+}
+
 async function controlPlaneRequest<T>(path: string, init?: RequestInit): Promise<T> {
   const { data } = supabase ? await supabase.auth.getSession() : { data: { session: null } };
   const accessToken = data.session?.access_token;
@@ -143,7 +258,7 @@ async function controlPlaneRequest<T>(path: string, init?: RequestInit): Promise
         : parsed && typeof parsed === "object" && "error" in parsed
           ? String(parsed.error)
           : `Control Plane API request failed with HTTP ${response.status}`;
-    throw new Error(message);
+    throw new ControlPlaneHttpError(message, response.status);
   }
 
   return parsed as T;

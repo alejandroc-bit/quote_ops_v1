@@ -1,4 +1,4 @@
-name: ${COMPOSE_PROJECT_NAME:-quoteops}
+name: ${COMPOSE_PROJECT_NAME:-quoteops_v1}
 
 x-quoteops-service: &quoteops-service
   restart: unless-stopped
@@ -52,9 +52,9 @@ services:
 
   quoteops-agent:
     <<: *quoteops-service
-    image: ${QUOTEOPS_IMAGE_REGISTRY:-ghcr.io/alejandroc-bit}/quoteops-agent:${QUOTEOPS_VERSION:-quoteops-v2.2.3}
+    image: ${QUOTEOPS_IMAGE_REGISTRY:-ghcr.io/alejandroc-bit}/quote-ops-agent:${QUOTEOPS_VERSION:-v0.1.0}
     env_file:
-      - path: ${QUOTEOPS_SECRETS_ENV_FILE:-/opt/quoteops/secrets/client.env}
+      - path: ${QUOTEOPS_SECRETS_ENV_FILE:-/opt/quoteops-v1/secrets/client.env}
         required: false
     depends_on:
       postgres:
@@ -64,7 +64,7 @@ services:
     environment:
       NODE_ENV: production
       QUOTEOPS_CLIENT_ID: ${QUOTEOPS_CLIENT_ID:-}
-      QUOTEOPS_VERSION: ${QUOTEOPS_VERSION:-quoteops-v2.2.3}
+      QUOTEOPS_VERSION: ${QUOTEOPS_VERSION:-v0.1.0}
       QUOTEOPS_CONTROL_PLANE_URL: ${QUOTEOPS_CONTROL_PLANE_URL:-}
       QUOTEOPS_INSTALLATION_ID: ${QUOTEOPS_INSTALLATION_ID:-}
       QUOTEOPS_LICENSE_PATH: /opt/quoteops/secrets/license.json
@@ -102,9 +102,9 @@ services:
 
   quoteops-api:
     <<: *quoteops-service
-    image: ${QUOTEOPS_IMAGE_REGISTRY:-ghcr.io/alejandroc-bit}/quoteops-api:${QUOTEOPS_VERSION:-quoteops-v2.2.3}
+    image: ${QUOTEOPS_IMAGE_REGISTRY:-ghcr.io/alejandroc-bit}/quote-ops-api:${QUOTEOPS_VERSION:-v0.1.0}
     env_file:
-      - path: ${QUOTEOPS_SECRETS_ENV_FILE:-/opt/quoteops/secrets/client.env}
+      - path: ${QUOTEOPS_SECRETS_ENV_FILE:-/opt/quoteops-v1/secrets/client.env}
         required: false
     depends_on:
       postgres:
@@ -119,7 +119,7 @@ services:
       NODE_ENV: production
       PORT: 8080
       QUOTEOPS_CLIENT_ID: ${QUOTEOPS_CLIENT_ID:-}
-      QUOTEOPS_VERSION: ${QUOTEOPS_VERSION:-quoteops-v2.2.3}
+      QUOTEOPS_VERSION: ${QUOTEOPS_VERSION:-v0.1.0}
       QUOTEOPS_CONTROL_PLANE_URL: ${QUOTEOPS_CONTROL_PLANE_URL:-}
       QUOTEOPS_INSTALLATION_ID: ${QUOTEOPS_INSTALLATION_ID:-}
       QUOTEOPS_LICENSE_PATH: /opt/quoteops/secrets/license.json
@@ -160,12 +160,12 @@ services:
   # run it with: docker compose run --rm quoteops-onboard
   quoteops-onboard:
     profiles: ["onboarding"]
-    image: ${QUOTEOPS_IMAGE_REGISTRY:-ghcr.io/alejandroc-bit}/quoteops-api:${QUOTEOPS_VERSION:-quoteops-v2.2.3}
+    image: ${QUOTEOPS_IMAGE_REGISTRY:-ghcr.io/alejandroc-bit}/quote-ops-api:${QUOTEOPS_VERSION:-v0.1.0}
     restart: "no"
     networks:
       - quoteops_internal
     env_file:
-      - path: ${QUOTEOPS_SECRETS_ENV_FILE:-/opt/quoteops/secrets/client.env}
+      - path: ${QUOTEOPS_SECRETS_ENV_FILE:-/opt/quoteops-v1/secrets/client.env}
         required: false
     environment:
       NODE_ENV: production
@@ -202,7 +202,7 @@ services:
 
   quoteops-web:
     <<: *quoteops-service
-    image: ${QUOTEOPS_IMAGE_REGISTRY:-ghcr.io/alejandroc-bit}/quoteops-web:${QUOTEOPS_VERSION:-quoteops-v2.2.3}
+    image: ${QUOTEOPS_IMAGE_REGISTRY:-ghcr.io/alejandroc-bit}/quote-ops-web:${QUOTEOPS_VERSION:-v0.1.0}
     depends_on:
       quoteops-api:
         condition: service_started
@@ -212,7 +212,7 @@ services:
       NODE_ENV: production
       PORT: 3000
       QUOTEOPS_CLIENT_ID: ${QUOTEOPS_CLIENT_ID:-}
-      QUOTEOPS_VERSION: ${QUOTEOPS_VERSION:-quoteops-v2.2.3}
+      QUOTEOPS_VERSION: ${QUOTEOPS_VERSION:-v0.1.0}
       QUOTEOPS_API_BASE_URL: ${QUOTEOPS_API_BASE_URL:-/api}
       QUOTEOPS_LOG_DIR: /var/log/quoteops
     volumes:
@@ -258,34 +258,34 @@ volumes:
     driver_opts:
       type: none
       o: bind
-      device: ${QUOTEOPS_MANIFEST_DIR:-/opt/quoteops/manifests}
+      device: ${QUOTEOPS_MANIFEST_DIR:-/opt/quoteops-v1/manifests}
   quoteops_criteria:
     driver: local
     driver_opts:
       type: none
       o: bind
-      device: ${QUOTEOPS_CRITERIA_DIR:-/opt/quoteops/criteria}
+      device: ${QUOTEOPS_CRITERIA_DIR:-/opt/quoteops-v1/criteria}
   quoteops_connectors:
     driver: local
     driver_opts:
       type: none
       o: bind
-      device: ${QUOTEOPS_CONNECTORS_DIR:-/opt/quoteops/connectors}
+      device: ${QUOTEOPS_CONNECTORS_DIR:-/opt/quoteops-v1/connectors}
   quoteops_secrets:
     driver: local
     driver_opts:
       type: none
       o: bind
-      device: ${QUOTEOPS_SECRETS_DIR:-/opt/quoteops/secrets}
+      device: ${QUOTEOPS_SECRETS_DIR:-/opt/quoteops-v1/secrets}
   quoteops_logs:
     driver: local
     driver_opts:
       type: none
       o: bind
-      device: ${QUOTEOPS_LOG_DIR:-/opt/quoteops/logs}
+      device: ${QUOTEOPS_LOG_DIR:-/opt/quoteops-v1/logs}
   quoteops_backups:
     driver: local
     driver_opts:
       type: none
       o: bind
-      device: ${QUOTEOPS_BACKUP_DIR:-/opt/quoteops/backups}
+      device: ${QUOTEOPS_BACKUP_DIR:-/opt/quoteops-v1/backups}

@@ -3,7 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 COMPOSE_FILE="${COMPOSE_FILE:-$SCRIPT_DIR/docker-compose.yml}"
-QUOTEOPS_HOME="${QUOTEOPS_HOME:-/opt/quoteops}"
+QUOTEOPS_HOME="${QUOTEOPS_HOME:-/opt/quoteops-v1}"
 ENV_FILE="${QUOTEOPS_ENV_FILE:-$QUOTEOPS_HOME/.env}"
 TO_VERSION=""
 SKIP_BACKUP=0
@@ -11,10 +11,10 @@ ENV_FILE_SET=0
 
 usage() {
   cat <<USAGE
-Usage: $(basename "$0") --to quoteops-v2.0.1 [options]
+Usage: $(basename "$0") --to v0.1.1 [options]
 
 Options:
-  --home PATH          Appliance data root (default: /opt/quoteops)
+  --home PATH          Appliance data root (default: /opt/quoteops-v1)
   --env-file PATH      Compose env file (default: <home>/.env)
   --compose-file PATH  Compose file (default: deploy/appliance/docker-compose.yml)
   --skip-backup        Do not create a pre-upgrade backup
@@ -114,7 +114,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ -n "$TO_VERSION" ]] || die "--to is required"
-[[ "$TO_VERSION" =~ ^quoteops-v[0-9]+[.][0-9]+[.][0-9]+([-+A-Za-z0-9.]+)?$ ]] || die "--to must look like quoteops-v2.0.1"
+[[ "$TO_VERSION" =~ ^v[0-9]+[.][0-9]+[.][0-9]+([-+A-Za-z0-9.]+)?$ ]] || die "--to must look like v0.1.1"
 
 COMPOSE_FILE="$(absolute_path "$COMPOSE_FILE")"
 ENV_FILE="$(absolute_path "$ENV_FILE")"

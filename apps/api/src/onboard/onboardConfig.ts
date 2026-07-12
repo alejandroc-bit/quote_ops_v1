@@ -1,6 +1,10 @@
 import { chmod, readFile, writeFile } from "node:fs/promises";
 import { stringify as stringifyYaml } from "yaml";
-import type { QuoteManifest, QuoteVehicleProfile } from "@quoteops/quote-core";
+import type {
+  ProfitabilityRbBracket,
+  QuoteManifest,
+  QuoteVehicleProfile
+} from "@quoteops/quote-core";
 import type { TmsCanonicalPerformance } from "@quoteops/contracts";
 
 // Pure config builders for the onboarding CLI. Kept side-effect free (except the
@@ -90,6 +94,8 @@ export type ProfileCommercialLayer = {
   margin_target_pct: number;
   minimum_margin_pct: number;
   keywords?: string[];
+  /** Custom RB brackets for the profitability model; omitted = quote-core defaults. */
+  profitability_rb_table?: ProfitabilityRbBracket[];
 };
 
 /**
@@ -114,6 +120,9 @@ export function buildProfileStub(
     diesel_price_mxn_per_liter: 0,
     margin_target_pct: commercial.margin_target_pct,
     minimum_margin_pct: commercial.minimum_margin_pct,
+    ...(commercial.profitability_rb_table
+      ? { profitability_rb_table: commercial.profitability_rb_table }
+      : {}),
     performance_source: "tms",
     tms_real_cost_per_km: performance.real_cost_per_km
   };

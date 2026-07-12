@@ -20,9 +20,17 @@
     "imapflow": "^1.4.3",
     "mailparser": "^3.9.12",
     "xlsx": "^0.18.5",
-    "yaml": "^2.9.0"
+    "yaml": "^2.9.0",
+    "@langchain/langgraph": "^0.4.9",
+    "@langchain/core": "^0.3.77",
+    "@langchain/openai": "^0.6.14",
+    "@langchain/langgraph-checkpoint-postgres": "^0.1.1",
+    "pdfkit": "^0.17.1",
+    "pg": "^8.22.0"
   },
   "devDependencies": {
-    "@types/mailparser": "^3.4.6"
+    "@types/mailparser": "^3.4.6",
+    "@types/pdfkit": "^0.17.3",
+    "@types/pg": "^8.15.4"
   }
 }

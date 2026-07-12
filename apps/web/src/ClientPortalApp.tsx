@@ -4,6 +4,7 @@ import {
   ClipboardCheck,
   HeartPulse,
   LayoutDashboard,
+  ListTree,
   Mail,
   RefreshCw,
   ShieldCheck,
@@ -17,8 +18,9 @@ import { HealthPage } from "./pages/health";
 import { InboxPage } from "./pages/inbox";
 import { KnowledgePage } from "./pages/knowledge";
 import { RfqsPage } from "./pages/rfqs";
+import { NAVIGATE_EVENT, RunsPage } from "./pages/runs";
 
-type ClientPortalPageKey = "inbox" | "rfqs" | "knowledge" | "approvals" | "health";
+type ClientPortalPageKey = "inbox" | "runs" | "rfqs" | "knowledge" | "approvals" | "health";
 
 const clientPortalPages: Array<DashboardPage<ClientPortalPageKey>> = [
   {
@@ -27,6 +29,13 @@ const clientPortalPages: Array<DashboardPage<ClientPortalPageKey>> = [
     description: "Agent mailbox",
     icon: Mail,
     component: InboxPage
+  },
+  {
+    key: "runs",
+    label: "Runs",
+    description: "Paso a paso del agente",
+    icon: ListTree,
+    component: RunsPage
   },
   {
     key: "rfqs",
@@ -44,7 +53,7 @@ const clientPortalPages: Array<DashboardPage<ClientPortalPageKey>> = [
   },
   {
     key: "approvals",
-    label: "Approvals",
+    label: "Aprobaciones",
     description: "Director decisions",
     icon: ClipboardCheck,
     component: ApprovalsPage
@@ -84,6 +93,18 @@ export function ClientPortalApp() {
   useEffect(() => {
     loadSetupState();
   }, [loadSetupState]);
+
+  useEffect(() => {
+    // in-app navigation requests from pages (e.g. run detail → approvals)
+    const onNavigate = (event: Event) => {
+      const page = (event as CustomEvent<string>).detail;
+      if (clientPortalPages.some((candidate) => candidate.key === page)) {
+        setActivePage(page as ClientPortalPageKey);
+      }
+    };
+    window.addEventListener(NAVIGATE_EVENT, onNavigate);
+    return () => window.removeEventListener(NAVIGATE_EVENT, onNavigate);
+  }, []);
 
   const setupRequired = Boolean(
     setup &&

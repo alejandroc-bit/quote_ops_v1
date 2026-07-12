@@ -1,12 +1,14 @@
 import { useEffect, useMemo, useState, type FormEvent } from "react";
 import type { Session } from "@supabase/supabase-js";
-import { Building2, KeyRound, Mail, ServerCog } from "lucide-react";
+import { Building2, Gauge, KeyRound, Mail, ScrollText, ServerCog } from "lucide-react";
 import { AppShell, type DashboardPage } from "./AppShell";
 import { supabase } from "./lib/supabaseAdminClient";
+import { ClientProfilePage } from "./pages/clientProfile";
 import { ClientsPage } from "./pages/clients";
+import { SentinelReportsPage } from "./pages/sentinelReports";
 import { SetupPage } from "./pages/setup";
 
-type ControlPlanePageKey = "clients" | "setup";
+type ControlPlanePageKey = "clients" | "profile" | "sentinel" | "setup";
 
 const controlPlanePages: Array<DashboardPage<ControlPlanePageKey>> = [
   {
@@ -15,6 +17,20 @@ const controlPlanePages: Array<DashboardPage<ControlPlanePageKey>> = [
     description: "Onboarding",
     icon: Building2,
     component: ClientsPage
+  },
+  {
+    key: "profile",
+    label: "Perfil de cliente",
+    description: "Versión, uso y ajustes",
+    icon: Gauge,
+    component: ClientProfilePage
+  },
+  {
+    key: "sentinel",
+    label: "Sentinel",
+    description: "Reportes semanales",
+    icon: ScrollText,
+    component: SentinelReportsPage
   },
   {
     key: "setup",

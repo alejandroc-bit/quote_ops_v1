@@ -3,7 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 COMPOSE_FILE="${COMPOSE_FILE:-$SCRIPT_DIR/docker-compose.yml}"
-QUOTEOPS_HOME="${QUOTEOPS_HOME:-/opt/quoteops}"
+QUOTEOPS_HOME="${QUOTEOPS_HOME:-/opt/quoteops-v1}"
 ENV_FILE="${QUOTEOPS_ENV_FILE:-$QUOTEOPS_HOME/.env}"
 SECRETS_ENV_FILE="${QUOTEOPS_SECRETS_ENV_FILE:-$QUOTEOPS_HOME/secrets/client.env}"
 CLIENT_ID=""
@@ -11,7 +11,7 @@ MANIFEST_PATH=""
 CONNECTORS_PATH=""
 AGENT_CONFIG_PATH=""
 TMS_ADAPTER_CONFIG_PATH=""
-QUOTEOPS_VERSION="${QUOTEOPS_VERSION:-quoteops-v2.2.3}"
+QUOTEOPS_VERSION="${QUOTEOPS_VERSION:-v0.1.0}"
 QUOTEOPS_IMAGE_REGISTRY="${QUOTEOPS_IMAGE_REGISTRY:-ghcr.io/alejandroc-bit}"
 QUOTEOPS_SITE_ADDRESS="${QUOTEOPS_SITE_ADDRESS:-:80}"
 QUOTEOPS_HTTP_PORT="${QUOTEOPS_HTTP_PORT:-80}"
@@ -37,7 +37,7 @@ usage() {
 Usage: $(basename "$0") --client cliente-demo --manifest manifest.yaml [options]
 
 Options:
-  --home PATH              Appliance data root (default: /opt/quoteops)
+  --home PATH              Appliance data root (default: /opt/quoteops-v1)
   --env-file PATH          Compose env file (default: <home>/.env)
   --secrets-env-file PATH  Client secrets env file (default: <home>/secrets/client.env)
   --compose-file PATH      Compose file (default: deploy/appliance/docker-compose.yml)
@@ -45,7 +45,7 @@ Options:
   --connectors-dir PATH    Connector data root (default: <home>/connectors)
   --agent-config PATH      Copy agent config YAML/JSON into connectors/agent
   --tms-adapter-config PATH Copy TMS adapter config YAML/JSON into connectors/tms-adapter.yaml
-  --version VERSION        QuoteOps image tag (default: quoteops-v2.2.3)
+  --version VERSION        QuoteOps image tag (default: v0.1.0)
   --image-registry IMAGE   Image registry/prefix (default: ghcr.io/alejandroc-bit)
   --site-address ADDRESS   Caddy site address (default: :80)
   --http-port PORT         Host HTTP port (default: 80)
@@ -307,7 +307,7 @@ done
 [[ -n "$CLIENT_ID" ]] || die "--client is required"
 [[ -n "$MANIFEST_PATH" ]] || die "--manifest is required"
 [[ "$CLIENT_ID" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || die "--client may only contain letters, numbers, dot, underscore, or dash"
-[[ "$QUOTEOPS_VERSION" =~ ^quoteops-v[0-9]+[.][0-9]+[.][0-9]+([-+A-Za-z0-9.]+)?$ ]] || die "--version must look like quoteops-v2.0.1"
+[[ "$QUOTEOPS_VERSION" =~ ^v[0-9]+[.][0-9]+[.][0-9]+([-+A-Za-z0-9.]+)?$ ]] || die "--version must look like v0.1.0"
 [[ "$QUOTEOPS_SAKBE_LIVE_ENABLED" =~ ^(true|false|1|0|yes|no|on|off)$ ]] || die "--sakbe-live must be true or false"
 [[ "$QUOTEOPS_SAKBE_CACHE_MODE" =~ ^(cache_first|live_only)$ ]] || die "--sakbe-cache-mode must be cache_first or live_only"
 [[ -f "$MANIFEST_PATH" ]] || die "manifest not found: $MANIFEST_PATH"
@@ -381,7 +381,7 @@ fi
 
 PROJECT_CLIENT="$(printf "%s" "$CLIENT_ID" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/-/g; s/^-*//; s/-*$//')"
 [[ -n "$PROJECT_CLIENT" ]] || die "client id did not produce a valid compose project suffix"
-COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-quoteops-$PROJECT_CLIENT}"
+COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-quoteops_v1}"
 QUOTEOPS_INSTALLATION_ID="${QUOTEOPS_INSTALLATION_ID:-$PROJECT_CLIENT-local-001}"
 POSTGRES_PASSWORD="$(generate_secret)"
 

@@ -1,6 +1,6 @@
 services:
   quoteops-agent:
-    image: quoteops-agent:local
+    image: quote-ops-agent:local
     build:
       context: ../..
       dockerfile: deploy/appliance/Dockerfile
@@ -10,7 +10,7 @@ services:
       PORT: 8081
 
   quoteops-api:
-    image: quoteops-api:local
+    image: quote-ops-api:local
     build:
       context: ../..
       dockerfile: deploy/appliance/Dockerfile
@@ -18,7 +18,7 @@ services:
         QUOTEOPS_SERVICE: api
 
   quoteops-web:
-    image: quoteops-web:local
+    image: quote-ops-web:local
     build:
       context: ../..
       dockerfile: deploy/appliance/Dockerfile.web
