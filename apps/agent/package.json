@@ -1,0 +1,28 @@
+{
+  "name": "@quoteops/agent",
+  "version": "2.0.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "dependencies": {
+    "@google/genai": "^1.0.0",
+    "@quoteops/audit": "2.0.0",
+    "@quoteops/connectors": "2.0.0",
+    "@quoteops/contracts": "2.0.0",
+    "@quoteops/criteria": "2.0.0",
+    "@quoteops/quote-core": "2.0.0",
+    "imapflow": "^1.4.3",
+    "mailparser": "^3.9.12",
+    "xlsx": "^0.18.5",
+    "yaml": "^2.9.0"
+  },
+  "devDependencies": {
+    "@types/mailparser": "^3.4.6"
+  }
+}

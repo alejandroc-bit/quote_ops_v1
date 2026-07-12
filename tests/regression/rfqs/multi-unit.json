@@ -1,0 +1,99 @@
+{
+  "rfq_id": "RFQ-2026-000004",
+  "source": "email",
+  "received_at": "2026-06-16T13:45:00-06:00",
+  "requester": {
+    "name": "Ana Perez",
+    "email": "ana.perez@cliente.com",
+    "company_alias": "Cliente Demo"
+  },
+  "raw": {
+    "subject": "Misma ruta con dryvan y plataforma",
+    "body": "Cotizar Monterrey a Saltillo para caja seca y plataforma.",
+    "attachments": []
+  },
+  "parsed": {
+    "lanes": [
+      {
+        "lane_id": "RFQ-2026-000004-L01",
+        "origin": {
+          "city": "Monterrey",
+          "state": "NL",
+          "country": "MX"
+        },
+        "destination": {
+          "city": "Saltillo",
+          "state": "CO",
+          "country": "MX"
+        },
+        "equipment_request": "T3S2_53_DRYVAN",
+        "vehicle_profile_id": "T3S2_53_DRYVAN",
+        "cargo": {
+          "commodity": "material industrial",
+          "commodity_category": "industrial",
+          "sector": "manufactura",
+          "weight_kg": 12000,
+          "value_mxn": 240000,
+          "hazmat": false,
+          "temperature_controlled": false
+        },
+        "service": {
+          "return_policy": "one_way",
+          "route_policy": "sakbe_required",
+          "requested_pickup_at": "2026-06-19T09:00:00-06:00"
+        },
+        "commercial": {
+          "target_rate_mxn": null,
+          "customer_id": "cliente-demo",
+          "customer_type": "shipper",
+          "business_unit_id": "general"
+        },
+        "confidence": {
+          "overall": 0.94,
+          "missing_fields": [],
+          "review_reasons": []
+        }
+      },
+      {
+        "lane_id": "RFQ-2026-000004-L02",
+        "origin": {
+          "city": "Monterrey",
+          "state": "NL",
+          "country": "MX"
+        },
+        "destination": {
+          "city": "Saltillo",
+          "state": "CO",
+          "country": "MX"
+        },
+        "equipment_request": "T3S2_53_FLATBED",
+        "vehicle_profile_id": "T3S2_53_FLATBED",
+        "cargo": {
+          "commodity": "material industrial",
+          "commodity_category": "industrial",
+          "sector": "manufactura",
+          "weight_kg": 14000,
+          "value_mxn": 300000,
+          "hazmat": false,
+          "temperature_controlled": false
+        },
+        "service": {
+          "return_policy": "one_way",
+          "route_policy": "sakbe_required",
+          "requested_pickup_at": "2026-06-19T09:00:00-06:00"
+        },
+        "commercial": {
+          "target_rate_mxn": null,
+          "customer_id": "cliente-demo",
+          "customer_type": "shipper",
+          "business_unit_id": "general"
+        },
+        "confidence": {
+          "overall": 0.94,
+          "missing_fields": [],
+          "review_reasons": []
+        }
+      }
+    ]
+  }
+}

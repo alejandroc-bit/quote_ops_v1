@@ -1,0 +1,25 @@
+{
+  "name": "@quoteops/web",
+  "version": "2.0.0",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "build": "npm run build:client && npm run build:control",
+    "build:client": "vite build --outDir dist/client-portal",
+    "build:control": "VITE_QUOTEOPS_APP=control-plane vite build --outDir dist/control-plane",
+    "dev": "npm run dev:client",
+    "dev:client": "vite --host 127.0.0.1 --port 19081",
+    "dev:control": "VITE_QUOTEOPS_APP=control-plane vite --host 127.0.0.1 --port 19082"
+  },
+  "dependencies": {
+    "@quoteops/contracts": "2.0.0",
+    "@supabase/supabase-js": "^2.110.0",
+    "lucide-react": "^0.468.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.3.4",
+    "vite": "^6.0.7"
+  }
+}

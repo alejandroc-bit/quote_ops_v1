@@ -1,0 +1,21 @@
+{
+  "installCommand": "npm install",
+  "buildCommand": "npm run build:control-plane-cloud",
+  "outputDirectory": "apps/web/dist/control-plane",
+  "functions": {
+    "api/index.ts": {
+      "maxDuration": 10,
+      "includeFiles": "deploy/appliance/**"
+    }
+  },
+  "rewrites": [
+    {
+      "source": "/api/(.*)",
+      "destination": "/api/index.ts"
+    },
+    {
+      "source": "/(.*)",
+      "destination": "/index.html"
+    }
+  ]
+}

@@ -1,0 +1,59 @@
+{
+  "rfq_id": "RFQ-2026-000002",
+  "source": "email",
+  "received_at": "2026-06-16T11:15:00-06:00",
+  "requester": {
+    "name": "Ana Perez",
+    "email": "ana.perez@cliente.com",
+    "company_alias": "Cliente Demo"
+  },
+  "raw": {
+    "subject": "Autopartes Monterrey a Ramos Arizpe",
+    "body": "Cotizar caja seca 53 para autopartes, 18 toneladas, entrega en Ramos Arizpe.",
+    "attachments": []
+  },
+  "parsed": {
+    "lanes": [
+      {
+        "lane_id": "RFQ-2026-000002-L01",
+        "origin": {
+          "city": "Monterrey",
+          "state": "NL",
+          "country": "MX"
+        },
+        "destination": {
+          "city": "Ramos Arizpe",
+          "state": "CO",
+          "country": "MX"
+        },
+        "equipment_request": "T3S2_53_DRYVAN",
+        "vehicle_profile_id": "T3S2_53_DRYVAN",
+        "cargo": {
+          "commodity": "autopartes",
+          "commodity_category": "industrial",
+          "sector": "automotriz",
+          "weight_kg": 18000,
+          "value_mxn": 650000,
+          "hazmat": false,
+          "temperature_controlled": false
+        },
+        "service": {
+          "return_policy": "one_way",
+          "route_policy": "sakbe_required",
+          "requested_pickup_at": "2026-06-17T13:00:00-06:00"
+        },
+        "commercial": {
+          "target_rate_mxn": null,
+          "customer_id": "cliente-demo",
+          "customer_type": "shipper",
+          "business_unit_id": "general"
+        },
+        "confidence": {
+          "overall": 0.94,
+          "missing_fields": [],
+          "review_reasons": []
+        }
+      }
+    ]
+  }
+}

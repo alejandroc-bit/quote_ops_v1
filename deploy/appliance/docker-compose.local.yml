@@ -1,0 +1,24 @@
+services:
+  quoteops-agent:
+    image: quoteops-agent:local
+    build:
+      context: ../..
+      dockerfile: deploy/appliance/Dockerfile
+      args:
+        QUOTEOPS_SERVICE: agent
+    environment:
+      PORT: 8081
+
+  quoteops-api:
+    image: quoteops-api:local
+    build:
+      context: ../..
+      dockerfile: deploy/appliance/Dockerfile
+      args:
+        QUOTEOPS_SERVICE: api
+
+  quoteops-web:
+    image: quoteops-web:local
+    build:
+      context: ../..
+      dockerfile: deploy/appliance/Dockerfile.web

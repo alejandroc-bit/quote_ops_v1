@@ -1,0 +1,14 @@
+node_modules/
+dist/
+dist-types/
+*.tsbuildinfo
+coverage/
+.DS_Store
+.env
+.env.*
+!.env.example
+quoteops-data/
+.quoteops/
+playwright-report/
+test-results/
+.vercel

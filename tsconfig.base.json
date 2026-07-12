@@ -1,0 +1,32 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "useDefineForClassFields": true,
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "resolveJsonModule": true,
+    "allowSyntheticDefaultImports": true,
+    "esModuleInterop": true,
+    "isolatedModules": true,
+    "strict": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "baseUrl": ".",
+    "paths": {
+      "@quoteops/shared": ["packages/shared/src/index.ts"],
+      "@quoteops/contracts": ["packages/contracts/src/index.ts"],
+      "@quoteops/quote-core": ["packages/quote-core/src/index.ts"],
+      "@quoteops/connectors": ["packages/connectors/src/index.ts"],
+      "@quoteops/criteria": ["packages/criteria/src/index.ts"],
+      "@quoteops/knowledge": ["packages/knowledge/src/index.ts"],
+      "@quoteops/audit": ["packages/audit/src/index.ts"],
+      "@quoteops/agent": ["apps/agent/src/index.ts"],
+      "@quoteops/control-plane": ["apps/control-plane/src/index.ts"],
+      "@quoteops/control-plane-api": ["apps/control-plane-api/src/index.ts"],
+      "@quoteops/api": ["apps/api/src/index.ts"]
+    }
+  }
+}

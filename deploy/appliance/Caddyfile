@@ -1,0 +1,26 @@
+{$QUOTEOPS_SITE_ADDRESS} {
+	encode zstd gzip
+
+	log {
+		output file /var/log/quoteops/caddy-access.log {
+			roll_size 10MiB
+			roll_keep 5
+			roll_keep_for 720h
+		}
+		format json
+	}
+
+	@api path /api /api/*
+	handle @api {
+		reverse_proxy quoteops-api:8080
+	}
+
+	handle /health {
+		rewrite * /api/health
+		reverse_proxy quoteops-api:8080
+	}
+
+	handle {
+		reverse_proxy quoteops-web:3000
+	}
+}

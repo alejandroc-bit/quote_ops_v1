@@ -1,0 +1,29 @@
+{
+  "name": "@quoteops/api",
+  "version": "2.0.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "dependencies": {
+    "@google/genai": "^1.0.0",
+    "@quoteops/agent": "2.0.0",
+    "@quoteops/connectors": "2.0.0",
+    "@quoteops/contracts": "2.0.0",
+    "@quoteops/knowledge": "2.0.0",
+    "@quoteops/shared": "2.0.0",
+    "@quoteops/quote-core": "2.0.0",
+    "cors": "^2.8.5",
+    "express": "^4.21.2",
+    "pg": "^8.22.0",
+    "yaml": "^2.6.1"
+  },
+  "devDependencies": {
+    "@types/pg": "^8.20.0"
+  }
+}

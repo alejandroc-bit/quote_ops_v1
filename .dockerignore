@@ -1,0 +1,12 @@
+node_modules
+**/node_modules
+**/dist
+*.tsbuildinfo
+**/*.tsbuildinfo
+.git
+.DS_Store
+npm-debug.log
+coverage
+.env
+*.local
+deploy/appliance/examples/*/connectors/tms/*writebacks*.jsonl

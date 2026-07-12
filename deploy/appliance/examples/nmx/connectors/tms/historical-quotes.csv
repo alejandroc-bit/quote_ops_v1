@@ -1,0 +1,4 @@
+quote_id,rfq_id,lane_id,customer_id,origin_city,origin_state,origin_country,destination_city,destination_state,destination_country,vehicle_profile_id,equipment_request,commodity,commodity_category,sector,weight_kg,rate_mxn,direct_cost_mxn,margin_pct,quoted_at,service_type,status
+QUOTE-NMX-1,RFQ-2026-000101,RFQ-2026-000101-L01,NMX-CUST-DEMO,Monterrey,Nuevo Leon,MX,Ciudad de Mexico,Ciudad de Mexico,MX,T3S3_53_DRYVAN,caja seca 53,carga general,general,industrial,18000,36000,21000,0.42,2026-03-15,cuota,won
+QUOTE-NMX-2,RFQ-2026-000102,RFQ-2026-000102-L01,NMX-CUST-DEMO,Monterrey,Nuevo Leon,MX,Ciudad de Mexico,Ciudad de Mexico,MX,T3S3_53_DRYVAN,caja seca 53,carga general,general,industrial,18000,36574.12,22000,0.41,2026-04-15,cuota,won
+QUOTE-NMX-3,RFQ-2026-000103,RFQ-2026-000103-L01,NMX-CUST-DEMO,Monterrey,Nuevo Leon,MX,Ciudad de Mexico,Ciudad de Mexico,MX,T3S3_53_DRYVAN,caja seca 53,carga general,general,industrial,18000,51269.8,31000,0.39,2026-05-15,cuota,won

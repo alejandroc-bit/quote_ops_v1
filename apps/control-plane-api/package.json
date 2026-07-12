@@ -1,0 +1,15 @@
+{
+  "name": "@quoteops/control-plane-api",
+  "version": "2.0.0",
+  "private": true,
+  "type": "module",
+  "main": "src/index.ts",
+  "dependencies": {
+    "@quoteops/control-plane": "2.0.0",
+    "@quoteops/shared": "2.0.0",
+    "pg": "^8.22.0"
+  },
+  "devDependencies": {
+    "@types/pg": "^8.20.0"
+  }
+}

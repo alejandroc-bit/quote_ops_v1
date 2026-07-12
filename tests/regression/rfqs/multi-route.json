@@ -1,0 +1,99 @@
+{
+  "rfq_id": "RFQ-2026-000003",
+  "source": "email",
+  "received_at": "2026-06-16T12:30:00-06:00",
+  "requester": {
+    "name": "Ana Perez",
+    "email": "ana.perez@cliente.com",
+    "company_alias": "Cliente Demo"
+  },
+  "raw": {
+    "subject": "Dos rutas desde Monterrey",
+    "body": "Favor de cotizar Monterrey a Saltillo y Monterrey a Puebla en caja seca 53.",
+    "attachments": []
+  },
+  "parsed": {
+    "lanes": [
+      {
+        "lane_id": "RFQ-2026-000003-L01",
+        "origin": {
+          "city": "Monterrey",
+          "state": "NL",
+          "country": "MX"
+        },
+        "destination": {
+          "city": "Saltillo",
+          "state": "CO",
+          "country": "MX"
+        },
+        "equipment_request": "T3S2_53_DRYVAN",
+        "vehicle_profile_id": "T3S2_53_DRYVAN",
+        "cargo": {
+          "commodity": "empaque industrial",
+          "commodity_category": "industrial",
+          "sector": "manufactura",
+          "weight_kg": 11000,
+          "value_mxn": 220000,
+          "hazmat": false,
+          "temperature_controlled": false
+        },
+        "service": {
+          "return_policy": "one_way",
+          "route_policy": "sakbe_required",
+          "requested_pickup_at": "2026-06-18T08:00:00-06:00"
+        },
+        "commercial": {
+          "target_rate_mxn": null,
+          "customer_id": "cliente-demo",
+          "customer_type": "shipper",
+          "business_unit_id": "general"
+        },
+        "confidence": {
+          "overall": 0.95,
+          "missing_fields": [],
+          "review_reasons": []
+        }
+      },
+      {
+        "lane_id": "RFQ-2026-000003-L02",
+        "origin": {
+          "city": "Monterrey",
+          "state": "NL",
+          "country": "MX"
+        },
+        "destination": {
+          "city": "Puebla",
+          "state": "PU",
+          "country": "MX"
+        },
+        "equipment_request": "T3S2_53_DRYVAN",
+        "vehicle_profile_id": "T3S2_53_DRYVAN",
+        "cargo": {
+          "commodity": "empaque industrial",
+          "commodity_category": "industrial",
+          "sector": "manufactura",
+          "weight_kg": 13000,
+          "value_mxn": 280000,
+          "hazmat": false,
+          "temperature_controlled": false
+        },
+        "service": {
+          "return_policy": "one_way",
+          "route_policy": "sakbe_required",
+          "requested_pickup_at": "2026-06-18T08:00:00-06:00"
+        },
+        "commercial": {
+          "target_rate_mxn": null,
+          "customer_id": "cliente-demo",
+          "customer_type": "shipper",
+          "business_unit_id": "general"
+        },
+        "confidence": {
+          "overall": 0.93,
+          "missing_fields": [],
+          "review_reasons": []
+        }
+      }
+    ]
+  }
+}

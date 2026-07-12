@@ -1,0 +1,17 @@
+{
+  "files": [],
+  "references": [
+    { "path": "packages/shared" },
+    { "path": "packages/contracts" },
+    { "path": "packages/quote-core" },
+    { "path": "packages/connectors" },
+    { "path": "packages/criteria" },
+    { "path": "packages/knowledge" },
+    { "path": "packages/audit" },
+    { "path": "apps/agent" },
+    { "path": "apps/api" },
+    { "path": "apps/control-plane" },
+    { "path": "apps/control-plane-api" },
+    { "path": "apps/web" }
+  ]
+}
