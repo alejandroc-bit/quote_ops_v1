@@ -1,8 +1,8 @@
 import {
   calculateQuote,
   type ProfitabilityRbBracket,
+  type QuoteCoreStatus,
   type QuoteManifest,
-  type QuoteVehicleProfile,
   type RouteEvidence
 } from "@quoteops/quote-core";
 
@@ -21,6 +21,12 @@ export function validateMarginParams(target: number, minimum: number): string[] 
     errors.push("minimum_margin_pct no puede ser mayor que margin_target_pct");
   }
   return errors;
+}
+
+export function validateMinimumMargin(minimum: number): string[] {
+  return Number.isFinite(minimum) && minimum >= 0 && minimum < 1
+    ? []
+    : ["minimum_margin_pct debe estar entre 0 y 1 (ej. 0.18)"];
 }
 
 /**
@@ -91,7 +97,7 @@ export function validateAuthorization(input: {
     }
   }
   const phone = input.whatsapp_approver_phone.replace(/[\s()-]/g, "");
-  if (phone && !PHONE_RE.test(phone)) {
+  if (!PHONE_RE.test(phone)) {
     errors.push(`teléfono WhatsApp inválido: "${input.whatsapp_approver_phone}"`);
   }
   return errors;
@@ -106,8 +112,9 @@ export function parseDomainList(raw: string): string[] {
 
 /**
  * Persist the authorization tenant into the client manifest: a top-level
- * `authorization` block plus mirroring allowed_domains into the default
- * business unit's requester_email_domains (the existing intake policy field).
+ * `authorization` block plus replacing requester_email_domains across business
+ * units. Replacement matters: a rerun must revoke domains removed by the
+ * operator instead of leaving an older mailbox-intake path authorized.
  */
 export function applyAuthorization(
   manifest: OnboardManifest,
@@ -115,19 +122,15 @@ export function applyAuthorization(
 ): OnboardManifest {
   const normalized: ManifestAuthorization = {
     approver_email: auth.approver_email.trim().toLowerCase(),
-    allowed_domains: auth.allowed_domains.map((domain) => domain.trim().toLowerCase()),
+    allowed_domains: [
+      ...new Set(auth.allowed_domains.map((domain) => domain.trim().toLowerCase()))
+    ],
     whatsapp_approver_phone: auth.whatsapp_approver_phone.replace(/[\s()-]/g, "")
   };
-  const businessUnits = manifest.business_units.map((unit) =>
-    unit.default
-      ? {
-          ...unit,
-          requester_email_domains: [
-            ...new Set([...(unit.requester_email_domains ?? []), ...normalized.allowed_domains])
-          ]
-        }
-      : unit
-  );
+  const businessUnits = manifest.business_units.map((unit) => ({
+    ...unit,
+    requester_email_domains: [...new Set(normalized.allowed_domains)]
+  }));
   return { ...manifest, business_units: businessUnits, authorization: normalized };
 }
 
@@ -139,6 +142,8 @@ export type SampleQuoteRow = {
   unit: string;
   pricing_model: string;
   rate_mxn: number;
+  status: QuoteCoreStatus;
+  review_reasons: string[];
 };
 
 const SAMPLE_LANES = [
@@ -147,10 +152,10 @@ const SAMPLE_LANES = [
   { origin: "Guadalajara, Jalisco", destination: "Tijuana, Baja California", km: 2250, minutes: 1560, tolls: 3900 }
 ] as const;
 
-function mockRoute(lane: (typeof SAMPLE_LANES)[number]): RouteEvidence {
+function validationRoute(lane: (typeof SAMPLE_LANES)[number]): RouteEvidence {
   return {
     status: "resolved",
-    source: "mock",
+    source: "sakbe",
     km_loaded: lane.km,
     estimated_minutes: lane.minutes,
     tolls_mxn: lane.tolls,
@@ -165,16 +170,27 @@ function splitCityState(place: string): { city: string; state: string } {
 
 /**
  * Run 3 fixed sample lanes through the deterministic quote-core with the
- * configured manifest + mock route evidence. quote-core is the ONLY rate
+ * configured manifest + deterministic resolved route evidence. quote-core is the ONLY rate
  * source — this just formats what it returns for the operator to eyeball.
  */
 export function buildSampleQuoteRows(
   manifest: QuoteManifest,
-  profile?: QuoteVehicleProfile
+  profileIds?: readonly string[]
 ): SampleQuoteRow[] {
-  const target = profile ?? manifest.vehicle_profiles[0];
-  if (!target) throw new Error("el manifest no tiene vehicle_profiles");
+  const selectedIds = [...new Set(profileIds ?? [])];
+  const targets =
+    selectedIds.length > 0
+      ? selectedIds.map((profileId) => {
+          const profile = manifest.vehicle_profiles.find(
+            (candidate) => candidate.vehicle_profile_id === profileId
+          );
+          if (!profile) throw new Error(`vehicle_profile no encontrado: ${profileId}`);
+          return profile;
+        })
+      : manifest.vehicle_profiles.slice(0, 1);
+  if (targets.length === 0) throw new Error("el manifest no tiene vehicle_profiles");
   return SAMPLE_LANES.map((lane, index) => {
+    const target = targets[index % targets.length]!;
     const result = calculateQuote({
       rfq: {
         rfq_id: `onboard-sample-${index + 1}`,
@@ -184,30 +200,41 @@ export function buildSampleQuoteRows(
         origin: { ...splitCityState(lane.origin), country: "MX" },
         destination: { ...splitCityState(lane.destination), country: "MX" },
         vehicle_profile_id: target.vehicle_profile_id,
-        cargo: { weight_kg: 12000 },
+        cargo: { weight_kg: null },
         service: { return_policy: "one_way", route_policy: "standard" },
         commercial: {}
       },
       manifest,
-      route_evidence: mockRoute(lane)
+      route_evidence: validationRoute(lane)
     });
     return {
       origin: lane.origin,
       destination: lane.destination,
       unit: target.vehicle_profile_id,
       pricing_model: result.pricing_model,
-      rate_mxn: result.base_rate_mxn
+      rate_mxn: result.base_rate_mxn,
+      status: result.status,
+      review_reasons: result.review_reasons
     };
   });
 }
 
 export function renderQuoteTable(rows: SampleQuoteRow[]): string {
-  const header = ["Origen → Destino", "Unidad", "Modelo", "Tarifa MXN"];
+  const header = [
+    "Origen → Destino",
+    "Unidad",
+    "Modelo",
+    "Tarifa MXN",
+    "Estado",
+    "Motivos de revisión"
+  ];
   const cells = rows.map((row) => [
     `${row.origin} → ${row.destination}`,
     row.unit,
     row.pricing_model,
-    row.rate_mxn.toLocaleString("es-MX", { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+    row.rate_mxn.toLocaleString("es-MX", { minimumFractionDigits: 2, maximumFractionDigits: 2 }),
+    row.status,
+    row.review_reasons.join(", ") || "—"
   ]);
   const widths = header.map((title, column) =>
     Math.max(title.length, ...cells.map((row) => row[column]!.length))
@@ -217,4 +244,29 @@ export function renderQuoteTable(rows: SampleQuoteRow[]): string {
   return [line(header), widths.map((width) => "-".repeat(width)).join("  "), ...cells.map(line)].join(
     "\n"
   );
+}
+
+export async function runSampleValidationLoop(
+  initialManifest: QuoteManifest,
+  actions: {
+    profileIds?: readonly string[];
+    show(rows: SampleQuoteRow[]): void | Promise<void>;
+    confirm(): boolean | Promise<boolean>;
+    adjust(
+      manifest: QuoteManifest,
+      rows: SampleQuoteRow[]
+    ): QuoteManifest | Promise<QuoteManifest>;
+  }
+): Promise<QuoteManifest> {
+  let manifest = initialManifest;
+  while (true) {
+    const rows = buildSampleQuoteRows(manifest, actions.profileIds);
+    await actions.show(rows);
+    if (rows.some((row) => row.status !== "APPROVED")) {
+      manifest = await actions.adjust(manifest, rows);
+      continue;
+    }
+    if (await actions.confirm()) return manifest;
+    manifest = await actions.adjust(manifest, rows);
+  }
 }

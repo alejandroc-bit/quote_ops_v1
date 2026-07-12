@@ -62,7 +62,7 @@ Future connector or agent keys can be added with the same pattern as uppercase e
 
 ```bash
 printf '%s\n' "$VALUE" | bash deploy/appliance/secrets.sh \
-  --home /opt/quoteops \
+  --home /opt/quoteops-v1 \
   set CONNECTOR_API_KEY --stdin
 ```
 

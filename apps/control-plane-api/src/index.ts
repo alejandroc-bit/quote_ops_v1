@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import cors from "cors";
 import express, { type Express, type Request, type Response } from "express";
+import { z } from "zod";
 import {
   applyMinimalHeartbeat,
   applyQuoteCounters,
@@ -27,6 +28,55 @@ import {
 import { createFileControlPlaneStore } from "./stores/fileStore.js";
 import { createPostgresControlPlaneStore } from "./stores/postgresStore.js";
 import { createDefaultTenantDataStore, type TenantDataStore } from "./tenantData.js";
+
+const isoDateSchema = z
+  .string()
+  .trim()
+  .regex(/^\d{4}-\d{2}-\d{2}$/, "must be an ISO date (YYYY-MM-DD)")
+  .refine((value) => {
+    const parsed = new Date(`${value}T00:00:00.000Z`);
+    return !Number.isNaN(parsed.getTime()) && parsed.toISOString().slice(0, 10) === value;
+  }, "must be a valid date");
+
+const sentinelReportSchema = z
+  .object({
+    installation_id: z.string().trim().min(1).max(200),
+    week_start: isoDateSchema,
+    body_md: z.string().trim().min(1).max(250_000),
+    stats: z
+      .object({
+        runs: z.number().int().nonnegative(),
+        errors: z.number().int().nonnegative(),
+        interrupts: z.number().int().nonnegative(),
+        avg_node_ms: z.number().finite().nonnegative()
+      })
+      .strict()
+  })
+  .strict();
+
+const usageEventSchema = z
+  .object({
+    day: isoDateSchema,
+    channel: z.string().trim().min(1).max(64),
+    quotes: z.number().int().nonnegative(),
+    routes: z.number().int().nonnegative()
+  })
+  .strict();
+
+const versionSchema = z.string().trim().regex(/^v\d+\.\d+\.\d+$/);
+
+const heartbeatSettingsSchema = z
+  .object({
+    pricing_model: z.enum(["formula", "profitability"]).optional().catch(undefined),
+    pdf_template: z
+      .union([
+        z.string().min(1).refine((value) => value.trim().length > 0),
+        z.record(z.unknown())
+      ])
+      .optional()
+      .catch(undefined)
+  })
+  .strip();
 
 export class ApiError extends Error {
   constructor(
@@ -68,9 +118,14 @@ export type ControlPlaneStore = {
 };
 
 export type AdminTokenVerifier = (token: string) => Promise<string | null>;
+export type AuthenticatedSession = { user_id: string; email: string };
+export type SessionTokenVerifier = (token: string) => Promise<AuthenticatedSession | null>;
+export type VendorAdminEmailVerifier = (email: string) => boolean;
 
 export type ControlPlaneApiDependencies = {
   verifyAdminToken?: AdminTokenVerifier | null;
+  verifySessionToken?: SessionTokenVerifier | null;
+  isVendorAdminEmail?: VendorAdminEmailVerifier | null;
   controlPlaneUrl?: string;
   keyPair?: LicenseKeyPair;
   now?: () => Date;
@@ -81,32 +136,46 @@ export type ControlPlaneApiDependencies = {
 };
 
 /**
- * Verifies a Supabase Auth session token by asking Supabase who it belongs to,
- * then checks that email against the admin allowlist. Any Supabase sign-in
- * method (magic link, OAuth, password) produces a session that validates the
- * same way here.
+ * Verifies a Supabase Auth session token and returns only normalized identity.
+ * Role/tenant decisions are deliberately separate from authentication.
  */
-function createDefaultAdminTokenVerifier(): AdminTokenVerifier | null {
+function createDefaultSessionTokenVerifier(): SessionTokenVerifier | null {
   const supabaseUrl = process.env.QUOTEOPS_SUPABASE_URL?.trim() || null;
   const anonKey = process.env.QUOTEOPS_SUPABASE_ANON_KEY?.trim() || null;
+  if (!supabaseUrl || !anonKey) return null;
+
+  return async (token: string): Promise<AuthenticatedSession | null> => {
+    const response = await fetch(`${supabaseUrl}/auth/v1/user`, {
+      headers: { apikey: anonKey, authorization: `Bearer ${token}` }
+    });
+    if (!response.ok) return null;
+    const body = (await response.json()) as { id?: unknown; email?: unknown };
+    const userId = typeof body.id === "string" ? body.id.trim() : null;
+    const email = typeof body.email === "string" ? body.email.trim().toLowerCase() : null;
+    return userId && email ? { user_id: userId, email } : null;
+  };
+}
+
+function createDefaultVendorAdminEmailVerifier(): VendorAdminEmailVerifier | null {
   const adminEmails = new Set(
     (process.env.QUOTEOPS_ADMIN_EMAILS ?? "")
       .split(",")
       .map((email) => email.trim().toLowerCase())
       .filter(Boolean)
   );
-  if (!supabaseUrl || !anonKey || adminEmails.size === 0) {
-    return null;
-  }
+  return adminEmails.size > 0
+    ? (email: string) => adminEmails.has(email.trim().toLowerCase())
+    : null;
+}
 
-  return async (token: string): Promise<string | null> => {
-    const response = await fetch(`${supabaseUrl}/auth/v1/user`, {
-      headers: { apikey: anonKey, authorization: `Bearer ${token}` }
-    });
-    if (!response.ok) return null;
-    const body = (await response.json()) as { email?: unknown };
-    const email = typeof body.email === "string" ? body.email.trim().toLowerCase() : null;
-    return email && adminEmails.has(email) ? email : null;
+function createAdminTokenVerifier(
+  verifySessionToken: SessionTokenVerifier | null,
+  isVendorAdminEmail: VendorAdminEmailVerifier | null
+): AdminTokenVerifier | null {
+  if (!verifySessionToken || !isVendorAdminEmail) return null;
+  return async (token) => {
+    const session = await verifySessionToken(token);
+    return session && isVendorAdminEmail(session.email) ? session.email : null;
   };
 }
 
@@ -174,6 +243,14 @@ export function createControlPlaneApi(
     dependencies.controlPlaneUrl ??
     process.env.QUOTEOPS_CONTROL_PLANE_URL ??
     null;
+  const verifySessionToken =
+    dependencies.verifySessionToken !== undefined
+      ? dependencies.verifySessionToken
+      : createDefaultSessionTokenVerifier();
+  const isVendorAdminEmail =
+    dependencies.isVendorAdminEmail !== undefined
+      ? dependencies.isVendorAdminEmail
+      : createDefaultVendorAdminEmailVerifier();
 
   app.use(cors());
   app.use(express.json({ limit: "256kb" }));
@@ -183,7 +260,7 @@ export function createControlPlaneApi(
   const verifyAdminToken =
     dependencies.verifyAdminToken !== undefined
       ? dependencies.verifyAdminToken
-      : createDefaultAdminTokenVerifier();
+      : createAdminTokenVerifier(verifySessionToken, isVendorAdminEmail);
   app.use("/api/admin", asyncMiddleware(async (req, res, next) => {
     if (!verifyAdminToken) {
       res.status(503).json({
@@ -210,6 +287,30 @@ export function createControlPlaneApi(
     });
   }));
 
+  app.post("/api/portal/profile/claim", asyncRoute(async (req, res) => {
+    parseInput(() => z.object({}).strict().parse(req.body));
+    if (!verifySessionToken) {
+      throw new ApiError(503, "portal_auth_unavailable", "portal session auth is not configured");
+    }
+    if (!tenantData) {
+      throw new ApiError(503, "tenant_data_unavailable", "tenant data store is not configured");
+    }
+    const authorization = String(req.headers.authorization ?? "").trim();
+    const token = /^Bearer\s+([^\s]+)$/i.exec(authorization)?.[1] ?? null;
+    const session = token ? await verifySessionToken(token) : null;
+    if (!session) throw new ApiError(401, "unauthorized_portal", "invalid portal session");
+    const profile = await tenantData.claimPortalProfile({
+      user_id: session.user_id,
+      email: session.email.trim().toLowerCase(),
+      vendor_admin: isVendorAdminEmail?.(session.email) ?? false
+    });
+    if (!profile) {
+      throw new ApiError(403, "portal_profile_forbidden", "email is not authorized for a tenant");
+    }
+    const { email: _claimedEmail, ...publicProfile } = profile;
+    res.json({ profile: publicProfile });
+  }));
+
   app.get("/api/admin/clients", asyncRoute(async (_req, res) => {
     res.json({ items: await store.listClients() });
   }));
@@ -227,6 +328,12 @@ export function createControlPlaneApi(
       })
     );
     await store.upsertClient(client);
+    await tenantData?.provisionClient({
+      client_id: client.client_id,
+      legal_name: client.legal_name,
+      authorized_email: client.authorized_users[0]!.email,
+      installation_id: client.installation.installation_id
+    });
     res.status(201).json({ client });
   }));
 
@@ -241,6 +348,14 @@ export function createControlPlaneApi(
       expires_at: addMinutes(now(), tokenTtlMinutes).toISOString(),
       used_at: null
     };
+    if (tenantData) {
+      await tenantData.issueRegistrationToken({
+        token: token.token,
+        installation_id: token.installation_id,
+        expires_at: token.expires_at,
+        used_at: token.used_at
+      });
+    }
     await store.saveRegistrationToken(token);
 
     const pack = createInstallPack({
@@ -385,9 +500,13 @@ export function createControlPlaneApi(
 
     const issuedAt = now().toISOString();
     const license = issueLicense(client, keyPair.private_key_pem, issuedAt);
-    await store.updateRegistrationToken({ ...token, used_at: issuedAt });
     const updated = markClientLicensed(client);
+    // Retry-safe cross-store order: keep both tokens unused until the client is
+    // durably licensed, then mark the authoritative long-lived credential,
+    // and only consume the legacy activation token after every prior write.
     await store.upsertClient(updated);
+    await tenantData?.markRegistrationTokenUsed(token.token, issuedAt);
+    await store.updateRegistrationToken({ ...token, used_at: issuedAt });
 
     res.json({
       activated: true,
@@ -404,6 +523,7 @@ export function createControlPlaneApi(
       res.status(400).json({ error: "installation_id_required" });
       return;
     }
+    await requireInstallationToken(req, installationId);
     if (body.installation_id && body.installation_id !== installationId) {
       res.status(400).json({ error: "installation_id_mismatch" });
       return;
@@ -411,7 +531,8 @@ export function createControlPlaneApi(
 
     // `version` is consumed here for the update channel; the strict minimal
     // heartbeat parser only accepts its own allowlisted fields.
-    const { version: reportedVersion, ...heartbeatBody } = body;
+    const { version: reportedVersionInput, ...heartbeatBody } = body;
+    const reportedVersion = parseInput(() => versionSchema.optional().parse(reportedVersionInput));
     const heartbeat = parseInput(() =>
       parseMinimalHeartbeat({ ...heartbeatBody, installation_id: installationId })
     );
@@ -425,11 +546,13 @@ export function createControlPlaneApi(
     if (tenantData) {
       await tenantData.touchInstallation(
         installationId,
-        optionalString(reportedVersion),
+        reportedVersion ?? null,
         now().toISOString()
       );
       latestVersion = (await tenantData.latestRelease())?.version ?? null;
-      settings = await tenantData.getInstallationSettings(installationId);
+      settings = heartbeatSettingsSchema.parse(
+        await tenantData.getInstallationSettings(installationId)
+      );
     }
     res.status(202).json({
       accepted: true,
@@ -446,6 +569,7 @@ export function createControlPlaneApi(
       res.status(400).json({ error: "installation_id_required" });
       return;
     }
+    await requireInstallationToken(req, installationId);
     if (body.installation_id && body.installation_id !== installationId) {
       res.status(400).json({ error: "installation_id_mismatch" });
       return;
@@ -462,47 +586,67 @@ export function createControlPlaneApi(
 
   // Appliance ingest endpoints: Bearer = installation registration token,
   // resolved to a tenant against the Supabase-backed tenant tables.
-  async function requireTenantToken(req: Request): Promise<{ tenant_id: string }> {
-    if (!tenantData) {
-      throw new ApiError(503, "tenant_data_unavailable", "tenant data store is not configured");
+  async function requireTenantToken(
+    req: Request
+  ): Promise<{ tenant_id: string; installation_id: string }> {
+    const authorization = String(req.headers.authorization ?? "").trim();
+    const token = /^Bearer\s+([^\s]+)$/i.exec(authorization)?.[1] ?? null;
+    if (!token) {
+      throw new ApiError(401, "unauthorized_installation", "invalid installation token");
     }
-    const token = String(req.headers.authorization ?? "").replace(/^Bearer\s+/i, "").trim();
-    const resolved = token ? await tenantData.resolveTenantByToken(token) : null;
+    const resolved = tenantData
+      ? await tenantData.resolveTenantByToken(token)
+      : await resolveLegacyTenantToken(store, token, now());
     if (!resolved) {
       throw new ApiError(401, "unauthorized_installation", "invalid installation token");
     }
     return resolved;
   }
 
+  async function requireInstallationToken(req: Request, installationId: string) {
+    const resolved = await requireTenantToken(req);
+    if (resolved.installation_id !== installationId) {
+      throw new ApiError(403, "installation_token_mismatch", "token is bound to another installation");
+    }
+    return resolved;
+  }
+
+  function requireTenantDataStore(): TenantDataStore {
+    if (!tenantData) {
+      throw new ApiError(503, "tenant_data_unavailable", "tenant data store is not configured");
+    }
+    return tenantData;
+  }
+
   app.post("/api/sentinel/reports", asyncRoute(async (req, res) => {
-    const { tenant_id } = await requireTenantToken(req);
-    const body = assertRecord(req.body);
-    await tenantData!.insertSentinelReport({
+    const body = parseInput(() => sentinelReportSchema.parse(req.body));
+    const { tenant_id } = await requireInstallationToken(req, body.installation_id);
+    await requireTenantDataStore().insertSentinelReport({
       tenant_id,
-      installation_id: requiredString(body.installation_id, "installation_id"),
-      week_start: requiredString(body.week_start, "week_start"),
-      body_md: requiredString(body.body_md, "body_md"),
-      stats: body.stats && typeof body.stats === "object" ? (body.stats as Record<string, unknown>) : {}
+      installation_id: body.installation_id,
+      week_start: body.week_start,
+      body_md: body.body_md,
+      stats: body.stats
     });
     res.status(201).json({ accepted: true });
   }));
 
   app.post("/api/usage", asyncRoute(async (req, res) => {
     const { tenant_id } = await requireTenantToken(req);
-    const body = assertRecord(req.body);
-    await tenantData!.recordUsage({
+    const body = parseInput(() => usageEventSchema.parse(req.body));
+    await requireTenantDataStore().recordUsage({
       tenant_id,
-      day: requiredString(body.day, "day"),
-      channel: requiredString(body.channel, "channel"),
-      quotes: requiredNumber(body.quotes, "quotes"),
-      routes: requiredNumber(body.routes, "routes")
+      day: body.day,
+      channel: body.channel,
+      quotes: body.quotes,
+      routes: body.routes
     });
     res.status(202).json({ accepted: true });
   }));
 
   app.get("/api/releases/latest", asyncRoute(async (req, res) => {
     await requireTenantToken(req);
-    const release = await tenantData!.latestRelease();
+    const release = await requireTenantDataStore().latestRelease();
     if (!release) {
       throw new ApiError(404, "not_found", "no releases published");
     }
@@ -566,6 +710,17 @@ function markClientLicensed(client: MinimalClientRecord): MinimalClientRecord {
   };
 }
 
+async function resolveLegacyTenantToken(
+  store: ControlPlaneStore,
+  tokenValue: string,
+  now: Date
+): Promise<{ tenant_id: string; installation_id: string } | null> {
+  const token = await store.getRegistrationToken(tokenValue);
+  if (!token) return null;
+  if (!token.used_at && Date.parse(token.expires_at) <= now.getTime()) return null;
+  return { tenant_id: token.client_id, installation_id: token.installation_id };
+}
+
 function ensureClientCanReceiveLicense(client: MinimalClientRecord): void {
   if (client.status === "suspended" || client.installation.license_status === "suspended") {
     throw new ApiError(403, "client_not_active", "client suspended");
@@ -620,13 +775,6 @@ function requiredString(value: unknown, field: string): string {
     throw new ApiError(400, "bad_request", `${field} is required`);
   }
   return value.trim();
-}
-
-function requiredNumber(value: unknown, field: string): number {
-  if (typeof value !== "number" || !Number.isFinite(value)) {
-    throw new ApiError(400, "bad_request", `${field} must be a number`);
-  }
-  return value;
 }
 
 function optionalString(value: unknown): string | null {

@@ -7,14 +7,20 @@ import { ClientProfilePage } from "./pages/clientProfile";
 import { ClientsPage } from "./pages/clients";
 import { SentinelReportsPage } from "./pages/sentinelReports";
 import { SetupPage } from "./pages/setup";
+import {
+  claimCurrentPortalProfile,
+  listTenantInstallations,
+  type ControlPlaneInstallationDetail,
+  type ControlPlanePortalProfile
+} from "./api/controlPlaneApi";
 
 type ControlPlanePageKey = "clients" | "profile" | "sentinel" | "setup";
 
 const controlPlanePages: Array<DashboardPage<ControlPlanePageKey>> = [
   {
     key: "clients",
-    label: "Clients",
-    description: "Onboarding",
+    label: "Clientes",
+    description: "Alta y administración",
     icon: Building2,
     component: ClientsPage
   },
@@ -34,8 +40,8 @@ const controlPlanePages: Array<DashboardPage<ControlPlanePageKey>> = [
   },
   {
     key: "setup",
-    label: "Install",
-    description: "Client packs",
+    label: "Instalación",
+    description: "Paquetes del cliente",
     icon: ServerCog,
     component: SetupPage
   }
@@ -45,6 +51,12 @@ export function ControlPlaneApp() {
   const [activePage, setActivePage] = useState<ControlPlanePageKey>("clients");
   const [session, setSession] = useState<Session | null>(null);
   const [sessionChecked, setSessionChecked] = useState(false);
+  const [profile, setProfile] = useState<ControlPlanePortalProfile | null>(null);
+  const [tenantInstallations, setTenantInstallations] = useState<
+    ControlPlaneInstallationDetail[]
+  >([]);
+  const [accessLoading, setAccessLoading] = useState(false);
+  const [accessError, setAccessError] = useState<string | null>(null);
 
   useEffect(() => {
     if (!supabase) {
@@ -61,38 +73,116 @@ export function ControlPlaneApp() {
     return () => subscription.subscription.unsubscribe();
   }, []);
 
+  useEffect(() => {
+    if (!session) {
+      setProfile(null);
+      setTenantInstallations([]);
+      setAccessError(null);
+      setAccessLoading(false);
+      return;
+    }
+    let cancelled = false;
+    setAccessLoading(true);
+    setAccessError(null);
+    void claimCurrentPortalProfile()
+      .then(async (nextProfile) => {
+        const installations =
+          nextProfile.role === "vendor_admin"
+            ? []
+            : nextProfile.tenant_id
+              ? await listTenantInstallations(nextProfile.tenant_id)
+              : (() => { throw new Error("El perfil tenant no tiene tenant_id."); })();
+        if (cancelled) return;
+        setProfile(nextProfile);
+        setTenantInstallations(installations);
+      })
+      .catch((error: unknown) => {
+        if (cancelled) return;
+        setProfile(null);
+        setTenantInstallations([]);
+        setAccessError(error instanceof Error ? error.message : String(error));
+      })
+      .finally(() => {
+        if (!cancelled) setAccessLoading(false);
+      });
+    return () => { cancelled = true; };
+  }, [session]);
+
   async function signOut() {
     await supabase?.auth.signOut();
   }
 
+  const pages = useMemo<Array<DashboardPage<ControlPlanePageKey>>>(() => {
+    if (profile && profile.role !== "vendor_admin") {
+      return [
+        {
+          key: "profile",
+          label: "Perfil de cliente",
+          description: "Versión, uso y ajustes",
+          icon: Gauge,
+          component: () => <ClientProfilePage tenantInstallations={tenantInstallations} />
+        },
+        {
+          key: "sentinel",
+          label: "Sentinel",
+          description: "Reportes semanales",
+          icon: ScrollText,
+          component: SentinelReportsPage
+        }
+      ];
+    }
+    return controlPlanePages;
+  }, [profile, tenantInstallations]);
+
+  useEffect(() => {
+    if (!pages.some((page) => page.key === activePage)) setActivePage(pages[0]!.key);
+  }, [activePage, pages]);
+
   const loginOverride = useMemo(() => {
-    if (session) return undefined;
-    return <LoginPage checking={!sessionChecked} />;
-  }, [session, sessionChecked]);
+    if (!session) return <LoginPage checking={!sessionChecked} />;
+    if (accessLoading || !profile && !accessError) {
+      return <AccessState title="Verificando acceso" body="Cargando rol y tenant desde Supabase…" />;
+    }
+    if (accessError) {
+      return <AccessState title="Acceso no disponible" body={accessError} />;
+    }
+    return undefined;
+  }, [accessError, accessLoading, profile, session, sessionChecked]);
 
   return (
     <>
       {session ? (
         <div className="admin-token-bar">
-          <span>Signed in as {session.user.email}</span>
+          <span>Sesión iniciada como {session.user.email}</span>
           <button className="button button-secondary" onClick={signOut} type="button">
-            Sign out
+            Cerrar sesión
           </button>
         </div>
       ) : null}
       <AppShell
         activePage={activePage}
-        ariaLabel="Inducta control plane"
+        ariaLabel="Plano de control de Inducta"
         contentOverride={loginOverride}
-        defaultPage={controlPlanePages[0]!}
+        defaultPage={pages[0]!}
         headerTitle="Inducta Control Plane"
-        navDisabled={!session}
-        pages={controlPlanePages}
-        productKicker="Central product"
-        runtimeItems={["Authorized clients", "Install packs", "Aggregate counters only"]}
+        navDisabled={!session || !profile}
+        pages={pages}
+        productKicker="Producto central"
+        runtimeItems={["Clientes autorizados", "Paquetes de instalación", "Solo métricas agregadas"]}
         setActivePage={setActivePage}
       />
     </>
+  );
+}
+
+function AccessState({ title, body }: { title: string; body: string }) {
+  return (
+    <section className="workspace" aria-live="polite">
+      <article className="panel">
+        <h2>{title}</h2>
+        <p className="muted">{body}</p>
+      </article>
+    </section>
   );
 }
 
@@ -105,7 +195,7 @@ function LoginPage({ checking }: { checking: boolean }) {
   async function sendMagicLink(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!supabase) {
-      setMessage("Supabase auth is not configured (VITE_SUPABASE_URL / VITE_SUPABASE_ANON_KEY missing).");
+      setMessage("La autenticación de Supabase no está configurada (faltan VITE_SUPABASE_URL / VITE_SUPABASE_ANON_KEY).");
       return;
     }
     setSending(true);
@@ -121,7 +211,7 @@ function LoginPage({ checking }: { checking: boolean }) {
       return;
     }
     setSent(true);
-    setMessage(`We sent a sign-in link to ${email}. Check your inbox and click it to continue.`);
+    setMessage(`Enviamos un enlace de acceso a ${email}. Revisa tu correo para continuar.`);
   }
 
   return (
@@ -129,27 +219,27 @@ function LoginPage({ checking }: { checking: boolean }) {
       <div className="workspace-heading">
         <div>
           <p className="eyebrow">Inducta Control Plane</p>
-          <h2 id="login-heading">Sign in</h2>
+          <h2 id="login-heading">Iniciar sesión</h2>
         </div>
       </div>
 
       <article className="panel login-panel">
         <div className="panel-title">
           <KeyRound size={18} aria-hidden />
-          <h3>Admin sign-in</h3>
+          <h3>Acceso de administración</h3>
         </div>
         <p className="muted">
-          Enter an authorized admin email. We&apos;ll send a one-time sign-in link — no password
-          to manage.
+          Ingresa un correo de administración autorizado. Enviaremos un enlace de acceso de un
+          solo uso; no necesitas contraseña.
         </p>
 
         <form onSubmit={sendMagicLink}>
-          <label htmlFor="login-email">Admin email</label>
+          <label htmlFor="login-email">Correo de administración</label>
           <input
             disabled={checking}
             id="login-email"
             onChange={(event) => setEmail(event.target.value)}
-            placeholder="you@company.com"
+            placeholder="tu@empresa.com"
             required
             type="email"
             value={email}
@@ -160,7 +250,7 @@ function LoginPage({ checking }: { checking: boolean }) {
             type="submit"
           >
             <Mail size={16} aria-hidden />
-            {sending ? "Sending…" : "Send magic link"}
+            {sending ? "Enviando…" : "Enviar enlace mágico"}
           </button>
         </form>
 

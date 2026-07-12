@@ -3,17 +3,17 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 COMPOSE_FILE="${COMPOSE_FILE:-$SCRIPT_DIR/docker-compose.yml}"
-QUOTEOPS_HOME="${QUOTEOPS_HOME:-/opt/quoteops}"
+QUOTEOPS_HOME="${QUOTEOPS_HOME:-/opt/quoteops-v1}"
 ENV_FILE="${QUOTEOPS_ENV_FILE:-$QUOTEOPS_HOME/.env}"
 OUTPUT_DIR=""
 ENV_FILE_SET=0
 
 usage() {
   cat <<USAGE
-Usage: $(basename "$0") --output /opt/quoteops/backups [options]
+Usage: $(basename "$0") --output /opt/quoteops-v1/backups [options]
 
 Options:
-  --home PATH          Appliance data root (default: /opt/quoteops)
+  --home PATH          Appliance data root (default: /opt/quoteops-v1)
   --env-file PATH      Compose env file (default: <home>/.env)
   --compose-file PATH  Compose file (default: deploy/appliance/docker-compose.yml)
   -h, --help           Show this help

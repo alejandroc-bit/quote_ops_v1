@@ -13,11 +13,11 @@ const installCommand = `QUOTEOPS_REGISTRATION_TOKEN='<paste-token-here>' \\
   bash -c 'curl -fsSL <control-plane-url>/api/install/$QUOTEOPS_REGISTRATION_TOKEN | bash'`;
 
 const secretsCommand = `printf '%s\\n' "$AI_PROVIDER_API_KEY" | bash deploy/appliance/secrets.sh \\
-  --home /opt/quoteops \\
+  --home /opt/quoteops-v1 \\
   set AI_PROVIDER_API_KEY --stdin`;
 
 const composeCommand = `docker compose \\
-  --env-file /opt/quoteops/.env \\
+  --env-file /opt/quoteops-v1/.env \\
   -f docker-compose.yml \\
   up -d`;
 

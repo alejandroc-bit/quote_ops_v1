@@ -12,6 +12,8 @@ export function isUpdateAvailable(
 ): boolean {
   if (!latest) return false;
   if (!installed) return true;
+  const stableVersion = /^v?\d+\.\d+\.\d+$/;
+  if (!stableVersion.test(installed.trim()) || !stableVersion.test(latest.trim())) return false;
   const a = normalizeVersion(installed);
   const b = normalizeVersion(latest);
   const length = Math.max(a.length, b.length);
@@ -36,7 +38,23 @@ export function parsePdfTemplate(raw: string): PdfTemplateParseResult {
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
       return { ok: false, error: "La plantilla debe ser un objeto JSON, por ejemplo {\"title\": \"...\"}" };
     }
-    return { ok: true, value: parsed as Record<string, unknown> };
+    const template = parsed as Record<string, unknown>;
+    const supportedStringFields = ["title", "footer_note", "accent_color", "logo_base64"];
+    const supportedFields = new Set([...supportedStringFields, "show_breakdown"]);
+    const unsupported = Object.keys(template).find((key) => !supportedFields.has(key));
+    if (unsupported) {
+      return { ok: false, error: `Campo no soportado en la plantilla PDF: ${unsupported}.` };
+    }
+    const invalidStringField = supportedStringFields.find(
+      (key) => key in template && typeof template[key] !== "string"
+    );
+    if (invalidStringField) {
+      return { ok: false, error: `${invalidStringField} debe ser texto.` };
+    }
+    if ("show_breakdown" in template && typeof template.show_breakdown !== "boolean") {
+      return { ok: false, error: "show_breakdown debe ser un valor booleano." };
+    }
+    return { ok: true, value: template };
   } catch {
     return { ok: false, error: "JSON inválido: revisa comillas, comas y llaves." };
   }

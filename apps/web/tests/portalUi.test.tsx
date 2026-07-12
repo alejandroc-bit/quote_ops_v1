@@ -27,16 +27,20 @@ vi.mock("../src/api/controlPlaneApi", () => ({
   ]),
   getInstallation: vi.fn(async () => ({
     installation_id: "inst-nmx-1",
+    tenant_id: "tenant-nmx",
     version: "1.0.0",
     settings: { pricing_model: "profitability", pdf_template: { title: "Cotización NMX" } },
     last_heartbeat_at: "2026-07-10T00:00:00Z"
   })),
   getLatestRelease: vi.fn(async () => ({ version: "v1.1.0", notes: null, published_at: null })),
   listInstallationUsage: vi.fn(async () => [
-    { day: "2026-07-09", quotes: 4, routes: 3 },
-    { day: "2026-07-10", quotes: 7, routes: 5 }
+    { day: "2026-07-09", channel: "whatsapp", quotes: 4, routes: 3 },
+    { day: "2026-07-10", channel: "email", quotes: 7, routes: 5 }
   ]),
-  updateInstallationSettings: vi.fn(async () => null),
+  listCredentialStatuses: vi.fn(async () => [
+    { kind: "tms", metadata: { status: "configured" }, updated_at: "2026-07-10T00:00:00Z" }
+  ]),
+  updateSettings: vi.fn(async () => null),
   listSentinelReports: vi.fn(async () => [
     {
       installation_id: "inst-nmx-1",
@@ -58,6 +62,8 @@ describe("portal settings helpers", () => {
     expect(isUpdateAvailable("2.0.0", "v1.9.9")).toBe(false);
     expect(isUpdateAvailable(null, "v1.0.0")).toBe(true);
     expect(isUpdateAvailable("1.0.0", null)).toBe(false);
+    expect(isUpdateAvailable("v1.0.0", "v1.1.0-rc.1")).toBe(false);
+    expect(isUpdateAvailable("v1.0.0-beta.1", "v1.1.0")).toBe(false);
   });
 
   it("validates the PDF template JSON", () => {
@@ -65,6 +71,14 @@ describe("portal settings helpers", () => {
     expect(parsePdfTemplate('{"title":"x"}')).toEqual({ ok: true, value: { title: "x" } });
     expect(parsePdfTemplate("not json").ok).toBe(false);
     expect(parsePdfTemplate("[1,2]").ok).toBe(false);
+    expect(parsePdfTemplate('{"show_breakdown":"yes"}')).toEqual({
+      ok: false,
+      error: expect.stringMatching(/show_breakdown.*booleano/i)
+    });
+    expect(parsePdfTemplate('{"unknown":"x"}')).toEqual({
+      ok: false,
+      error: expect.stringMatching(/campo no soportado.*unknown/i)
+    });
   });
 });
 
@@ -74,8 +88,11 @@ describe("ClientProfilePage", () => {
 
     expect(await screen.findByText(/Actualización disponible v1\.1\.0/i)).toBeInTheDocument();
     expect(screen.getByText("1.0.0")).toBeInTheDocument();
-    expect(screen.getByText("2026-07-10")).toBeInTheDocument();
+    expect(screen.getAllByText("2026-07-10").length).toBeGreaterThan(0);
     expect(screen.getByText("7")).toBeInTheDocument();
+    expect(screen.getByRole("columnheader", { name: /Canal/i })).toBeInTheDocument();
+    expect(screen.getByText(/Credenciales conectadas/i)).toBeInTheDocument();
+    expect(screen.getByText(/tms/i)).toBeInTheDocument();
 
     // settings hydrated from installation
     const rentabilidad = screen.getByLabelText(/Rentabilidad RB/i) as HTMLInputElement;
@@ -88,7 +105,7 @@ describe("ClientProfilePage", () => {
     fireEvent.click(screen.getByRole("button", { name: /Guardar configuración/i }));
 
     await waitFor(() =>
-      expect(vi.mocked(controlPlaneApi.updateInstallationSettings)).toHaveBeenCalledWith(
+      expect(vi.mocked(controlPlaneApi.updateSettings)).toHaveBeenCalledWith(
         "inst-nmx-1",
         expect.objectContaining({
           pricing_model: "formula",
@@ -109,7 +126,7 @@ describe("ClientProfilePage", () => {
     fireEvent.click(screen.getByRole("button", { name: /Guardar configuración/i }));
 
     expect(await screen.findByText(/JSON inválido/i)).toBeInTheDocument();
-    expect(vi.mocked(controlPlaneApi.updateInstallationSettings)).not.toHaveBeenCalled();
+    expect(vi.mocked(controlPlaneApi.updateSettings)).not.toHaveBeenCalled();
   });
 });
 

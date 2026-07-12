@@ -108,9 +108,9 @@ grep -q 'unique (document_id, chunk_index)' "$SCHEMA_FILE" || fail "knowledge_ch
 grep -q 'create table if not exists knowledge_chunks' "$SCHEMA_FILE" || fail "knowledge_chunks schema missing"
 grep -q 'create table if not exists knowledge_ingestion_jobs' "$SCHEMA_FILE" || fail "knowledge_ingestion_jobs schema missing"
 grep -q 'image: postgres:16-alpine' "$COMPOSE_FILE" || fail "appliance compose must use postgres:16-alpine"
-[[ "$(grep -c 'QUOTEOPS_LICENSE_PATH: /opt/quoteops/secrets/license.json' "$COMPOSE_FILE")" -ge 2 ]] || fail "appliance compose must wire QUOTEOPS_LICENSE_PATH to mounted secrets for agent and api"
-[[ "$(grep -c 'QUOTEOPS_LICENSE_PUBLIC_KEY_PATH: /opt/quoteops/secrets/license-public-key.pem' "$COMPOSE_FILE")" -ge 2 ]] || fail "appliance compose must wire QUOTEOPS_LICENSE_PUBLIC_KEY_PATH to mounted secrets for agent and api"
-[[ "$(grep -c -- '- quoteops_secrets:/opt/quoteops/secrets' "$COMPOSE_FILE")" -ge 3 ]] || fail "appliance compose must mount quoteops_secrets into agent, api and onboard"
+[[ "$(grep -c 'QUOTEOPS_LICENSE_PATH: /opt/quoteops-v1/secrets/license.json' "$COMPOSE_FILE")" -ge 2 ]] || fail "appliance compose must wire QUOTEOPS_LICENSE_PATH to mounted secrets for agent and api"
+[[ "$(grep -c 'QUOTEOPS_LICENSE_PUBLIC_KEY_PATH: /opt/quoteops-v1/secrets/license-public-key.pem' "$COMPOSE_FILE")" -ge 2 ]] || fail "appliance compose must wire QUOTEOPS_LICENSE_PUBLIC_KEY_PATH to mounted secrets for agent and api"
+[[ "$(grep -c -- '- quoteops_secrets:/opt/quoteops-v1/secrets' "$COMPOSE_FILE")" -ge 3 ]] || fail "appliance compose must mount quoteops_secrets into agent, api and onboard"
 
 if docker_daemon_available; then
   validate_schema_sql_with_postgres
@@ -231,7 +231,7 @@ status_writebacks_path_env: QUOTEOPS_TMS_STATUS_WRITEBACKS_PATH
 YAML
   compose_config() {
     QUOTEOPS_CLIENT_ID=cliente-demo \
-    QUOTEOPS_VERSION=quoteops-v2.0.0 \
+    QUOTEOPS_VERSION=v2.0.0 \
     QUOTEOPS_IMAGE_REGISTRY=ghcr.io/alejandroc-bit \
     QUOTEOPS_MANIFEST_DIR="$WORK_DIR/manifests" \
     QUOTEOPS_CRITERIA_DIR="$WORK_DIR/criteria" \
@@ -244,11 +244,12 @@ YAML
     POSTGRES_DB=quoteops \
     POSTGRES_USER=quoteops \
     POSTGRES_PASSWORD=test-password \
-    docker compose "$@" config >/dev/null
+    docker compose "$@" config
   }
 
-  compose_config -f "$APPLIANCE_DIR/docker-compose.yml"
-  compose_config -f "$APPLIANCE_DIR/docker-compose.yml" -f "$APPLIANCE_DIR/docker-compose.local.yml"
+  COMPOSE_RENDERED="$(compose_config -f "$APPLIANCE_DIR/docker-compose.yml")"
+  printf '%s\n' "$COMPOSE_RENDERED" | grep -q 'image: ghcr.io/alejandroc-bit/quote-ops-agent:v2.0.0' || fail "compose must render quote-ops-agent:v2.0.0"
+  compose_config -f "$APPLIANCE_DIR/docker-compose.yml" -f "$APPLIANCE_DIR/docker-compose.local.yml" >/dev/null
 else
   echo "smoke.sh: docker compose not available; skipped compose config validation"
 fi

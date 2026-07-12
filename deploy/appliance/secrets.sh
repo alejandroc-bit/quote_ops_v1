@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-QUOTEOPS_HOME="${QUOTEOPS_HOME:-/opt/quoteops}"
+QUOTEOPS_HOME="${QUOTEOPS_HOME:-/opt/quoteops-v1}"
 SECRETS_ENV_FILE="${QUOTEOPS_SECRETS_ENV_FILE:-$QUOTEOPS_HOME/secrets/client.env}"
 SECRETS_ENV_FILE_SET=0
 
@@ -16,7 +16,7 @@ Commands:
   list                List configured secret keys without values
 
 Options:
-  --home PATH              Appliance data root (default: /opt/quoteops)
+  --home PATH              Appliance data root (default: /opt/quoteops-v1)
   --secrets-env-file PATH  Client secrets env file (default: <home>/secrets/client.env)
   -h, --help               Show this help
 USAGE

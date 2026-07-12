@@ -35,8 +35,9 @@ The control plane must not receive:
    manifest, criteria and connector templates. The token authorizes the
    download but is never embedded in the script, and it is only consumed by
    activation. Images are pulled from the registry published by the
-   `release-appliance-images` workflow (`ghcr.io/<owner>/quoteops-{agent,api,web}`,
-   tagged on `quoteops-v*` releases); override with `QUOTEOPS_IMAGE_REGISTRY`.
+   `release-appliance-images` workflow
+   (`ghcr.io/alejandroc-bit/quote-ops-{agent,api,web}`, tagged on `v*`
+   releases); override the registry namespace with `QUOTEOPS_IMAGE_REGISTRY`.
 3. **The client signs in through the cloud onboarding flow.** The control plane validates the user allowlist and registration token, then issues a signed license for `client_id + installation_id`.
 
 For development installs from a repo checkout, `bash deploy/appliance/install.sh --client <ID> --manifest <path> ...` still works directly (see `deploy/appliance/examples/nmx/` for a fictional example client).
@@ -52,7 +53,7 @@ re-activating with the old token fails — the control plane answers
 
 - **Generate install pack** (portal) is the recovery path: it issues a NEW
   registration token. Update `QUOTEOPS_REGISTRATION_TOKEN` in
-  `/opt/quoteops/secrets/client.env`, restart the api container and POST
+  `/opt/quoteops-v1/secrets/client.env`, restart the api container and POST
   `/api/onboarding/activate` again.
 - **Reissue license** only re-signs a license for an authorized client record;
   it does NOT create or re-enable a registration token.

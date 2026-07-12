@@ -80,6 +80,9 @@ export type AgentRuntimeConfig = {
     api_key_env?: string | null;
   };
   authorization: {
+    approver_email: string | null;
+    allowed_domains: string[];
+    whatsapp_approver_phone: string | null;
     tools: Record<string, AgentToolPolicy>;
   };
   mailbox: AgentMailboxConfig | null;
@@ -149,6 +152,9 @@ export function defaultAgentRuntimeConfig(): AgentRuntimeConfig {
       api_key_env: null
     },
     authorization: {
+      approver_email: null,
+      allowed_domains: [],
+      whatsapp_approver_phone: null,
       tools: {
         "email.intake": { effect: "read", mode: "allowed" },
         "knowledge.search": { effect: "read", mode: "allowed" },
@@ -203,6 +209,11 @@ function normalizeAgentRuntimeConfig(value: unknown): AgentRuntimeConfig {
     "authorization",
     "Agent runtime config authorization"
   );
+  assertKnownKeys(
+    authorization,
+    ["approver_email", "allowed_domains", "whatsapp_approver_phone", "tools"],
+    "Agent runtime config authorization"
+  );
   const tools = requiredRecord(authorization, "tools", "Agent runtime config authorization.tools");
 
   return {
@@ -221,6 +232,18 @@ function normalizeAgentRuntimeConfig(value: unknown): AgentRuntimeConfig {
         : defaults.model.api_key_env
     },
     authorization: {
+      approver_email: hasOwn(authorization, "approver_email")
+        ? parseOptionalString(authorization.approver_email, "Agent runtime config authorization.approver_email")
+        : defaults.authorization.approver_email,
+      allowed_domains: hasOwn(authorization, "allowed_domains")
+        ? parseStringArray(authorization.allowed_domains, "Agent runtime config authorization.allowed_domains")
+        : defaults.authorization.allowed_domains,
+      whatsapp_approver_phone: hasOwn(authorization, "whatsapp_approver_phone")
+        ? parseOptionalString(
+            authorization.whatsapp_approver_phone,
+            "Agent runtime config authorization.whatsapp_approver_phone"
+          )
+        : defaults.authorization.whatsapp_approver_phone,
       tools: normalizeToolPolicies(tools)
     },
     mailbox:
@@ -307,6 +330,18 @@ function parseOptionalEnvName(value: unknown, label: string): string | null {
     return value;
   }
   throw new Error(`${label} must be a non-empty string or null`);
+}
+
+function parseOptionalString(value: unknown, label: string): string | null {
+  if (value === null) return null;
+  return parseNonEmptyString(value, label);
+}
+
+function parseStringArray(value: unknown, label: string): string[] {
+  if (!Array.isArray(value) || value.some((entry) => typeof entry !== "string" || !entry.trim())) {
+    throw new Error(`${label} must be an array of non-empty strings`);
+  }
+  return value as string[];
 }
 
 function parseMissing(label: string): never {

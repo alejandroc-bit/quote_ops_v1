@@ -1,12 +1,14 @@
 import { useCallback, useEffect, useState, type FormEvent } from "react";
-import { ArrowUpCircle, BarChart3, FileJson, Gauge, Settings2 } from "lucide-react";
+import { ArrowUpCircle, BarChart3, FileJson, Gauge, KeyRound, Settings2 } from "lucide-react";
 import {
   getInstallation,
   getLatestRelease,
+  listCredentialStatuses,
   listControlPlaneClients,
   listInstallationUsage,
-  updateInstallationSettings,
+  updateSettings,
   type ControlPlaneInstallationDetail,
+  type ControlPlaneCredentialStatus,
   type ControlPlaneRelease,
   type ControlPlaneUsagePoint
 } from "../api/controlPlaneApi";
@@ -20,7 +22,18 @@ const PDF_TEMPLATE_PLACEHOLDER = `{
   "show_breakdown": true
 }`;
 
-export function ClientProfilePage() {
+export function ClientProfilePage({
+  tenantInstallations
+}: {
+  tenantInstallations?: ControlPlaneInstallationDetail[];
+} = {}) {
+  if (tenantInstallations) {
+    return <TenantClientProfile installations={tenantInstallations} />;
+  }
+  return <VendorClientProfile />;
+}
+
+function VendorClientProfile() {
   const loadClients = useCallback(() => listControlPlaneClients(), []);
   const { data: clients, error, loading } = useAsyncResource(loadClients, []);
   const [selectedClientId, setSelectedClientId] = useState<string | null>(null);
@@ -74,15 +87,69 @@ export function ClientProfilePage() {
   );
 }
 
-function InstallationProfile({ installationId }: { installationId: string }) {
+function TenantClientProfile({ installations }: { installations: ControlPlaneInstallationDetail[] }) {
+  const [selectedInstallationId, setSelectedInstallationId] = useState(
+    installations[0]?.installation_id ?? ""
+  );
+  const installation =
+    installations.find((candidate) => candidate.installation_id === selectedInstallationId) ??
+    installations[0] ??
+    null;
+
+  return (
+    <section aria-labelledby="client-profile-heading" className="workspace">
+      <div className="workspace-heading">
+        <div>
+          <p className="eyebrow">Portal cloud</p>
+          <h2 id="client-profile-heading">Perfil del cliente</h2>
+        </div>
+        {installations.length > 1 ? (
+          <label>
+            Instalación{" "}
+            <select
+              aria-label="Seleccionar instalación"
+              onChange={(event) => setSelectedInstallationId(event.target.value)}
+              value={installation?.installation_id ?? ""}
+            >
+              {installations.map((candidate) => (
+                <option key={candidate.installation_id} value={candidate.installation_id}>
+                  {candidate.installation_id}
+                </option>
+              ))}
+            </select>
+          </label>
+        ) : null}
+      </div>
+      {installation ? (
+        <InstallationProfile
+          installationId={installation.installation_id}
+          preloadedInstallation={installation}
+        />
+      ) : (
+        <p className="muted">Tu tenant todavía no tiene instalaciones registradas.</p>
+      )}
+    </section>
+  );
+}
+
+function InstallationProfile({
+  installationId,
+  preloadedInstallation
+}: {
+  installationId: string;
+  preloadedInstallation?: ControlPlaneInstallationDetail;
+}) {
   const loadProfile = useCallback(async () => {
-    const [installation, release, usage] = await Promise.all([
-      getInstallation(installationId),
+    const installation = preloadedInstallation ?? await getInstallation(installationId);
+    const [release, usage, credentials] = await Promise.all([
       getLatestRelease(),
-      listInstallationUsage(installationId)
+      listInstallationUsage(installationId),
+      installation?.tenant_id
+        ? listCredentialStatuses(installation.tenant_id)
+        : Promise.resolve([])
     ]);
-    return { installation, release, usage };
-  }, [installationId]);
+    return { installation, release, usage, credentials };
+  }, [installationId, preloadedInstallation]);
   const { data, error, loading } = useAsyncResource(loadProfile, [installationId]);
 
   if (error) {
@@ -98,9 +165,47 @@ function InstallationProfile({ installationId }: { installationId: string }) {
     <>
       <VersionCard installation={data.installation} release={data.release} />
       <SettingsCard installation={data.installation} installationId={installationId} />
+      <CredentialsCard credentials={data.credentials} />
       <UsageCard usage={data.usage} />
     </>
   );
+}
+
+function CredentialsCard({ credentials }: { credentials: ControlPlaneCredentialStatus[] }) {
+  return (
+    <article className="panel">
+      <div className="panel-title">
+        <KeyRound size={18} aria-hidden />
+        <h3>Credenciales conectadas</h3>
+      </div>
+      {credentials.length === 0 ? (
+        <p className="muted">Sin metadatos de credenciales registrados.</p>
+      ) : (
+        <div className="registry-table-wrap">
+          <table className="registry-table">
+            <thead>
+              <tr><th>Tipo</th><th>Estado</th><th>Actualizado</th></tr>
+            </thead>
+            <tbody>
+              {credentials.map((credential) => (
+                <tr key={credential.kind}>
+                  <td>{credential.kind}</td>
+                  <td>{credentialStatusLabel(credential.metadata)}</td>
+                  <td>{credential.updated_at?.slice(0, 10) ?? "—"}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+      <p className="muted">El portal muestra solo estado y metadatos; los secretos permanecen fuera de esta vista.</p>
+    </article>
+  );
+}
+
+function credentialStatusLabel(metadata: Record<string, unknown>): string {
+  const status = metadata.status;
+  return typeof status === "string" && status.trim() ? status : "Metadatos disponibles";
 }
 
 function VersionCard({
@@ -174,7 +279,7 @@ function SettingsCard({
     }
     setSaving(true);
     try {
-      await updateInstallationSettings(installationId, {
+      await updateSettings(installationId, {
         ...installation?.settings,
         pricing_model: pricingModel,
         pdf_template: template.value
@@ -230,8 +335,8 @@ function SettingsCard({
         value={pdfTemplateRaw}
       />
       <p className="muted">
-        Campos soportados: title, footer_note, accent_color, show_breakdown. Vacío = plantilla
-        por defecto.
+        Campos soportados: title, footer_note, accent_color, logo_base64 y show_breakdown. Vacío
+        = plantilla por defecto.
       </p>
 
       {saveError ? (
@@ -267,14 +372,16 @@ function UsageCard({ usage }: { usage: ControlPlaneUsagePoint[] }) {
             <thead>
               <tr>
                 <th>Día</th>
+                <th>Canal</th>
                 <th>Cotizaciones</th>
                 <th>Rutas</th>
               </tr>
             </thead>
             <tbody>
               {usage.map((point) => (
-                <tr key={point.day}>
+                <tr key={`${point.day}-${point.channel}`}>
                   <td>{point.day}</td>
+                  <td>{formatChannel(point.channel)}</td>
                   <td>{point.quotes}</td>
                   <td>{point.routes}</td>
                 </tr>
@@ -289,6 +396,12 @@ function UsageCard({ usage }: { usage: ControlPlaneUsagePoint[] }) {
 
 function formatVersion(version: string): string {
   return version.startsWith("v") ? version : `v${version}`;
+}
+
+function formatChannel(channel: string | undefined): string {
+  if (channel === "email") return "Correo";
+  if (channel === "whatsapp") return "WhatsApp";
+  return channel || "Todos";
 }
 
 export default ClientProfilePage;

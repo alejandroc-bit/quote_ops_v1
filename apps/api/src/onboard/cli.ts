@@ -24,7 +24,8 @@ import {
   buildProfileStub,
   buildTmsAdapterYaml,
   createCopilot,
-  mergeProfileStubs,
+  applyAuthorizationToAgentConfig,
+  mergeConfiguredProfileStubs,
   writeSecret,
   type Copilot,
   type ProfileCommercialLayer
@@ -35,7 +36,9 @@ import {
   parseDomainList,
   parseRbTable,
   renderQuoteTable,
+  runSampleValidationLoop,
   validateAuthorization,
+  validateMinimumMargin,
   validateMarginParams,
   type OnboardManifest
 } from "./wizardSteps.js";
@@ -44,15 +47,18 @@ type OnboardPaths = {
   secretsFile: string;
   manifestPath: string;
   tmsAdapterConfigPath: string;
+  agentConfigPath: string;
   apiBaseUrl: string;
 };
 
 function resolvePaths(env: NodeJS.ProcessEnv): OnboardPaths {
   return {
-    secretsFile: env.QUOTEOPS_SECRETS_ENV_FILE ?? "/opt/quoteops/secrets/client.env",
-    manifestPath: env.QUOTEOPS_MANIFEST_PATH ?? "/opt/quoteops/manifests/client-manifest.yaml",
+    secretsFile: env.QUOTEOPS_SECRETS_ENV_FILE ?? "/opt/quoteops-v1/secrets/client.env",
+    manifestPath: env.QUOTEOPS_MANIFEST_PATH ?? "/opt/quoteops-v1/manifests/client-manifest.yaml",
     tmsAdapterConfigPath:
-      env.QUOTEOPS_TMS_ADAPTER_CONFIG_PATH ?? "/opt/quoteops/connectors/tms-adapter.yaml",
+      env.QUOTEOPS_TMS_ADAPTER_CONFIG_PATH ?? "/opt/quoteops-v1/connectors/tms-adapter.yaml",
+    agentConfigPath:
+      env.QUOTEOPS_AGENT_CONFIG_PATH ?? "/opt/quoteops-v1/connectors/agent/agent-config.yaml",
     apiBaseUrl: env.QUOTEOPS_ONBOARD_API_URL ?? "http://quoteops-api:8080"
   };
 }
@@ -73,9 +79,10 @@ async function main(argv: string[]): Promise<void> {
   const copilot = await stepAiKey(paths);
   await stepSecrets(paths, copilot);
   await stepTms(paths, copilot);
-  await stepSyncUnits(paths, copilot);
+  const configuredProfileIds = await stepSyncUnits(paths, copilot);
+  await stepAuthorization(paths, copilot);
+  await stepValidatePricing(paths, copilot, configuredProfileIds);
   await stepIngest(paths, copilot);
-  await stepTestRfq(paths, copilot);
 
   line(section("Onboarding completo"));
   ok("El appliance quedó configurado. Revisa el tablero para ver el estado de readiness.");
@@ -211,7 +218,7 @@ async function captureSqlQueries(): Promise<Record<string, string>> {
   return queries;
 }
 
-async function stepSyncUnits(paths: OnboardPaths, copilot: Copilot | null): Promise<void> {
+async function stepSyncUnits(paths: OnboardPaths, copilot: Copilot | null): Promise<string[]> {
   line(section("Paso 4 · Sincronizar unidades desde el TMS"));
   await guide(
     copilot,
@@ -227,57 +234,259 @@ async function stepSyncUnits(paths: OnboardPaths, copilot: Copilot | null): Prom
     spin.stop(`Recibidos ${performance.length} tipos de unidad.`);
   } catch (error) {
     spin.stop();
-    fail(`No pude leer rendimientos del TMS: ${(error as Error).message}`);
-    return;
-  }
-  if (performance.length === 0) {
-    warn("El TMS no devolvió tipos de unidad; nada que sincronizar.");
-    return;
+    warn(`No pude leer rendimientos del TMS: ${(error as Error).message}`);
+    performance = [];
   }
 
   const manifest = await readManifest(paths.manifestPath);
   if (!manifest) {
     fail(`No encontré el manifest en ${paths.manifestPath}.`);
-    return;
+    return [];
   }
   const defaultBu = manifest.business_units.find((unit) => unit.default) ?? manifest.business_units[0];
 
-  const stubs = [];
-  for (const perf of performance) {
-    info(`Unidad ${paint(ansi.cyan, perf.unit_type)} · rendimiento ${perf.kpl_yield} km/l`);
-    const commercial = await captureCommercialLayer(perf.unit_type, defaultBu?.business_unit_id ?? "general");
-    stubs.push(buildProfileStub(perf, commercial));
+  if (performance.length === 0) {
+    warn("El TMS no devolvió rendimientos; conservaré los datos físicos existentes y capturaré el modelo comercial manualmente.");
+    const configured = [];
+    for (const profile of manifest.vehicle_profiles) {
+      const commercial = await captureCommercialLayer(
+        profile.vehicle_profile_id,
+        profile.business_unit_id ?? defaultBu?.business_unit_id ?? "general",
+        profile
+      );
+      configured.push(applyCommercialLayer(profile, commercial));
+    }
+    await writeManifest(paths.manifestPath, { ...manifest, vehicle_profiles: configured });
+    ok(`Modelo comercial actualizado para ${configured.length} perfil(es).`);
+    return configured.map((profile) => profile.vehicle_profile_id);
   }
 
-  const merged = mergeProfileStubs(manifest, stubs);
+  const configurations = [];
+  for (const perf of performance) {
+    info(
+      `Unidad ${paint(ansi.cyan, perf.unit_type)} · TMS: ${perf.kpl_yield} km/l · $${perf.real_cost_per_km}/km`
+    );
+    const existing = manifest.vehicle_profiles.find(
+      (profile) => profile.vehicle_profile_id === perf.unit_type
+    );
+    const commercial = await captureCommercialLayer(
+      perf.unit_type,
+      defaultBu?.business_unit_id ?? "general",
+      existing
+    );
+    configurations.push({ stub: buildProfileStub(perf, commercial), commercial });
+  }
+  const merged = mergeConfiguredProfileStubs(manifest, configurations);
   await writeManifest(paths.manifestPath, merged);
-  ok(`Manifest actualizado con ${stubs.length} perfil(es). El runtime lo recarga sin reinicio.`);
+  ok(
+    `Manifest actualizado con ${configurations.length} perfil(es). El runtime lo recarga sin reinicio.`
+  );
+  return configurations.map(({ stub }) => stub.vehicle_profile_id);
 }
 
 async function captureCommercialLayer(
   unitType: string,
-  defaultBu: string
+  defaultBu: string,
+  current?: QuoteManifest["vehicle_profiles"][number]
 ): Promise<ProfileCommercialLayer> {
   const pricingModel = (await select(`Modelo de precio para ${unitType}`, [
     { value: "formula", label: "Fórmula (costo + margen)" },
     { value: "profitability", label: "Rentabilidad (tabla RB)" }
   ])) as "formula" | "profitability";
-  const marginTarget = Number(await ask("Margen objetivo (ej. 0.25)", "0.25"));
-  const marginMin = Number(await ask("Margen mínimo (ej. 0.18)", "0.18"));
+  let marginTarget = current?.margin_target_pct ?? 0.25;
+  let marginMin = current?.minimum_margin_pct ?? 0.18;
+  let rbTable = current?.profitability_rb_table;
+
+  if (pricingModel === "formula") {
+    while (true) {
+      marginTarget = Number(
+        await ask("Margen objetivo (ej. 0.25)", String(current?.margin_target_pct ?? 0.25))
+      );
+      marginMin = Number(
+        await ask("Margen mínimo (ej. 0.18)", String(current?.minimum_margin_pct ?? 0.18))
+      );
+      const errors = validateMarginParams(marginTarget, marginMin);
+      if (errors.length === 0) break;
+      errors.forEach(warn);
+    }
+  } else {
+    while (true) {
+      marginMin = Number(
+        await ask(
+          "Margen mínimo de control (ej. 0.18)",
+          String(current?.minimum_margin_pct ?? 0.18)
+        )
+      );
+      const errors = validateMinimumMargin(marginMin);
+      if (errors.length === 0) break;
+      errors.forEach(warn);
+    }
+    while (true) {
+      const currentRb = rbTable
+        ?.map((bracket) => `${bracket.max_km ?? "*"}:${bracket.rb_pct}`)
+        .join(", ");
+      const raw = await ask(
+        "Tabla RB max_km:rb (ej. 100:0.6, 500:0.6, *:0.5)",
+        currentRb ?? "100:0.6, 500:0.6, 1000:0.57, 2000:0.55, 3000:0.52, *:0.5"
+      );
+      try {
+        rbTable = parseRbTable(raw) ?? undefined;
+        break;
+      } catch (error) {
+        warn((error as Error).message);
+      }
+    }
+  }
   const keywordsRaw = await ask("Palabras clave adicionales (separadas por coma)", "");
   return {
     business_unit_id: defaultBu,
     pricing_model: pricingModel,
     margin_target_pct: Number.isFinite(marginTarget) ? marginTarget : 0.25,
     minimum_margin_pct: Number.isFinite(marginMin) ? marginMin : 0.18,
+    ...(pricingModel === "profitability" && rbTable
+      ? { profitability_rb_table: rbTable }
+      : {}),
     keywords: keywordsRaw
       ? keywordsRaw.split(",").map((keyword) => keyword.trim()).filter(Boolean)
       : []
   };
 }
 
+function applyCommercialLayer(
+  profile: QuoteManifest["vehicle_profiles"][number],
+  commercial: ProfileCommercialLayer
+): QuoteManifest["vehicle_profiles"][number] {
+  return {
+    ...profile,
+    business_unit_id: commercial.business_unit_id,
+    pricing_model: commercial.pricing_model,
+    margin_target_pct: commercial.margin_target_pct,
+    minimum_margin_pct: commercial.minimum_margin_pct,
+    keywords: [...new Set([...(profile.keywords ?? []), ...(commercial.keywords ?? [])])],
+    ...(commercial.profitability_rb_table
+      ? { profitability_rb_table: commercial.profitability_rb_table }
+      : { profitability_rb_table: undefined })
+  };
+}
+
+async function stepAuthorization(paths: OnboardPaths, copilot: Copilot | null): Promise<void> {
+  line(section("Paso 5 · Autorización del cliente"));
+  await guide(
+    copilot,
+    "Definimos quién aprueba y qué dominios pueden solicitar cotizaciones.",
+    "Explica que el correo aprobador, los dominios permitidos y el WhatsApp del aprobador forman el límite de autorización del cliente."
+  );
+  const manifest = await readManifest(paths.manifestPath);
+  if (!manifest) {
+    fail(`No encontré el manifest en ${paths.manifestPath}.`);
+    return;
+  }
+
+  while (true) {
+    const authorization = {
+      approver_email: await ask("Correo del aprobador", manifest.authorization?.approver_email ?? ""),
+      allowed_domains: parseDomainList(
+        await ask(
+          "Dominios permitidos (separados por coma)",
+          manifest.authorization?.allowed_domains.join(", ") ?? ""
+        )
+      ),
+      whatsapp_approver_phone: await ask(
+        "WhatsApp del aprobador (+52…)",
+        manifest.authorization?.whatsapp_approver_phone ?? ""
+      )
+    };
+    const errors = validateAuthorization(authorization);
+    if (errors.length > 0) {
+      errors.forEach(warn);
+      continue;
+    }
+    const updated = applyAuthorization(manifest, authorization);
+    const agentConfig = await readFile(paths.agentConfigPath, "utf8");
+    await writeManifest(paths.manifestPath, updated);
+    await writeFile(
+      paths.agentConfigPath,
+      applyAuthorizationToAgentConfig(agentConfig, updated.authorization!),
+      "utf8"
+    );
+    ok("Autorización persistida en manifest y agent-config.");
+    return;
+  }
+}
+
+async function stepValidatePricing(
+  paths: OnboardPaths,
+  copilot: Copilot | null,
+  configuredProfileIds: readonly string[]
+): Promise<void> {
+  line(section("Paso 6 · Validación de tarifas"));
+  await guide(
+    copilot,
+    "Calculo tres cotizaciones de muestra con quote-core para validar los parámetros.",
+    "Explica que quote-core, no la IA, calcula tres cotizaciones de muestra y que los parámetros se pueden ajustar antes de aceptar."
+  );
+  const manifest = await readManifest(paths.manifestPath);
+  if (!manifest) {
+    fail(`No encontré el manifest en ${paths.manifestPath}.`);
+    return;
+  }
+  const accepted = await runSampleValidationLoop(manifest, {
+    profileIds: configuredProfileIds,
+    show(rows) {
+      line(`\n${renderQuoteTable(rows)}\n`);
+    },
+    confirm: () => confirm("¿Confirmas estas tres tarifas de muestra?"),
+    adjust: async (current, rows) => {
+      const profilesNeedingReview = rows
+        .filter((row) => row.status !== "APPROVED")
+        .map((row) => row.unit);
+      const candidates = [
+        ...new Set(profilesNeedingReview.length > 0 ? profilesNeedingReview : rows.map((row) => row.unit))
+      ];
+      if (profilesNeedingReview.length > 0) {
+        warn(
+          `No puedes confirmar mientras haya muestras en revisión: ${[
+            ...new Set(
+              rows
+                .filter((row) => row.status !== "APPROVED")
+                .flatMap((row) => row.review_reasons)
+            )
+          ].join(", ")}`
+        );
+      }
+      const profileId =
+        candidates.length === 1
+          ? candidates[0]!
+          : await select(
+              "¿Qué perfil quieres ajustar?",
+              candidates.map((candidate) => ({ value: candidate, label: candidate }))
+            );
+      const profile = current.vehicle_profiles.find(
+        (candidate) => candidate.vehicle_profile_id === profileId
+      );
+      if (!profile) throw new Error("el manifest no tiene vehicle_profiles");
+      warn(`Ajustemos los parámetros del perfil ${profile.vehicle_profile_id}.`);
+      const commercial = await captureCommercialLayer(
+        profile.vehicle_profile_id,
+        profile.business_unit_id ?? "general",
+        profile
+      );
+      return {
+        ...current,
+        vehicle_profiles: current.vehicle_profiles.map((entry) =>
+          entry.vehicle_profile_id === profile.vehicle_profile_id
+            ? applyCommercialLayer(entry, commercial)
+            : entry
+        )
+      };
+    }
+  });
+  await writeManifest(paths.manifestPath, accepted);
+  ok("Tarifas de muestra confirmadas.");
+}
+
 async function stepIngest(paths: OnboardPaths, copilot: Copilot | null): Promise<void> {
-  line(section("Paso 5 · Cerebro vectorial (criterio comercial)"));
+  line(section("Paso 7 · Cerebro vectorial (criterio comercial)"));
   await guide(
     copilot,
     "Cargo los documentos de criterio comercial al almacén vectorial local.",
@@ -298,33 +507,6 @@ async function stepIngest(paths: OnboardPaths, copilot: Copilot | null): Promise
   ok(`Ingeridos ${body.document_count ?? 0} documento(s) al cerebro vectorial.`);
 }
 
-async function stepTestRfq(paths: OnboardPaths, copilot: Copilot | null): Promise<void> {
-  line(section("Paso 6 · RFQ de prueba"));
-  await guide(copilot, "Envío un RFQ de prueba para confirmar que el flujo completo responde.", "Explica que enviamos un RFQ de prueba de extremo a extremo para verificar la instalación.");
-  if (!(await confirm("¿Enviar un RFQ de prueba?"))) return;
-
-  const origin = await ask("Ciudad origen", "Monterrey");
-  const originState = await ask("Estado origen", "Nuevo Leon");
-  const destination = await ask("Ciudad destino", "Saltillo");
-  const destinationState = await ask("Estado destino", "Coahuila");
-
-  const spin = createSpinner("Procesando RFQ…");
-  const response = await postJson(`${paths.apiBaseUrl}/api/playground/rfqs`, {
-    origin_city: origin,
-    origin_state: originState,
-    destination_city: destination,
-    destination_state: destinationState,
-    weight_kg: 12000
-  });
-  spin.stop();
-  if (!response.ok) {
-    fail(`El RFQ de prueba falló (${response.status}): ${JSON.stringify(response.body)}`);
-    return;
-  }
-  const body = response.body as { run_id?: string; status?: string };
-  ok(`RFQ de prueba aceptado (run ${body.run_id}). Revisa el tablero para el resultado.`);
-}
-
 async function guide(copilot: Copilot | null, fallback: string, context: string): Promise<void> {
   if (!copilot) {
     info(fallback);
@@ -334,9 +516,9 @@ async function guide(copilot: Copilot | null, fallback: string, context: string)
   info(paint(ansi.magenta, `⟩ ${text}`));
 }
 
-async function readManifest(path: string): Promise<QuoteManifest | null> {
+async function readManifest(path: string): Promise<OnboardManifest | null> {
   try {
-    return parseYaml(await readFile(path, "utf8")) as QuoteManifest;
+    return parseYaml(await readFile(path, "utf8")) as OnboardManifest;
   } catch {
     return null;
   }

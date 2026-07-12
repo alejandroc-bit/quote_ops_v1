@@ -1,23 +1,17 @@
-import { createServer, type Server } from "node:http";
+import { type IncomingMessage, ServerResponse } from "node:http";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Duplex, Readable } from "node:stream";
 import { afterEach, describe, expect, it } from "vitest";
 import { createApplianceWorkflowTools, createQuoteOpsApi } from "@quoteops/api";
 import { createInstallationLicense, generateLicenseKeyPair } from "@quoteops/shared";
 import { nmxCriteriaNodes, nmxManifest, nmxRfq } from "../fixtures/nmx/clientPack";
 
-let server: Server | null = null;
 const tempDirs: string[] = [];
 const envRestores: Array<() => void> = [];
 
 afterEach(async () => {
-  if (server) {
-    await new Promise<void>((resolve, reject) => {
-      server?.close((error) => (error ? reject(error) : resolve()));
-    });
-    server = null;
-  }
   while (envRestores.length > 0) {
     envRestores.pop()?.();
   }
@@ -39,7 +33,7 @@ describe("NMX appliance runtime", () => {
     await writeFile(historicalQuotesPath, nmxHistoricalQuotesCsv.trim(), "utf8");
     await writeFile(agentConfigPath, nmxAgentConfigYaml, "utf8");
 
-    const baseUrl = await startApi({
+    const api = startApi({
       ...licenseEnv("NMX", "nmx-local-001"),
       QUOTEOPS_INSTALLATION_ID: "nmx-local-001",
       QUOTEOPS_AGENT_CONFIG_PATH: agentConfigPath,
@@ -53,26 +47,22 @@ describe("NMX appliance runtime", () => {
       QUOTEOPS_HISTORICAL_FROM: "2026-01-01",
       QUOTEOPS_HISTORICAL_TO: "2026-12-31"
     }, testFetch);
-    const response = await fetch(`${baseUrl}/api/rfqs`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        run_id: "RUN-NMX-APPLIANCE-001",
-        client_id: "NMX",
-        manifest_version: "nmx-supabase-snapshot-2026.06.15.5",
-        criteria_version: "nmx-criteria-2026.06.19.1",
-        connector_versions: {
-          tms: "file-import@2.0.0",
-          route_provider: "sakbe@2.0.0"
-        },
-        raw_rfq: nmxRfq,
-        manifest: nmxManifest,
-        criteria_nodes: nmxCriteriaNodes
-      })
+    const response = await api.post("/api/rfqs", {
+      run_id: "RUN-NMX-APPLIANCE-001",
+      client_id: "NMX",
+      manifest_version: "nmx-supabase-snapshot-2026.06.15.5",
+      criteria_version: "nmx-criteria-2026.06.19.1",
+      connector_versions: {
+        tms: "file-import@2.0.0",
+        route_provider: "sakbe@2.0.0"
+      },
+      raw_rfq: nmxRfq,
+      manifest: nmxManifest,
+      criteria_nodes: nmxCriteriaNodes
     });
-    const submitted = await response.json();
-    const stateResponse = await fetch(`${baseUrl}/api/workflow-state/RUN-NMX-APPLIANCE-001`);
-    const state = await stateResponse.json();
+    const submitted = response.body;
+    const stateResponse = await api.get("/api/workflow-state/RUN-NMX-APPLIANCE-001");
+    const state = stateResponse.body;
     const writebackLines = (await readFile(quoteWritebacksPath, "utf8")).trim().split("\n");
     const writeback = JSON.parse(writebackLines[0] ?? "{}") as Record<string, unknown>;
 
@@ -107,7 +97,7 @@ describe("NMX appliance runtime", () => {
   });
 });
 
-async function startApi(env: NodeJS.ProcessEnv, fetchFn: typeof fetch = fetch): Promise<string> {
+function startApi(env: NodeJS.ProcessEnv, fetchFn: typeof fetch = fetch) {
   applyProcessEnv(env);
   const app = createQuoteOpsApi({
     defaultTools: createApplianceWorkflowTools({
@@ -116,16 +106,82 @@ async function startApi(env: NodeJS.ProcessEnv, fetchFn: typeof fetch = fetch): 
       now: () => new Date("2026-06-19T18:00:00.000Z")
     })
   });
-  server = createServer(app);
 
-  await new Promise<void>((resolve) => {
-    server?.listen(0, "127.0.0.1", resolve);
+  return {
+    get(path: string) {
+      return directRequest(app, "GET", path);
+    },
+    post(path: string, body: Record<string, unknown>) {
+      return directRequest(app, "POST", path, body);
+    }
+  };
+}
+
+async function directRequest(
+  app: ReturnType<typeof createQuoteOpsApi>,
+  method: "GET" | "POST",
+  path: string,
+  body?: Record<string, unknown>
+): Promise<{ status: number; body: Record<string, any>; text: string }> {
+  const payload = body === undefined ? "" : JSON.stringify(body);
+  const socket = new Duplex({
+    read() {},
+    write(_chunk, _encoding, callback) {
+      callback();
+    }
   });
-  const address = server.address();
-  if (!address || typeof address === "string") {
-    throw new Error("Expected API test server to listen on a local port");
-  }
-  return `http://127.0.0.1:${address.port}`;
+  const req = Readable.from(payload ? [Buffer.from(payload)] : []) as unknown as IncomingMessage;
+  Object.assign(req, {
+    method,
+    url: path,
+    socket,
+    connection: socket,
+    httpVersion: "1.1",
+    httpVersionMajor: 1,
+    httpVersionMinor: 1,
+    complete: true,
+    headers: {
+      host: "quoteops-appliance.test",
+      ...(payload
+        ? {
+            "content-type": "application/json",
+            "content-length": String(Buffer.byteLength(payload))
+          }
+        : {})
+    }
+  });
+
+  const res = new ServerResponse(req);
+  res.assignSocket(socket as never);
+  const chunks: Buffer[] = [];
+  const originalWrite = res.write.bind(res);
+  const originalEnd = res.end.bind(res);
+  res.write = ((chunk: unknown, ...args: unknown[]) => {
+    if (chunk !== undefined && chunk !== null) chunks.push(Buffer.from(chunk as never));
+    return originalWrite(chunk as never, ...(args as never[]));
+  }) as typeof res.write;
+  res.end = ((chunk?: unknown, ...args: unknown[]) => {
+    if (chunk !== undefined && chunk !== null) chunks.push(Buffer.from(chunk as never));
+    return originalEnd(chunk as never, ...(args as never[]));
+  }) as typeof res.end;
+
+  const finished = new Promise<void>((resolve, reject) => {
+    res.once("finish", resolve);
+    res.once("error", reject);
+  });
+  app(req, res);
+  await finished;
+
+  const text = Buffer.concat(chunks).toString("utf8");
+  const contentType = String(res.getHeader("content-type") ?? "");
+  return {
+    status: res.statusCode,
+    body:
+      text && contentType.includes("application/json")
+        ? (JSON.parse(text) as Record<string, any>)
+        : {},
+    text
+  };
 }
 
 function licenseEnv(clientId: string, installationId: string): NodeJS.ProcessEnv {

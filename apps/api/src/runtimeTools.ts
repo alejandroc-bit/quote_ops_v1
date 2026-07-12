@@ -33,8 +33,8 @@ export type ApplianceWorkflowToolsOptions = {
   cache?: KeyValueCache | null;
 };
 
-const DEFAULT_AGENT_CONFIG_PATH = "/opt/quoteops/connectors/agent/agent-config.yaml";
-const DEFAULT_ROUTE_CACHE_PATH = "/opt/quoteops/connectors/sakbe/route-cache.json";
+const DEFAULT_AGENT_CONFIG_PATH = "/opt/quoteops-v1/connectors/agent/agent-config.yaml";
+const DEFAULT_ROUTE_CACHE_PATH = "/opt/quoteops-v1/connectors/sakbe/route-cache.json";
 
 export function createApplianceWorkflowTools(
   options: ApplianceWorkflowToolsOptions = {}

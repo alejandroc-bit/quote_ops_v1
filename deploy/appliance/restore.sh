@@ -3,7 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 COMPOSE_FILE="${COMPOSE_FILE:-$SCRIPT_DIR/docker-compose.yml}"
-QUOTEOPS_HOME="${QUOTEOPS_HOME:-/opt/quoteops}"
+QUOTEOPS_HOME="${QUOTEOPS_HOME:-/opt/quoteops-v1}"
 ENV_FILE="${QUOTEOPS_ENV_FILE:-$QUOTEOPS_HOME/.env}"
 BACKUP_FILE=""
 SKIP_PRE_RESTORE_BACKUP=0
@@ -14,7 +14,7 @@ usage() {
 Usage: $(basename "$0") --backup backup-file [options]
 
 Options:
-  --home PATH                  Appliance data root (default: /opt/quoteops)
+  --home PATH                  Appliance data root (default: /opt/quoteops-v1)
   --env-file PATH              Compose env file (default: <home>/.env)
   --compose-file PATH          Compose file (default: deploy/appliance/docker-compose.yml)
   --skip-pre-restore-backup    Do not back up the current appliance before restore

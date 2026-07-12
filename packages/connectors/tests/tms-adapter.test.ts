@@ -1,4 +1,3 @@
-import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -104,40 +103,33 @@ status_writebacks_path_env: TMS_STATUS_WRITEBACKS_PATH
   });
 
   it("creates an http adapter from YAML env config with interpolated authorization", async () => {
-    let receivedAuthorization: string | undefined;
-    let receivedUrl: string | undefined;
-    const server = await startServer((req, res) => {
-      receivedAuthorization = req.headers.authorization;
-      receivedUrl = req.url;
-      res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify({ ok: true }));
-    });
-
-    try {
-      const configPath = await createTempFile(
-        "tms-adapter.yaml",
-        `
+    const scripted = createScriptedFetch(jsonResponse({ ok: true }));
+    const configPath = await createTempFile(
+      "tms-adapter.yaml",
+      `
 provider: http
 base_url_env: TMS_BASE_URL
 headers:
   authorization: "Bearer \${TMS_API_KEY}"
 health_endpoint_path: /ready
 `
-      );
-      const adapter = await createTmsAdapterFromConfig(configPath, {
-        env: {
-          TMS_BASE_URL: server.baseUrl,
-          TMS_API_KEY: "test-token"
-        }
-      });
+    );
+    const adapter = await createTmsAdapterFromConfig(configPath, {
+      env: {
+        TMS_BASE_URL: "https://tms.example.test",
+        TMS_API_KEY: "test-token"
+      },
+      fetch: scripted.fetch
+    });
 
-      await expect(adapter.healthCheck()).resolves.toMatchObject({ ok: true, status: "ok" });
-      expect(adapter).toBeInstanceOf(HttpTmsAdapter);
-      expect(receivedUrl).toBe("/ready");
-      expect(receivedAuthorization).toBe("Bearer test-token");
-    } finally {
-      await server.close();
-    }
+    await expect(adapter.healthCheck()).resolves.toMatchObject({ ok: true, status: "ok" });
+    expect(adapter).toBeInstanceOf(HttpTmsAdapter);
+    expect(scripted.calls).toHaveLength(1);
+    expect(scripted.calls[0]?.url).toBe("https://tms.example.test/ready");
+    expect(scripted.calls[0]?.init?.method).toBe("GET");
+    expect(new Headers(scripted.calls[0]?.init?.headers).get("authorization")).toBe(
+      "Bearer test-token"
+    );
   });
 });
 
@@ -211,24 +203,18 @@ describe("FileImportTmsAdapter", () => {
 
 describe("HttpTmsAdapter", () => {
   it("reports write quote as unavailable when the TMS has no writeback endpoint", async () => {
-    const server = await startServer((_req, res) => {
-      res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify({ ok: true }));
+    const scripted = createScriptedFetch(jsonResponse({ ok: true }));
+    const adapter = new HttpTmsAdapter({
+      baseUrl: "https://tms.example.test",
+      endpoints: { health: "/health" },
+      fetch: scripted.fetch
     });
 
-    try {
-      const adapter = new HttpTmsAdapter({
-        baseUrl: server.baseUrl,
-        endpoints: { health: "/health" }
-      });
-
-      await expect(adapter.healthCheck()).resolves.toMatchObject({
-        ok: true,
-        capabilities: { write_quote: false }
-      });
-    } finally {
-      await server.close();
-    }
+    await expect(adapter.healthCheck()).resolves.toMatchObject({
+      ok: true,
+      capabilities: { write_quote: false }
+    });
+    expect(scripted.calls[0]?.url).toBe("https://tms.example.test/health");
   });
 
   it("validates write payloads before sending them to the TMS", async () => {
@@ -255,75 +241,72 @@ describe("HttpTmsAdapter", () => {
   });
 
   it("returns a failed health result when the TMS is unhealthy", async () => {
-    const server = await startServer((_req, res) => {
-      res.writeHead(503, { "content-type": "application/json" });
-      res.end(JSON.stringify({ ok: false, error: "maintenance" }));
+    const scripted = createScriptedFetch(
+      jsonResponse({ ok: false, error: "maintenance" }, 503)
+    );
+    const adapter = new HttpTmsAdapter({
+      baseUrl: "https://tms.example.test",
+      endpoints: { health: "/health" },
+      fetch: scripted.fetch
     });
 
-    try {
-      const adapter = new HttpTmsAdapter({
-        baseUrl: server.baseUrl,
-        endpoints: { health: "/health" }
-      });
-
-      await expect(adapter.healthCheck()).resolves.toMatchObject({
-        ok: false,
-        status: "failed",
-        capabilities: { write_quote: false },
-        details: { status_code: 503 }
-      });
-    } finally {
-      await server.close();
-    }
+    await expect(adapter.healthCheck()).resolves.toMatchObject({
+      ok: false,
+      status: "failed",
+      capabilities: { write_quote: false },
+      details: { status_code: 503, error: "maintenance" }
+    });
+    expect(scripted.calls[0]?.url).toBe("https://tms.example.test/health");
   });
 
   it("does not break quote-core when TMS health fails", async () => {
-    const server = await startServer((_req, res) => {
-      res.writeHead(503, { "content-type": "application/json" });
-      res.end(JSON.stringify({ ok: false, error: "maintenance" }));
+    const scripted = createScriptedFetch(
+      jsonResponse({ ok: false, error: "maintenance" }, 503)
+    );
+    const adapter = new HttpTmsAdapter({
+      baseUrl: "https://tms.example.test",
+      endpoints: { health: "/health" },
+      fetch: scripted.fetch
     });
+    const health = await adapter.healthCheck();
+    const quote = calculateQuote(quoteCoreInput);
 
-    try {
-      const adapter = new HttpTmsAdapter({
-        baseUrl: server.baseUrl,
-        endpoints: { health: "/health" }
-      });
-      const health = await adapter.healthCheck();
-      const quote = calculateQuote(quoteCoreInput);
-
-      expect(health.ok).toBe(false);
-      expect(quote.status).toBe("APPROVED");
-      expect(quote.base_rate_mxn).toBeGreaterThan(0);
-    } finally {
-      await server.close();
-    }
+    expect(health.ok).toBe(false);
+    expect(health.details).toMatchObject({ status_code: 503, error: "maintenance" });
+    expect(scripted.calls[0]?.url).toBe("https://tms.example.test/health");
+    expect(quote.status).toBe("APPROVED");
+    expect(quote.base_rate_mxn).toBeGreaterThan(0);
   });
 
   it("rejects failed status writeback without importing quote-core", async () => {
-    const server = await startServer((_req, res) => {
-      res.writeHead(500, { "content-type": "application/json" });
-      res.end(JSON.stringify({ error: "writeback failed" }));
+    const scripted = createScriptedFetch(jsonResponse({ error: "writeback failed" }, 500));
+    const adapter = new HttpTmsAdapter({
+      baseUrl: "https://tms.example.test",
+      endpoints: { writeStatus: "/statuses" },
+      fetch: scripted.fetch
     });
 
-    try {
-      const adapter = new HttpTmsAdapter({
-        baseUrl: server.baseUrl,
-        endpoints: { writeStatus: "/statuses" }
-      });
-
-      await expect(
-        adapter.writeQuoteStatus({
-          entity_id: "RFQ-2026-000099-L01",
-          status: "failed",
-          metadata: { reason: "tms_unavailable" }
-        })
-      ).rejects.toMatchObject({
-        name: "TmsAdapterError",
-        status: 500
-      });
-    } finally {
-      await server.close();
-    }
+    await expect(
+      adapter.writeQuoteStatus({
+        entity_id: "RFQ-2026-000099-L01",
+        status: "failed",
+        metadata: { reason: "tms_unavailable" }
+      })
+    ).rejects.toMatchObject({
+      name: "TmsAdapterError",
+      status: 500,
+      details: { error: "writeback failed" }
+    });
+    expect(scripted.calls[0]?.url).toBe("https://tms.example.test/statuses");
+    expect(scripted.calls[0]?.init?.method).toBe("POST");
+    expect(new Headers(scripted.calls[0]?.init?.headers).get("content-type")).toBe(
+      "application/json"
+    );
+    expect(JSON.parse(String(scripted.calls[0]?.init?.body))).toMatchObject({
+      entity_id: "RFQ-2026-000099-L01",
+      status: "failed",
+      metadata: { reason: "tms_unavailable" }
+    });
   });
 });
 
@@ -372,33 +355,33 @@ describe("FileImportTmsAdapter writeback queue", () => {
   });
 });
 
-async function startServer(
-  handler: (req: IncomingMessage, res: ServerResponse) => void
-): Promise<{ baseUrl: string; close: () => Promise<void> }> {
-  const server = createServer(handler);
+interface ScriptedFetchCall {
+  url: string;
+  init: RequestInit | undefined;
+}
 
-  await new Promise<void>((resolve) => {
-    server.listen(0, "127.0.0.1", resolve);
+function createScriptedFetch(...responses: Response[]): {
+  fetch: typeof fetch;
+  calls: ScriptedFetchCall[];
+} {
+  const calls: ScriptedFetchCall[] = [];
+  const fetchFn = (async (input: URL | RequestInfo, init?: RequestInit) => {
+    calls.push({ url: String(input), init });
+    const response = responses.shift();
+    if (!response) {
+      throw new Error(`Unexpected TMS fetch call: ${String(input)}`);
+    }
+    return response;
+  }) as typeof fetch;
+
+  return { fetch: fetchFn, calls };
+}
+
+function jsonResponse(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "content-type": "application/json" }
   });
-
-  const address = server.address();
-  if (!address || typeof address === "string") {
-    throw new Error("Expected test HTTP server to listen on a local port");
-  }
-
-  return {
-    baseUrl: `http://127.0.0.1:${address.port}`,
-    close: () =>
-      new Promise<void>((resolve, reject) => {
-        server.close((error) => {
-          if (error) {
-            reject(error);
-          } else {
-            resolve();
-          }
-        });
-      })
-  };
 }
 
 const quoteCoreInput: QuoteCoreInput = {

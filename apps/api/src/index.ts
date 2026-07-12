@@ -1,4 +1,4 @@
-import { access, mkdir, readFile, readdir, writeFile } from "node:fs/promises";
+import { access, mkdir, readFile, readdir, rename, unlink, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import express, { type Express, type Request, type Response } from "express";
 import cors from "cors";
@@ -504,14 +504,18 @@ async function runControlPlaneMinimalSync({
   const clientId = manifest?.client_id ?? optionalEnv(env.QUOTEOPS_CLIENT_ID) ?? null;
   const installationId = optionalEnv(env.QUOTEOPS_INSTALLATION_ID) ?? null;
   const controlPlaneUrl = optionalEnv(env.QUOTEOPS_CONTROL_PLANE_URL) ?? null;
+  const registrationToken = optionalEnv(env.QUOTEOPS_REGISTRATION_TOKEN) ?? null;
+  const version = optionalEnv(env.QUOTEOPS_VERSION) ?? null;
 
-  if (!clientId || !installationId || !controlPlaneUrl) {
+  if (!clientId || !installationId || !controlPlaneUrl || !registrationToken || !version) {
     return {
       synced: false as const,
       missing: {
         client_id: !clientId,
         installation_id: !installationId,
-        control_plane_url: !controlPlaneUrl
+        control_plane_url: !controlPlaneUrl,
+        registration_token: !registrationToken,
+        version: !version
       }
     };
   }
@@ -521,25 +525,36 @@ async function runControlPlaneMinimalSync({
   const heartbeat = {
     client_id: clientId,
     ai_key_status: hasAiProviderKey(env) ? "configured" : "missing",
-    onboarding_status: minimalOnboardingStatus(setup)
+    onboarding_status: minimalOnboardingStatus(setup),
+    version
   };
   const counters = {
     client_id: clientId,
     ...quoteCounters(workflowRuns)
   };
 
-  await postControlPlaneJson(
+  const heartbeatResponse = await postControlPlaneJson(
     controlPlaneUrl,
     `/api/installations/${encodeURIComponent(installationId)}/heartbeat`,
-    heartbeat
+    heartbeat,
+    registrationToken
   );
   await postControlPlaneJson(
     controlPlaneUrl,
     `/api/installations/${encodeURIComponent(installationId)}/counters`,
-    counters
+    counters,
+    registrationToken
   );
+  const syncSettings = parseHeartbeatSyncResponse(heartbeatResponse);
+  await persistHeartbeatSettings(syncSettings.settings, env);
 
-  return { synced: true as const, installation_id: installationId, heartbeat, counters };
+  return {
+    synced: true as const,
+    installation_id: installationId,
+    heartbeat,
+    counters,
+    latest_version: syncSettings.latest_version
+  };
 }
 
 const DEFAULT_CONTROL_PLANE_SYNC_INTERVAL_MS = 10 * 60 * 1000;
@@ -557,7 +572,12 @@ export function startControlPlaneSyncScheduler({
   store: QuoteOpsStore;
   resolveManifest?: () => Promise<QuoteManifest | null>;
 }): NodeJS.Timeout | null {
-  if (!optionalEnv(env.QUOTEOPS_CONTROL_PLANE_URL) || !optionalEnv(env.QUOTEOPS_INSTALLATION_ID)) {
+  if (
+    !optionalEnv(env.QUOTEOPS_CONTROL_PLANE_URL) ||
+    !optionalEnv(env.QUOTEOPS_INSTALLATION_ID) ||
+    !optionalEnv(env.QUOTEOPS_REGISTRATION_TOKEN) ||
+    !optionalEnv(env.QUOTEOPS_VERSION)
+  ) {
     return null;
   }
   const rawInterval = env.QUOTEOPS_SYNC_INTERVAL_MS;
@@ -706,14 +726,18 @@ async function activateAgainstControlPlane(input: {
 async function postControlPlaneJson(
   controlPlaneUrl: string,
   path: string,
-  body: Record<string, unknown>
-): Promise<void> {
+  body: Record<string, unknown>,
+  registrationToken: string
+): Promise<unknown> {
   const response = await fetch(`${controlPlaneUrl.replace(/\/+$/, "")}${path}`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: {
+      "content-type": "application/json",
+      authorization: `Bearer ${registrationToken}`
+    },
     body: JSON.stringify(body)
   });
-  if (response.ok) return;
+  if (response.ok) return response.json().catch(() => null);
 
   const responseText = await response.text();
   throw new ControlPlaneRequestError(
@@ -721,6 +745,76 @@ async function postControlPlaneJson(
     "control_plane_sync_failed",
     responseText || response.statusText
   );
+}
+
+type HeartbeatSyncSettings = {
+  pricing_model?: "formula" | "profitability";
+  pdf_template?: string | Record<string, unknown>;
+};
+
+function parseHeartbeatSyncResponse(value: unknown): {
+  latest_version: string | null;
+  settings: HeartbeatSyncSettings;
+} {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("control_plane_heartbeat_response_invalid");
+  }
+  const body = value as Record<string, unknown>;
+  const latestVersion =
+    body.latest_version === null || typeof body.latest_version === "string"
+      ? body.latest_version
+      : null;
+  const rawSettings =
+    body.settings && typeof body.settings === "object" && !Array.isArray(body.settings)
+      ? body.settings as Record<string, unknown>
+      : {};
+  const settings: HeartbeatSyncSettings = {};
+  if (rawSettings.pricing_model === "formula" || rawSettings.pricing_model === "profitability") {
+    settings.pricing_model = rawSettings.pricing_model;
+  }
+  if (
+    typeof rawSettings.pdf_template === "string" && rawSettings.pdf_template.trim() ||
+    rawSettings.pdf_template &&
+      typeof rawSettings.pdf_template === "object" &&
+      !Array.isArray(rawSettings.pdf_template)
+  ) {
+    settings.pdf_template = rawSettings.pdf_template as string | Record<string, unknown>;
+  }
+  return { latest_version: latestVersion, settings };
+}
+
+async function persistHeartbeatSettings(
+  settings: HeartbeatSyncSettings,
+  env: NodeJS.ProcessEnv
+): Promise<void> {
+  const settingsPath = optionalEnv(env.QUOTEOPS_SETTINGS_PATH);
+  if (settingsPath) await writeJsonAtomic(settingsPath, settings);
+
+  const pdfTemplatePath = optionalEnv(env.QUOTEOPS_PDF_TEMPLATE_PATH);
+  if (!pdfTemplatePath) return;
+  if (
+    settings.pdf_template &&
+    typeof settings.pdf_template === "object" &&
+    !Array.isArray(settings.pdf_template)
+  ) {
+    await writeJsonAtomic(pdfTemplatePath, settings.pdf_template);
+    return;
+  }
+  await unlink(pdfTemplatePath).catch((error: NodeJS.ErrnoException) => {
+    if (error.code !== "ENOENT") throw error;
+  });
+}
+
+async function writeJsonAtomic(path: string, value: unknown): Promise<void> {
+  await mkdir(dirname(path), { recursive: true });
+  const tempPath = `${path}.tmp.${process.pid}.${Date.now()}`;
+  try {
+    await writeFile(tempPath, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
+    await rename(tempPath, path);
+  } catch (error) {
+    await unlink(tempPath).catch(() => undefined);
+    throw error;
+  }
 }
 
 function quoteCounters(workflowRuns: WorkflowRunSummary[]): {

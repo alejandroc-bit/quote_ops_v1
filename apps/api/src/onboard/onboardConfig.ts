@@ -1,11 +1,12 @@
 import { chmod, readFile, writeFile } from "node:fs/promises";
-import { stringify as stringifyYaml } from "yaml";
+import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 import type {
   ProfitabilityRbBracket,
   QuoteManifest,
   QuoteVehicleProfile
 } from "@quoteops/quote-core";
 import type { TmsCanonicalPerformance } from "@quoteops/contracts";
+import type { ManifestAuthorization } from "./wizardSteps.js";
 
 // Pure config builders for the onboarding CLI. Kept side-effect free (except the
 // thin file wrappers) so the risky logic — secret escaping, TMS yaml, profile
@@ -35,6 +36,30 @@ export async function writeSecret(file: string, key: string, value: string): Pro
   const current = await readFile(file, "utf8").catch(() => "");
   await writeFile(file, upsertEnvLine(current, key, value), "utf8");
   await chmod(file, 0o600);
+}
+
+/** Preserve the tool policy while persisting the onboarding approver identity. */
+export function applyAuthorizationToAgentConfig(
+  contents: string,
+  authorization: ManifestAuthorization
+): string {
+  const parsed = parseYaml(contents) as Record<string, unknown> | null;
+  if (!parsed || typeof parsed !== "object") {
+    throw new Error("agent-config debe ser un objeto YAML");
+  }
+  const current =
+    parsed.authorization && typeof parsed.authorization === "object"
+      ? (parsed.authorization as Record<string, unknown>)
+      : {};
+  return stringifyYaml({
+    ...parsed,
+    authorization: {
+      ...current,
+      approver_email: authorization.approver_email,
+      allowed_domains: authorization.allowed_domains,
+      whatsapp_approver_phone: authorization.whatsapp_approver_phone
+    }
+  });
 }
 
 export type TmsAdapterYamlInput =
@@ -141,11 +166,51 @@ export function mergeProfileStubs(
     byId.set(
       stub.vehicle_profile_id,
       existing
-        ? { ...existing, performance_source: "tms", tms_real_cost_per_km: stub.tms_real_cost_per_km }
+        ? {
+            ...existing,
+            fuel_loaded_km_per_l: stub.fuel_loaded_km_per_l,
+            fuel_empty_km_per_l: stub.fuel_empty_km_per_l,
+            operator_cost_per_km_mxn: stub.operator_cost_per_km_mxn,
+            performance_source: "tms",
+            tms_real_cost_per_km: stub.tms_real_cost_per_km
+          }
         : stub
     );
   }
   return { ...manifest, vehicle_profiles: [...byId.values()] };
+}
+
+/** Apply a pricing choice captured in the same run after refreshing TMS fields. */
+export function mergeConfiguredProfileStubs(
+  manifest: QuoteManifest,
+  configurations: Array<{ stub: QuoteVehicleProfile; commercial: ProfileCommercialLayer }>
+): QuoteManifest {
+  const merged = mergeProfileStubs(
+    manifest,
+    configurations.map(({ stub }) => stub)
+  );
+  const commercialById = new Map(
+    configurations.map(({ stub, commercial }) => [stub.vehicle_profile_id, commercial])
+  );
+  return {
+    ...merged,
+    vehicle_profiles: merged.vehicle_profiles.map((profile) => {
+      const commercial = commercialById.get(profile.vehicle_profile_id);
+      if (!commercial) return profile;
+      return {
+        ...profile,
+        business_unit_id: commercial.business_unit_id,
+        pricing_model: commercial.pricing_model,
+        margin_target_pct: commercial.margin_target_pct,
+        minimum_margin_pct: commercial.minimum_margin_pct,
+        keywords: [...new Set([...(profile.keywords ?? []), ...(commercial.keywords ?? [])])],
+        profitability_rb_table:
+          commercial.pricing_model === "profitability"
+            ? commercial.profitability_rb_table
+            : undefined
+      };
+    })
+  };
 }
 
 export type Copilot = {

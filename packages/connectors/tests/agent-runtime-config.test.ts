@@ -87,6 +87,39 @@ describe("AgentRuntimeConfig", () => {
     ).not.toThrow();
   });
 
+  it("loads onboarding approver identity alongside tool authorization", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "quoteops-agent-config-"));
+    tempDirs.push(dir);
+    const configPath = join(dir, "agent-config.yaml");
+    await writeFile(
+      configPath,
+      [
+        "model:",
+        "  provider: deterministic",
+        "  model_name: quote-core-preserver",
+        "authorization:",
+        "  approver_email: boss@example.com",
+        "  allowed_domains:",
+        "    - example.com",
+        "  whatsapp_approver_phone: '+528112345678'",
+        "  tools:",
+        "    route.resolve:",
+        "      effect: read",
+        "      mode: allowed",
+        ""
+      ].join("\n"),
+      "utf8"
+    );
+
+    const config = await loadAgentRuntimeConfig(configPath);
+
+    expect(config.authorization).toMatchObject({
+      approver_email: "boss@example.com",
+      allowed_domains: ["example.com"],
+      whatsapp_approver_phone: "+528112345678"
+    });
+  });
+
   it("rejects typoed model providers in explicit config files", async () => {
     const dir = await mkdtemp(join(tmpdir(), "quoteops-agent-config-"));
     tempDirs.push(dir);

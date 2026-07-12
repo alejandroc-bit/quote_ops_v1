@@ -1,7 +1,8 @@
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
-import { createServer, type Server } from "node:http";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { type IncomingMessage, ServerResponse } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Duplex, Readable } from "node:stream";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   createApplianceWorkflowTools,
@@ -11,19 +12,29 @@ import {
   type QuoteOpsApiDependencies
 } from "../src/index";
 import { createControlPlaneApi } from "../../control-plane-api/src/index";
+import { createInMemoryTenantDataStore } from "../../control-plane-api/src/tenantData";
+import { quoteLane } from "../../agent/src/graph/nodes/quote";
+import { loadPdfTemplate } from "../../agent/src/pdf/quotePdf";
 import type { QuoteWorkflowInput } from "@quoteops/agent";
 import { createInstallationLicense, generateLicenseKeyPair } from "@quoteops/shared";
 
 const TEST_ADMIN_TOKEN = "test-admin-token";
-let server: Server | null = null;
-let cloudServer: Server | null = null;
+type TestExpressApp =
+  | ReturnType<typeof createQuoteOpsApi>
+  | ReturnType<typeof createControlPlaneApi>;
+const nativeFetch = globalThis.fetch;
+const testApps = new Map<string, TestExpressApp>();
+const applianceOrigins = new Set<string>();
+const cloudOrigins = new Set<string>();
+let nextTestAppId = 0;
+let fetchRouterInstalled = false;
 const tempDirs: string[] = [];
 const testEnvRestores: Array<() => void> = [];
 const originalInstallationId = process.env.QUOTEOPS_INSTALLATION_ID;
 
 afterEach(async () => {
-  await closeTestServer();
-  await closeCloudTestServer();
+  clearTestApps();
+  restoreNativeFetch();
   while (testEnvRestores.length > 0) {
     testEnvRestores.pop()?.();
   }
@@ -584,7 +595,10 @@ describe("QuoteOps API", () => {
   });
 
   it("syncs only minimal heartbeat and aggregate counters to the control plane", async () => {
-    const cloudBaseUrl = await startCloudTestServer("unused-token");
+    const tenantData = createInMemoryTenantDataStore({
+      releases: [{ version: "v1.1.0", notes: "Stable" }]
+    });
+    const cloudBaseUrl = await startCloudTestServer("unused-token", tenantData);
     await fetch(`${cloudBaseUrl}/api/admin/clients`, {
       method: "POST",
       headers: { "content-type": "application/json", authorization: `Bearer ${TEST_ADMIN_TOKEN}` },
@@ -594,10 +608,37 @@ describe("QuoteOps API", () => {
         authorized_email: "ops@cliente.com"
       })
     });
+    await fetch(`${cloudBaseUrl}/api/admin/clients/cliente-demo/install-pack`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${TEST_ADMIN_TOKEN}` },
+      body: "{}"
+    });
+    await fetch(`${cloudBaseUrl}/api/onboarding/activate`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        client_id: "cliente-demo",
+        installation_id: "cliente-demo-prod-001",
+        email: "ops@cliente.com",
+        registration_token: "unused-token"
+      })
+    });
+    tenantData.installations.get("cliente-demo-prod-001")!.settings = {
+      pricing_model: "profitability",
+      pdf_template: { title: "Plantilla sincronizada", show_breakdown: false }
+    };
+    const syncDir = await mkdtemp(join(tmpdir(), "quoteops-settings-sync-"));
+    tempDirs.push(syncDir);
+    const settingsPath = join(syncDir, "runtime-settings.json");
+    const pdfTemplatePath = join(syncDir, "pdf-template.json");
 
     await withEnv(
       await setupReadyEnv({
-        QUOTEOPS_CONTROL_PLANE_URL: cloudBaseUrl
+        QUOTEOPS_CONTROL_PLANE_URL: cloudBaseUrl,
+        QUOTEOPS_REGISTRATION_TOKEN: "unused-token",
+        QUOTEOPS_VERSION: "v1.0.0",
+        QUOTEOPS_SETTINGS_PATH: settingsPath,
+        QUOTEOPS_PDF_TEMPLATE_PATH: pdfTemplatePath
       }),
       async () => {
         const baseUrl = await startApi({
@@ -619,7 +660,8 @@ describe("QuoteOps API", () => {
         expect(syncBody.heartbeat).toEqual({
           client_id: "cliente-demo",
           ai_key_status: "configured",
-          onboarding_status: "ready"
+          onboarding_status: "ready",
+          version: "v1.0.0"
         });
         expect(syncBody.counters).toEqual({
           client_id: "cliente-demo",
@@ -647,6 +689,27 @@ describe("QuoteOps API", () => {
           pending: 0,
           failed: 0
         });
+        expect(JSON.parse(await readFile(settingsPath, "utf8"))).toEqual({
+          pricing_model: "profitability",
+          pdf_template: { title: "Plantilla sincronizada", show_breakdown: false }
+        });
+        expect(await loadPdfTemplate(pdfTemplatePath)).toMatchObject({
+          title: "Plantilla sincronizada",
+          show_breakdown: false
+        });
+
+        const lane = workflowInput.raw_rfq.parsed.lanes[0]!;
+        const graphQuote = await quoteLane(
+          lane,
+          await workflowInput.tools.resolveRoute(lane),
+          {
+            manifest: workflowInput.manifest,
+            tools: workflowInput.tools,
+            env: { QUOTEOPS_SETTINGS_PATH: settingsPath },
+            now: () => new Date("2026-07-12T00:00:00.000Z")
+          } as never
+        );
+        expect(graphQuote.manifest.vehicle_profiles[0]?.pricing_model).toBe("profitability");
       }
     );
   });
@@ -662,12 +725,29 @@ describe("QuoteOps API", () => {
         authorized_email: "ops@cliente.com"
       })
     });
+    await fetch(`${cloudBaseUrl}/api/admin/clients/cliente-demo/install-pack`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${TEST_ADMIN_TOKEN}` },
+      body: "{}"
+    });
+    await fetch(`${cloudBaseUrl}/api/onboarding/activate`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        client_id: "cliente-demo",
+        installation_id: "cliente-demo-prod-001",
+        email: "ops@cliente.com",
+        registration_token: "unused-token"
+      })
+    });
 
     let timer: NodeJS.Timeout | null = null;
     try {
       await withEnv(
         await setupReadyEnv({
           QUOTEOPS_CONTROL_PLANE_URL: cloudBaseUrl,
+          QUOTEOPS_REGISTRATION_TOKEN: "unused-token",
+          QUOTEOPS_VERSION: "v1.0.0",
           QUOTEOPS_SYNC_INTERVAL_MS: "3600000"
         }),
         async () => {
@@ -693,7 +773,9 @@ describe("QuoteOps API", () => {
     const store = createInMemoryQuoteOpsStore();
     const configured = {
       QUOTEOPS_CONTROL_PLANE_URL: "http://127.0.0.1:9",
-      QUOTEOPS_INSTALLATION_ID: "cliente-demo-prod-001"
+      QUOTEOPS_INSTALLATION_ID: "cliente-demo-prod-001",
+      QUOTEOPS_REGISTRATION_TOKEN: "test-token",
+      QUOTEOPS_VERSION: "v1.0.0"
     };
 
     expect(
@@ -965,7 +1047,7 @@ describe("QuoteOps API", () => {
       }
     );
 
-    await closeTestServer();
+    clearApplianceTestApps();
 
     await withEnv(
       await setupReadyEnv(),
@@ -1005,7 +1087,7 @@ describe("QuoteOps API", () => {
       }
     );
 
-    await closeTestServer();
+    clearApplianceTestApps();
 
     await withEnv(
       await setupReadyEnv({
@@ -1032,34 +1114,128 @@ describe("QuoteOps API", () => {
 async function startApi(dependencies: Partial<QuoteOpsApiDependencies> = {}): Promise<string> {
   ensureDefaultLicensedEnvForApiTest();
   const app = createQuoteOpsApi({ defaultTools: workflowInput.tools, ...dependencies });
-  server = createServer(app);
-
-  await new Promise<void>((resolve) => {
-    server?.listen(0, "127.0.0.1", resolve);
-  });
-  const address = server.address();
-  if (!address || typeof address === "string") {
-    throw new Error("Expected API test server to listen on a local port");
-  }
-  return `http://127.0.0.1:${address.port}`;
+  return registerTestApp("appliance", app);
 }
 
-async function startCloudTestServer(registrationToken: string): Promise<string> {
+async function startCloudTestServer(
+  registrationToken: string,
+  tenantData = createInMemoryTenantDataStore()
+): Promise<string> {
   const app = createControlPlaneApi({
     verifyAdminToken: async (token) => (token === TEST_ADMIN_TOKEN ? "ops@e2e.example" : null),
     tokenGenerator: () => registrationToken,
-    now: () => new Date("2026-06-25T12:00:00.000Z")
+    now: () => new Date("2026-06-25T12:00:00.000Z"),
+    tenantData
   });
-  cloudServer = createServer(app);
+  return registerTestApp("cloud", app);
+}
 
-  await new Promise<void>((resolve) => {
-    cloudServer?.listen(0, "127.0.0.1", resolve);
-  });
-  const address = cloudServer.address();
-  if (!address || typeof address === "string") {
-    throw new Error("Expected cloud API test server to listen on a local port");
+function registerTestApp(kind: "appliance" | "cloud", app: TestExpressApp): string {
+  installFetchRouter();
+  const baseUrl = `https://quoteops-${kind}-${++nextTestAppId}.test`;
+  testApps.set(baseUrl, app);
+  (kind === "appliance" ? applianceOrigins : cloudOrigins).add(baseUrl);
+  return baseUrl;
+}
+
+function installFetchRouter(): void {
+  if (fetchRouterInstalled) return;
+  globalThis.fetch = routedFetch;
+  fetchRouterInstalled = true;
+}
+
+function restoreNativeFetch(): void {
+  if (!fetchRouterInstalled) return;
+  globalThis.fetch = nativeFetch;
+  fetchRouterInstalled = false;
+}
+
+const routedFetch: typeof fetch = async (input, init) => {
+  const requestUrl = new URL(input instanceof Request ? input.url : String(input));
+  const app = testApps.get(requestUrl.origin);
+  if (!app) {
+    return nativeFetch(input, init);
   }
-  return `http://127.0.0.1:${address.port}`;
+
+  return directAppFetch(app, new Request(input, init));
+};
+
+async function directAppFetch(app: TestExpressApp, request: Request): Promise<Response> {
+  const url = new URL(request.url);
+  const payload = Buffer.from(await request.arrayBuffer());
+  const socket = new Duplex({
+    read() {},
+    write(_chunk, _encoding, callback) {
+      callback();
+    }
+  });
+  const req = Readable.from(payload.length > 0 ? [payload] : []) as unknown as IncomingMessage;
+  const headers = Object.fromEntries(request.headers.entries());
+  if (payload.length > 0 && headers["content-length"] === undefined) {
+    headers["content-length"] = String(payload.length);
+  }
+  Object.assign(req, {
+    method: request.method,
+    url: `${url.pathname}${url.search}`,
+    socket,
+    connection: socket,
+    httpVersion: "1.1",
+    httpVersionMajor: 1,
+    httpVersionMinor: 1,
+    complete: true,
+    headers: {
+      host: url.host,
+      ...headers
+    },
+    rawHeaders: Object.entries(headers).flatMap(([name, value]) => [name, value])
+  });
+
+  const res = new ServerResponse(req);
+  res.assignSocket(socket as never);
+  const chunks: Buffer[] = [];
+  const originalWrite = res.write.bind(res);
+  const originalEnd = res.end.bind(res);
+  res.write = ((chunk: unknown, ...args: unknown[]) => {
+    if (chunk !== undefined && chunk !== null) chunks.push(Buffer.from(chunk as never));
+    return originalWrite(chunk as never, ...(args as never[]));
+  }) as typeof res.write;
+  res.end = ((chunk?: unknown, ...args: unknown[]) => {
+    if (chunk !== undefined && chunk !== null) chunks.push(Buffer.from(chunk as never));
+    return originalEnd(chunk as never, ...(args as never[]));
+  }) as typeof res.end;
+
+  const finished = new Promise<void>((resolve, reject) => {
+    res.once("finish", resolve);
+    res.once("error", reject);
+  });
+  app(req, res);
+  await finished;
+
+  const responseHeaders = new Headers();
+  for (const [name, value] of Object.entries(res.getHeaders())) {
+    if (Array.isArray(value)) {
+      for (const item of value) responseHeaders.append(name, item);
+    } else if (value !== undefined) {
+      responseHeaders.set(name, String(value));
+    }
+  }
+  const responseBody = Buffer.concat(chunks);
+  return new Response(responseBody.length > 0 ? responseBody : null, {
+    status: res.statusCode,
+    statusText: res.statusMessage,
+    headers: responseHeaders
+  });
+}
+
+function clearApplianceTestApps(): void {
+  for (const origin of applianceOrigins) testApps.delete(origin);
+  applianceOrigins.clear();
+}
+
+function clearTestApps(): void {
+  testApps.clear();
+  applianceOrigins.clear();
+  cloudOrigins.clear();
 }
 
 async function waitForCloudHeartbeat(cloudBaseUrl: string): Promise<Record<string, any>> {
@@ -1119,22 +1295,6 @@ function ensureDefaultLicensedEnvForApiTest(): void {
       }
     }
   });
-}
-
-async function closeTestServer(): Promise<void> {
-  if (!server) return;
-  await new Promise<void>((resolve, reject) => {
-    server?.close((error) => (error ? reject(error) : resolve()));
-  });
-  server = null;
-}
-
-async function closeCloudTestServer(): Promise<void> {
-  if (!cloudServer) return;
-  await new Promise<void>((resolve, reject) => {
-    cloudServer?.close((error) => (error ? reject(error) : resolve()));
-  });
-  cloudServer = null;
 }
 
 let readyEnvDir: string | null = null;

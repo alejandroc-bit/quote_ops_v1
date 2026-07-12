@@ -198,7 +198,7 @@ function buildIntakeModel(
 }
 
 async function loadManifest(env: NodeJS.ProcessEnv): Promise<QuoteManifest> {
-  const path = env.QUOTEOPS_MANIFEST_PATH ?? "/opt/quoteops/manifests/client-manifest.yaml";
+  const path = env.QUOTEOPS_MANIFEST_PATH ?? "/opt/quoteops-v1/manifests/client-manifest.yaml";
   const manifest = parseYaml(await readFile(path, "utf8")) as QuoteManifest;
   if (!manifest?.client_id || !Array.isArray(manifest.business_units)) {
     throw new Error(`client manifest is invalid: ${path}`);

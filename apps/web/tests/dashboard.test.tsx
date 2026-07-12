@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ClientPortalApp } from "../src/ClientPortalApp";
 import { ControlPlaneApp } from "../src/ControlPlaneApp";
 import { supabase } from "../src/lib/supabaseAdminClient";
+import * as controlPlaneApi from "../src/api/controlPlaneApi";
 import { ApprovalsPage } from "../src/pages/approvals";
 import { ClientsPage } from "../src/pages/clients";
 import { HealthPage } from "../src/pages/health";
@@ -44,35 +45,73 @@ describe("Separated product shells", () => {
   it("shows a sign-in gate for the Inducta control plane when signed out", async () => {
     render(<ControlPlaneApp />);
 
-    expect(await screen.findByRole("heading", { name: /Sign in/i })).toBeInTheDocument();
-    expect(screen.getByLabelText(/Admin email/i)).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /Send magic link/i })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: /Iniciar sesión/i })).toBeInTheDocument();
+    expect(screen.getByLabelText(/Correo de administración/i)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Enviar enlace mágico/i })).toBeInTheDocument();
     expect(screen.queryByRole("heading", { name: /Authorized clients/i })).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /Clients/i })).toBeDisabled();
+    expect(screen.getByRole("button", { name: /Clientes/i })).toBeDisabled();
   });
 
   it("opens the Inducta control plane's client list once signed in", async () => {
     mockControlPlaneApi();
+    vi.spyOn(controlPlaneApi, "claimCurrentPortalProfile").mockResolvedValue({
+      user_id: "vendor-1",
+      tenant_id: null,
+      role: "vendor_admin"
+    });
     vi.mocked(supabase!.auth.getSession).mockResolvedValue({
-      data: { session: { user: { email: "ops@inducta.example" } } }
+      data: { session: { user: { id: "vendor-1", email: "ops@inducta.example" } } }
     } as never);
     render(<ControlPlaneApp />);
 
-    expect(await screen.findByText(/Signed in as ops@inducta.example/i)).toBeInTheDocument();
+    expect(await screen.findByText(/Sesión iniciada como ops@inducta.example/i)).toBeInTheDocument();
     expect(
       screen.getByRole("heading", { name: /Authorized clients/i })
     ).toBeInTheDocument();
     expect(
-      screen.getByRole("navigation", { name: /Inducta control plane/i })
+      screen.getByRole("navigation", { name: /Plano de control de Inducta/i })
     ).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: /Inducta Control Plane/i })).toBeInTheDocument();
     expect(await screen.findByText(/Autolineas NuevoMex/i)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Clientes/i })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /Create client/i })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /Inbox/i })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /RFQs/i })).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: /Approvals/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Aprobaciones/i })).not.toBeInTheDocument();
     expect(screen.queryByText(/hero/i)).not.toBeInTheDocument();
     expect(screen.queryByText(/coming soon/i)).not.toBeInTheDocument();
+  });
+
+  it("routes a tenant member to RLS-backed tenant pages without calling the admin clients API", async () => {
+    const listAdminClients = vi.spyOn(controlPlaneApi, "listControlPlaneClients");
+    vi.spyOn(controlPlaneApi, "claimCurrentPortalProfile").mockResolvedValue({
+      user_id: "tenant-user-1",
+      tenant_id: "tenant-1",
+      role: "member"
+    });
+    vi.spyOn(controlPlaneApi, "listTenantInstallations").mockResolvedValue([
+      {
+        installation_id: "tenant-inst-1",
+        tenant_id: "tenant-1",
+        version: "v1.0.0",
+        settings: { pricing_model: "formula" }
+      }
+    ]);
+    vi.spyOn(controlPlaneApi, "getLatestRelease").mockResolvedValue(null);
+    vi.spyOn(controlPlaneApi, "listInstallationUsage").mockResolvedValue([]);
+    vi.spyOn(controlPlaneApi, "listCredentialStatuses").mockResolvedValue([]);
+    vi.mocked(supabase!.auth.getSession).mockResolvedValue({
+      data: { session: { user: { id: "tenant-user-1", email: "user@tenant.example" } } }
+    } as never);
+
+    render(<ControlPlaneApp />);
+
+    expect(await screen.findByRole("heading", { name: /Perfil del cliente/i })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Perfil de cliente/i })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Sentinel/i })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Clientes/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Instalación/i })).not.toBeInTheDocument();
+    expect(listAdminClients).not.toHaveBeenCalled();
   });
 
   it("opens the client appliance portal without Inducta multi-client onboarding", async () => {
@@ -89,7 +128,7 @@ describe("Separated product shells", () => {
     expect(screen.getByRole("button", { name: /Inbox/i })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /RFQs/i })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /Knowledge/i })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /Approvals/i })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Aprobaciones/i })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /Clients/i })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /Install/i })).not.toBeInTheDocument();
     expect(screen.queryByText(/Autolineas NuevoMex/i)).not.toBeInTheDocument();
