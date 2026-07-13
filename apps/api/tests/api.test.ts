@@ -12,7 +12,10 @@ import {
   type QuoteOpsApiDependencies
 } from "../src/index";
 import { createControlPlaneApi } from "../../control-plane-api/src/index";
-import { createInMemoryTenantDataStore } from "../../control-plane-api/src/tenantData";
+import {
+  createInMemoryControlPlaneData,
+  type ControlPlaneData
+} from "../../control-plane-api/src/data/index";
 import { quoteLane } from "../../agent/src/graph/nodes/quote";
 import { loadPdfTemplate } from "../../agent/src/pdf/quotePdf";
 import type { QuoteWorkflowInput } from "@quoteops/agent";
@@ -609,10 +612,10 @@ describe("QuoteOps API", () => {
   });
 
   it("syncs only minimal heartbeat and aggregate counters to the control plane", async () => {
-    const tenantData = createInMemoryTenantDataStore({
+    const data = createInMemoryControlPlaneData({
       releases: [{ version: "v1.1.0", notes: "Stable" }]
     });
-    const cloudBaseUrl = await startCloudTestServer("unused-token", tenantData);
+    const cloudBaseUrl = await startCloudTestServer("unused-token", data);
     await fetch(`${cloudBaseUrl}/api/admin/clients`, {
       method: "POST",
       headers: { "content-type": "application/json", authorization: `Bearer ${TEST_ADMIN_TOKEN}` },
@@ -637,7 +640,7 @@ describe("QuoteOps API", () => {
         registration_token: "unused-token"
       })
     });
-    tenantData.installations.get("cliente-demo-prod-001")!.settings = {
+    data.installations.get("cliente-demo-prod-001")!.settings = {
       pricing_model: "profitability",
       pdf_template: { title: "Plantilla sincronizada", show_breakdown: false }
     };
@@ -1133,13 +1136,13 @@ async function startApi(dependencies: Partial<QuoteOpsApiDependencies> = {}): Pr
 
 async function startCloudTestServer(
   registrationToken: string,
-  tenantData = createInMemoryTenantDataStore()
+  data: ControlPlaneData = createInMemoryControlPlaneData()
 ): Promise<string> {
   const app = createControlPlaneApi({
     verifyAdminToken: async (token) => (token === TEST_ADMIN_TOKEN ? "ops@e2e.example" : null),
     tokenGenerator: () => registrationToken,
     now: () => new Date("2026-06-25T12:00:00.000Z"),
-    tenantData
+    data
   });
   return registerTestApp("cloud", app);
 }

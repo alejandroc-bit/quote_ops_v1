@@ -4,16 +4,12 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { createControlPlaneApi } from "../src/index";
 import {
-  createControlPlaneApi,
-  createInMemoryControlPlaneStore,
-  type ControlPlaneStore
-} from "../src/index";
-import { createFileControlPlaneStore } from "../src/stores/fileStore";
-import {
-  createInMemoryTenantDataStore,
-  type TenantDataStore
-} from "../src/tenantData";
+  createFileControlPlaneData,
+  createInMemoryControlPlaneData,
+  type ControlPlaneData
+} from "../src/data/index";
 import {
   generateLicenseKeyPair,
   verifyInstallationLicense,
@@ -110,7 +106,7 @@ describe("minimal control-plane API", () => {
   });
 
   it("claims portal profiles from verified session email without client-selected role or tenant", async () => {
-    const tenantData = createInMemoryTenantDataStore();
+    const data = createInMemoryControlPlaneData();
     const sessions = new Map([
       ["owner-session", { user_id: "user-owner", email: "owner@claim.example" }],
       ["vendor-session", { user_id: "user-vendor", email: "vendor@inducta.example" }],
@@ -118,7 +114,7 @@ describe("minimal control-plane API", () => {
       ["escalation-session", { user_id: "user-owner", email: "vendor@inducta.example" }]
     ]);
     const api = await startApi({
-      tenantData,
+      data,
       verifySessionToken: async (token) => sessions.get(token) ?? null,
       isVendorAdminEmail: (email) => email === "vendor@inducta.example"
     });
@@ -164,11 +160,11 @@ describe("minimal control-plane API", () => {
       "Bearer escalation-session"
     );
     expect(unchanged.status).toBe(403);
-    expect(tenantData.profiles.has("user-owner")).toBe(false);
+    expect(data.profiles.has("user-owner")).toBe(false);
   });
 
   it("revokes stale portal profiles when live email or role authority changes", async () => {
-    const tenantData = createInMemoryTenantDataStore();
+    const data = createInMemoryControlPlaneData();
     const vendorEmails = new Set([
       "vendor@inducta.example",
       "vendor-one@inducta.example",
@@ -184,7 +180,7 @@ describe("minimal control-plane API", () => {
       ["switch-session", { user_id: "switch-user", email: "switch@inducta.example" }]
     ]);
     const api = await startApi({
-      tenantData,
+      data,
       verifySessionToken: async (token) => sessions.get(token) ?? null,
       isVendorAdminEmail: (email) => vendorEmails.has(email)
     });
@@ -204,7 +200,7 @@ describe("minimal control-plane API", () => {
     expect((await api.post("/api/portal/profile/claim", {}, "Bearer vendor-session")).status).toBe(200);
     vendorEmails.delete("vendor@inducta.example");
     expect((await api.post("/api/portal/profile/claim", {}, "Bearer vendor-session")).status).toBe(403);
-    expect(tenantData.profiles.has("vendor-user")).toBe(false);
+    expect(data.profiles.has("vendor-user")).toBe(false);
 
     expect((await api.post("/api/portal/profile/claim", {}, "Bearer vendor-email-session")).status).toBe(200);
     sessions.set("vendor-email-session", {
@@ -220,12 +216,12 @@ describe("minimal control-plane API", () => {
       authorized_email: "replacement@revoke.example"
     });
     expect((await api.post("/api/portal/profile/claim", {}, "Bearer owner-session")).status).toBe(403);
-    expect(tenantData.profiles.has("owner-user")).toBe(false);
+    expect(data.profiles.has("owner-user")).toBe(false);
 
     expect((await api.post("/api/portal/profile/claim", {}, "Bearer email-change-session")).status).toBe(200);
     sessions.set("email-change-session", { user_id: "email-user", email: "changed@example.com" });
     expect((await api.post("/api/portal/profile/claim", {}, "Bearer email-change-session")).status).toBe(403);
-    expect(tenantData.profiles.has("email-user")).toBe(false);
+    expect(data.profiles.has("email-user")).toBe(false);
 
     expect((await api.post("/api/portal/profile/claim", {}, "Bearer same-tenant-email-session")).status).toBe(200);
     await api.post("/api/admin/clients", {
@@ -244,7 +240,7 @@ describe("minimal control-plane API", () => {
     sessions.set("switch-session", { user_id: "switch-user", email: "switch-owner@revoke.example" });
     const vendorToOwner = await api.post("/api/portal/profile/claim", {}, "Bearer switch-session");
     expect(vendorToOwner.status).toBe(403);
-    expect(tenantData.profiles.has("switch-user")).toBe(false);
+    expect(data.profiles.has("switch-user")).toBe(false);
   });
 
   it("serves a self-extracting installer script for a valid registration token", async () => {
@@ -332,42 +328,30 @@ describe("minimal control-plane API", () => {
     expect(activated.body.error).toBe("registration_token_expired");
   });
 
-  it.each(["client_licensed", "tenant_token_used", "legacy_token_used"] as const)(
+  it.each(["client_licensed", "token_used"] as const)(
     "retries activation after a %s persistence failure without reissuing the install pack",
     async (failureBoundary) => {
-      const baseStore = createInMemoryControlPlaneStore();
-      const baseTenantData = createInMemoryTenantDataStore();
+      const baseData = createInMemoryControlPlaneData();
       let failurePending = true;
-      const store: ControlPlaneStore = {
-        ...baseStore,
+      const data: ControlPlaneData = {
+        ...baseData,
         upsertClient(client) {
           if (failurePending && failureBoundary === "client_licensed" && client.status === "active") {
             failurePending = false;
             throw new Error("injected_client_persistence_failure");
           }
-          return baseStore.upsertClient(client);
+          return baseData.upsertClient(client);
         },
-        updateRegistrationToken(token) {
-          if (failurePending && failureBoundary === "legacy_token_used") {
-            failurePending = false;
-            throw new Error("injected_legacy_token_failure");
-          }
-          return baseStore.updateRegistrationToken(token);
-        }
-      };
-      const tenantData: TenantDataStore = {
-        ...baseTenantData,
         markRegistrationTokenUsed(token, usedAt) {
-          if (failurePending && failureBoundary === "tenant_token_used") {
+          if (failurePending && failureBoundary === "token_used") {
             failurePending = false;
-            throw new Error("injected_tenant_token_failure");
+            throw new Error("injected_token_failure");
           }
-          return baseTenantData.markRegistrationTokenUsed(token, usedAt);
+          return baseData.markRegistrationTokenUsed(token, usedAt);
         }
       };
       const api = await startApi({
-        store,
-        tenantData,
+        data,
         tokenGenerator: () => `retry-${failureBoundary}`,
         now: () => new Date("2026-07-12T15:00:00.000Z")
       });
@@ -394,9 +378,9 @@ describe("minimal control-plane API", () => {
   );
 
   it("updates heartbeat and aggregate counters without accepting detail fields", async () => {
-    const tenantData = createInMemoryTenantDataStore();
+    const data = createInMemoryControlPlaneData();
     const api = await startApi({
-      tenantData,
+      data,
       tokenGenerator: () => "counters-installation-token",
       now: () => new Date("2026-06-25T12:10:00.000Z")
     });
@@ -497,11 +481,11 @@ describe("minimal control-plane API", () => {
   });
 
   it("uses the activated install-pack token as the bound credential for every ingest endpoint", async () => {
-    const tenantData = createInMemoryTenantDataStore({
+    const data = createInMemoryControlPlaneData({
       releases: [{ version: "v1.2.0", notes: "Stable" }]
     });
     const api = await startApi({
-      tenantData,
+      data,
       tokenGenerator: () => "issued-appliance-token",
       now: () => new Date("2026-07-12T15:00:00.000Z")
     });
@@ -561,9 +545,8 @@ describe("minimal control-plane API", () => {
     expect(wrongInstallation.status).toBe(403);
   });
 
-  it("keeps legacy file/in-memory auth working while tenant-table ingests fail explicitly", async () => {
+  it("serves tenant ingests from the default in-memory unified data store", async () => {
     const api = await startApi({
-      tenantData: null,
       tokenGenerator: () => "legacy-appliance-token",
       now: () => new Date("2026-07-12T15:00:00.000Z")
     });
@@ -573,6 +556,12 @@ describe("minimal control-plane API", () => {
       authorized_email: "ops@legacy.example"
     });
     await api.post("/api/admin/clients/LEGACY/install-pack", {});
+    await api.post("/api/onboarding/activate", {
+      client_id: "LEGACY",
+      installation_id: "legacy-prod-001",
+      email: "ops@legacy.example",
+      registration_token: "legacy-appliance-token"
+    });
 
     const heartbeat = await api.post(
       "/api/installations/legacy-prod-001/heartbeat",
@@ -591,8 +580,8 @@ describe("minimal control-plane API", () => {
     );
 
     expect(heartbeat.status).toBe(202);
-    expect(sentinel.status).toBe(503);
-    expect(sentinel.body.error).toBe("tenant_data_unavailable");
+    expect(sentinel.status).toBe(201);
+    expect(sentinel.body).toEqual({ accepted: true });
   });
 
   it("rejects a token whose tenant and installation pair is internally inconsistent", async () => {
@@ -603,20 +592,22 @@ describe("minimal control-plane API", () => {
       created_at: "2026-07-12T00:00:00.000Z",
       status: "active"
     });
-    const store = createInMemoryControlPlaneStore([client]);
-    const tenantData = createInMemoryTenantDataStore({
+    const data = createInMemoryControlPlaneData({
+      clients: [client],
       tokens: [{
         token: "mismatched-token",
+        client_id: "MISMATCH",
         tenant_id: "tenant-a",
         installation_id: "mismatch-prod-001",
+        expires_at: "9999-01-01T00:00:00.000Z",
         used_at: "2026-07-12T00:00:00.000Z"
       }],
       installations: [{
-        tenant_id: "tenant-b",
+        tenant_id: "tenant:MISMATCH",
         installation_id: "mismatch-prod-001"
       }]
     });
-    const api = await startApi({ store, tenantData });
+    const api = await startApi({ data });
 
     const heartbeat = await api.post(
       "/api/installations/mismatch-prod-001/heartbeat",
@@ -629,11 +620,18 @@ describe("minimal control-plane API", () => {
   });
 
   it("ingests a strict aggregate sentinel report for the token tenant", async () => {
-    const tenantData = createInMemoryTenantDataStore({
-      tokens: [{ token: "installation-token", tenant_id: "tenant-a", installation_id: "tenant-a-prod-001" }],
+    const data = createInMemoryControlPlaneData({
+      tokens: [{
+        token: "installation-token",
+        client_id: "TENANT-A",
+        tenant_id: "tenant-a",
+        installation_id: "tenant-a-prod-001",
+        expires_at: "9999-01-01T00:00:00.000Z",
+        used_at: null
+      }],
       installations: [{ tenant_id: "tenant-a", installation_id: "tenant-a-prod-001" }]
     });
-    const api = await startApi({ tenantData });
+    const api = await startApi({ data });
 
     const accepted = await api.post(
       "/api/sentinel/reports",
@@ -647,7 +645,7 @@ describe("minimal control-plane API", () => {
     );
 
     expect(accepted.status).toBe(201);
-    expect(tenantData.sentinelReports).toEqual([
+    expect(data.sentinelReports).toEqual([
       {
         tenant_id: "tenant-a",
         installation_id: "tenant-a-prod-001",
@@ -702,11 +700,18 @@ describe("minimal control-plane API", () => {
   });
 
   it("upserts strict daily aggregate usage without duplicating retries", async () => {
-    const tenantData = createInMemoryTenantDataStore({
-      tokens: [{ token: "usage-token", tenant_id: "tenant-b", installation_id: "tenant-b-prod-001" }],
+    const data = createInMemoryControlPlaneData({
+      tokens: [{
+        token: "usage-token",
+        client_id: "TENANT-B",
+        tenant_id: "tenant-b",
+        installation_id: "tenant-b-prod-001",
+        expires_at: "9999-01-01T00:00:00.000Z",
+        used_at: null
+      }],
       installations: [{ tenant_id: "tenant-b", installation_id: "tenant-b-prod-001" }]
     });
-    const api = await startApi({ tenantData });
+    const api = await startApi({ data });
 
     const first = await api.post(
       "/api/usage",
@@ -721,7 +726,7 @@ describe("minimal control-plane API", () => {
 
     expect(first.status).toBe(202);
     expect(retry.status).toBe(202);
-    expect(tenantData.usageEvents.get("tenant-b|2026-07-12|email")).toMatchObject({
+    expect(data.usageEvents.get("tenant-b|2026-07-12|email")).toMatchObject({
       quotes: 5,
       routes: 8
     });
@@ -755,8 +760,15 @@ describe("minimal control-plane API", () => {
   });
 
   it("returns the latest release and only allowlisted heartbeat settings", async () => {
-    const tenantData = createInMemoryTenantDataStore({
-      tokens: [{ token: "release-token", tenant_id: "tenant:SYNC", installation_id: "sync-prod-001" }],
+    const data = createInMemoryControlPlaneData({
+      tokens: [{
+        token: "release-token",
+        client_id: "SYNC",
+        tenant_id: "tenant:SYNC",
+        installation_id: "sync-prod-001",
+        expires_at: "9999-01-01T00:00:00.000Z",
+        used_at: null
+      }],
       installations: [
         {
           tenant_id: "tenant:SYNC",
@@ -775,7 +787,7 @@ describe("minimal control-plane API", () => {
       ]
     });
     const api = await startApi({
-      tenantData,
+      data,
       now: () => new Date("2026-07-12T15:00:00.000Z")
     });
     await api.post("/api/admin/clients", {
@@ -799,7 +811,7 @@ describe("minimal control-plane API", () => {
       settings: { pricing_model: "profitability", pdf_template: { layout: "compact-v2" } }
     });
     expect(heartbeat.body.settings).not.toHaveProperty("customer_detail");
-    expect(tenantData.installations.get("sync-prod-001")).toMatchObject({
+    expect(data.installations.get("sync-prod-001")).toMatchObject({
       version: "v1.8.0",
       last_heartbeat_at: "2026-07-12T15:00:00.000Z"
     });
@@ -811,7 +823,7 @@ describe("minimal control-plane API", () => {
     );
     expect(prereleaseHeartbeat.status).toBe(400);
 
-    const installation = tenantData.installations.get("sync-prod-001");
+    const installation = data.installations.get("sync-prod-001");
     expect(installation).toBeDefined();
     installation!.settings = { pdf_template: "  legacy-compact-template  " };
     const legacyTemplateHeartbeat = await api.post(
@@ -845,9 +857,9 @@ describe("minimal control-plane API", () => {
     const dir = await mkdtemp(join(tmpdir(), "quoteops-control-plane-store-"));
     tempDirs.push(dir);
     const storePath = join(dir, "store.json");
-    const firstStore = createFileControlPlaneStore(storePath);
+    const firstData = createFileControlPlaneData(storePath);
     const firstApi = await startApi({
-      store: firstStore,
+      data: firstData,
       tokenGenerator: () => "file-store-token",
       now: () => new Date("2026-06-25T12:00:00.000Z")
     });
@@ -858,9 +870,9 @@ describe("minimal control-plane API", () => {
       authorized_email: "ops@file.example"
     });
     await firstApi.post("/api/admin/clients/FILE/install-pack", {});
-    const secondStore = createFileControlPlaneStore(storePath);
+    const secondData = createFileControlPlaneData(storePath);
     const secondApi = await startApi({
-      store: secondStore,
+      data: secondData,
       now: () => new Date("2026-06-25T12:01:00.000Z")
     });
     const login = await secondApi.post("/api/onboarding/login", {
@@ -883,6 +895,10 @@ describe("Supabase control-plane migration", () => {
   it("enables RLS on every table with tenant and vendor-admin policies but no anon policy", async () => {
     const sql = await readFile(
       new URL("../../../supabase/migrations/0001_control_plane.sql", import.meta.url),
+      "utf8"
+    );
+    const unifiedStoreSql = await readFile(
+      new URL("../../../supabase/migrations/0002_unify_client_store.sql", import.meta.url),
       "utf8"
     );
     const tables = [
@@ -929,6 +945,49 @@ describe("Supabase control-plane migration", () => {
       "lower(stats ->> 'avg_node_ms') not in ('nan', 'infinity', '-infinity')"
     );
     expect(sql).not.toMatch(/create policy sentinel_reports_tenant_(insert|update)/i);
+
+    expect(unifiedStoreSql).toMatch(
+      /add column status text not null default 'onboarding'/i
+    );
+    expect(unifiedStoreSql).toContain(
+      "check (status in ('active', 'onboarding', 'blocked', 'suspended'))"
+    );
+    expect(unifiedStoreSql).toMatch(
+      /add column authorized_users jsonb not null default '\[\]'::jsonb/i
+    );
+    expect(unifiedStoreSql).toMatch(
+      /add column license_status text not null default 'pending'/i
+    );
+    expect(unifiedStoreSql).toMatch(
+      /add column onboarding_status text not null default 'not_started'/i
+    );
+    expect(unifiedStoreSql).toMatch(
+      /add column ai_key_status text not null default 'missing'/i
+    );
+    expect(unifiedStoreSql).toContain(
+      "'{\"total\":0,\"validated\":0,\"rejected\":0,\"pending\":0,\"failed\":0}'::jsonb"
+    );
+    expect(unifiedStoreSql).toContain(
+      "if to_regclass('public.control_plane_clients') is not null then"
+    );
+    expect(unifiedStoreSql).toMatch(/on conflict \(client_id\) do update set/i);
+    expect(unifiedStoreSql).toMatch(/on conflict \(installation_id\) do update set/i);
+    expect(unifiedStoreSql).not.toMatch(
+      /on conflict \(client_id\) do update set[\s\S]*?\b(name|authorized_email)\s*=/i
+    );
+    expect(unifiedStoreSql).toContain(
+      "drop table if exists public.control_plane_install_tokens;"
+    );
+    expect(unifiedStoreSql).toContain(
+      "drop table if exists public.control_plane_clients;"
+    );
+    expect(unifiedStoreSql).toContain("where authorized_users = '[]'::jsonb;");
+    expect(unifiedStoreSql).toContain(
+      "if exists (select 1 from pg_roles where rolname = 'quoteops_cp') then"
+    );
+    expect(unifiedStoreSql).toMatch(
+      /grant select, insert, update, delete on table[\s\S]*?to quoteops_cp;/i
+    );
   });
 });
 
@@ -940,14 +999,14 @@ async function startApi(options: {
   now?: () => Date;
   tokenGenerator?: () => string;
   tokenTtlMinutes?: number;
-  store?: ControlPlaneStore;
-  tenantData?: TenantDataStore | null;
+  data?: ControlPlaneData;
   verifySessionToken?: (token: string) => Promise<{ user_id: string; email: string } | null>;
   isVendorAdminEmail?: (email: string) => boolean;
 } = {}) {
   const app = createControlPlaneApi({
     controlPlaneUrl: "https://quoteops-control-plane-staging.vercel.app",
     verifyAdminToken: async (token) => (token === TEST_ADMIN_TOKEN ? "ops@e2e.example" : null),
+    data: createInMemoryControlPlaneData(),
     ...options
   });
 

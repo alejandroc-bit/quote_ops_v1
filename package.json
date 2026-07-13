@@ -11,6 +11,7 @@
     "build": "npm run build:ts && npm --workspace @quoteops/web run build",
     "build:control-plane-cloud": "npm run build:ts && npm --workspace @quoteops/web run build:control",
     "build:ts": "tsc -b --force packages/shared packages/contracts packages/quote-core packages/audit packages/criteria packages/connectors packages/knowledge apps/agent apps/api apps/control-plane apps/control-plane-api",
+    "admin": "node --import tsx apps/control-plane-api/src/adminCli.ts",
     "dev:api": "tsx apps/api/src/server.ts",
     "dev:agent": "tsx apps/agent/src/dev.ts",
     "dev:control-plane-api": "tsx apps/control-plane-api/src/server.ts",

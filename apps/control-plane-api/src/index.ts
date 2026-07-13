@@ -8,8 +8,6 @@ import {
   authorizeUserForClient,
   createInstallPack,
   createMinimalClientRecord,
-  normalizeClientId,
-  normalizeEmail,
   parseMinimalCounters,
   parseMinimalHeartbeat,
   type InstallPack,
@@ -25,9 +23,11 @@ import {
   loadApplianceDeployFiles,
   renderInstallerScript
 } from "./installerScript.js";
-import { createFileControlPlaneStore } from "./stores/fileStore.js";
-import { createPostgresControlPlaneStore } from "./stores/postgresStore.js";
-import { createDefaultTenantDataStore, type TenantDataStore } from "./tenantData.js";
+import {
+  createDefaultControlPlaneData,
+  type ControlPlaneData,
+  type RegistrationTokenRecord
+} from "./data/index.js";
 
 const isoDateSchema = z
   .string()
@@ -96,27 +96,6 @@ function parseInput<T>(parse: () => T): T {
   }
 }
 
-export type RegistrationTokenRecord = {
-  token: string;
-  client_id: string;
-  installation_id: string;
-  expires_at: string;
-  used_at: string | null;
-};
-
-type MaybePromise<T> = T | Promise<T>;
-
-export type ControlPlaneStore = {
-  listClients(): MaybePromise<MinimalClientRecord[]>;
-  getClient(clientId: string): MaybePromise<MinimalClientRecord | null>;
-  getClientByInstallation(installationId: string): MaybePromise<MinimalClientRecord | null>;
-  findClientByAuthorizedEmail(email: string): MaybePromise<MinimalClientRecord | null>;
-  upsertClient(client: MinimalClientRecord): MaybePromise<MinimalClientRecord>;
-  saveRegistrationToken(token: RegistrationTokenRecord): MaybePromise<RegistrationTokenRecord>;
-  getRegistrationToken(token: string): MaybePromise<RegistrationTokenRecord | null>;
-  updateRegistrationToken(token: RegistrationTokenRecord): MaybePromise<RegistrationTokenRecord>;
-};
-
 export type AdminTokenVerifier = (token: string) => Promise<string | null>;
 export type AuthenticatedSession = { user_id: string; email: string };
 export type SessionTokenVerifier = (token: string) => Promise<AuthenticatedSession | null>;
@@ -129,8 +108,7 @@ export type ControlPlaneApiDependencies = {
   controlPlaneUrl?: string;
   keyPair?: LicenseKeyPair;
   now?: () => Date;
-  store?: ControlPlaneStore;
-  tenantData?: TenantDataStore | null;
+  data?: ControlPlaneData;
   tokenGenerator?: () => string;
   tokenTtlMinutes?: number;
 };
@@ -179,66 +157,16 @@ function createAdminTokenVerifier(
   };
 }
 
-export function createInMemoryControlPlaneStore(
-  seedClients: MinimalClientRecord[] = []
-): ControlPlaneStore {
-  const clients = new Map(seedClients.map((client) => [client.client_id, client]));
-  const tokens = new Map<string, RegistrationTokenRecord>();
-
-  return {
-    listClients() {
-      return [...clients.values()].sort((a, b) => a.legal_name.localeCompare(b.legal_name));
-    },
-    getClient(clientId) {
-      return clients.get(normalizeClientId(clientId)) ?? null;
-    },
-    getClientByInstallation(installationId) {
-      return (
-        [...clients.values()].find(
-          (client) => client.installation.installation_id === installationId
-        ) ?? null
-      );
-    },
-    findClientByAuthorizedEmail(email) {
-      const normalizedEmail = normalizeEmail(email);
-      return (
-        [...clients.values()].find((client) =>
-          client.authorized_users.some((user) => user.email === normalizedEmail)
-        ) ?? null
-      );
-    },
-    upsertClient(client) {
-      clients.set(client.client_id, client);
-      return client;
-    },
-    saveRegistrationToken(token) {
-      tokens.set(token.token, token);
-      return token;
-    },
-    getRegistrationToken(token) {
-      return tokens.get(token) ?? null;
-    },
-    updateRegistrationToken(token) {
-      tokens.set(token.token, token);
-      return token;
-    }
-  };
-}
-
 export function createControlPlaneApi(
   dependencies: ControlPlaneApiDependencies = {}
 ): Express {
   const app = express();
-  const store = dependencies.store ?? createDefaultControlPlaneStore();
+  const data = dependencies.data ?? createDefaultControlPlaneData();
   const keyPair = dependencies.keyPair ?? loadKeyPairFromEnv() ?? generateLicenseKeyPair();
   const now = dependencies.now ?? (() => new Date());
   const tokenGenerator =
     dependencies.tokenGenerator ?? (() => crypto.randomBytes(24).toString("base64url"));
   const tokenTtlMinutes = dependencies.tokenTtlMinutes ?? 60;
-  const tenantData =
-    dependencies.tenantData !== undefined
-      ? dependencies.tenantData
-      : createDefaultTenantDataStore();
   const configuredControlPlaneUrl =
     dependencies.controlPlaneUrl ??
     process.env.QUOTEOPS_CONTROL_PLANE_URL ??
@@ -279,7 +207,7 @@ export function createControlPlaneApi(
   }));
 
   app.get("/api/health", asyncRoute(async (_req, res) => {
-    const clients = await store.listClients();
+    const clients = await data.listClients();
     res.json({
       ok: true,
       service: "quoteops-control-plane-api",
@@ -292,14 +220,11 @@ export function createControlPlaneApi(
     if (!verifySessionToken) {
       throw new ApiError(503, "portal_auth_unavailable", "portal session auth is not configured");
     }
-    if (!tenantData) {
-      throw new ApiError(503, "tenant_data_unavailable", "tenant data store is not configured");
-    }
     const authorization = String(req.headers.authorization ?? "").trim();
     const token = /^Bearer\s+([^\s]+)$/i.exec(authorization)?.[1] ?? null;
     const session = token ? await verifySessionToken(token) : null;
     if (!session) throw new ApiError(401, "unauthorized_portal", "invalid portal session");
-    const profile = await tenantData.claimPortalProfile({
+    const profile = await data.claimPortalProfile({
       user_id: session.user_id,
       email: session.email.trim().toLowerCase(),
       vendor_admin: isVendorAdminEmail?.(session.email) ?? false
@@ -312,7 +237,7 @@ export function createControlPlaneApi(
   }));
 
   app.get("/api/admin/clients", asyncRoute(async (_req, res) => {
-    res.json({ items: await store.listClients() });
+    res.json({ items: await data.listClients() });
   }));
 
   app.post("/api/admin/clients", asyncRoute(async (req, res) => {
@@ -327,18 +252,12 @@ export function createControlPlaneApi(
         status: "onboarding"
       })
     );
-    await store.upsertClient(client);
-    await tenantData?.provisionClient({
-      client_id: client.client_id,
-      legal_name: client.legal_name,
-      authorized_email: client.authorized_users[0]!.email,
-      installation_id: client.installation.installation_id
-    });
+    await data.upsertClient(client);
     res.status(201).json({ client });
   }));
 
   app.post("/api/admin/clients/:clientId/install-pack", asyncRoute(async (req, res) => {
-    const client = await requireClient(store, req.params.clientId);
+    const client = await requireClient(data, req.params.clientId);
     ensureClientCanReceiveLicense(client);
 
     const token: RegistrationTokenRecord = {
@@ -348,15 +267,7 @@ export function createControlPlaneApi(
       expires_at: addMinutes(now(), tokenTtlMinutes).toISOString(),
       used_at: null
     };
-    if (tenantData) {
-      await tenantData.issueRegistrationToken({
-        token: token.token,
-        installation_id: token.installation_id,
-        expires_at: token.expires_at,
-        used_at: token.used_at
-      });
-    }
-    await store.saveRegistrationToken(token);
+    await data.saveRegistrationToken(token);
 
     const pack = createInstallPack({
       client,
@@ -368,7 +279,7 @@ export function createControlPlaneApi(
   }));
 
   app.get("/api/install/:registrationToken", asyncRoute(async (req, res) => {
-    const token = await store.getRegistrationToken(req.params.registrationToken ?? "");
+    const token = await data.getRegistrationToken(req.params.registrationToken ?? "");
     if (!token) {
       throw new ApiError(404, "not_found", "registration token not found");
     }
@@ -379,7 +290,7 @@ export function createControlPlaneApi(
       throw new ApiError(403, "registration_token_expired", "registration token expired");
     }
 
-    const client = await requireClient(store, token.client_id);
+    const client = await requireClient(data, token.client_id);
     ensureClientCanReceiveLicense(client);
 
     const deployFiles = await loadApplianceDeployFiles();
@@ -398,7 +309,7 @@ export function createControlPlaneApi(
   }));
 
   app.post("/api/admin/clients/:clientId/suspend", asyncRoute(async (req, res) => {
-    const client = await requireClient(store, req.params.clientId);
+    const client = await requireClient(data, req.params.clientId);
     const updated: MinimalClientRecord = {
       ...client,
       status: "suspended",
@@ -408,12 +319,12 @@ export function createControlPlaneApi(
         onboarding_status: "blocked"
       }
     };
-    await store.upsertClient(updated);
+    await data.upsertClient(updated);
     res.json({ client: updated });
   }));
 
   app.post("/api/admin/clients/:clientId/reactivate", asyncRoute(async (req, res) => {
-    const client = await requireClient(store, req.params.clientId);
+    const client = await requireClient(data, req.params.clientId);
     const updated: MinimalClientRecord = {
       ...client,
       status: "active",
@@ -427,16 +338,16 @@ export function createControlPlaneApi(
             : client.installation.onboarding_status
       }
     };
-    await store.upsertClient(updated);
+    await data.upsertClient(updated);
     res.json({ client: updated });
   }));
 
   app.post("/api/admin/clients/:clientId/reissue-license", asyncRoute(async (req, res) => {
-    const client = await requireClient(store, req.params.clientId);
+    const client = await requireClient(data, req.params.clientId);
     ensureClientCanReceiveLicense(client);
     const license = issueLicense(client, keyPair.private_key_pem, now().toISOString());
     const updated = markClientLicensed(client);
-    await store.upsertClient(updated);
+    await data.upsertClient(updated);
     res.json({
       client: updated,
       license,
@@ -449,8 +360,8 @@ export function createControlPlaneApi(
     const email = requiredString(body.email, "email");
     const clientId = optionalString(body.client_id);
     const client = clientId
-      ? await requireClient(store, clientId)
-      : await store.findClientByAuthorizedEmail(email);
+      ? await requireClient(data, clientId)
+      : await data.findClientByAuthorizedEmail(email);
 
     if (!client || !parseInput(() => authorizeUserForClient(client, email))) {
       res.status(403).json({ error: "unauthorized_user" });
@@ -473,7 +384,7 @@ export function createControlPlaneApi(
     const installationId = requiredString(body.installation_id, "installation_id");
     const registrationToken = requiredString(body.registration_token, "registration_token");
 
-    const client = await requireClient(store, clientId);
+    const client = await requireClient(data, clientId);
     ensureClientCanReceiveLicense(client);
     if (!parseInput(() => authorizeUserForClient(client, email))) {
       res.status(403).json({ error: "unauthorized_user" });
@@ -484,7 +395,7 @@ export function createControlPlaneApi(
       return;
     }
 
-    const token = await store.getRegistrationToken(registrationToken);
+    const token = await data.getRegistrationToken(registrationToken);
     if (!token || token.client_id !== client.client_id || token.installation_id !== installationId) {
       res.status(403).json({ error: "registration_token_invalid" });
       return;
@@ -501,12 +412,10 @@ export function createControlPlaneApi(
     const issuedAt = now().toISOString();
     const license = issueLicense(client, keyPair.private_key_pem, issuedAt);
     const updated = markClientLicensed(client);
-    // Retry-safe cross-store order: keep both tokens unused until the client is
-    // durably licensed, then mark the authoritative long-lived credential,
-    // and only consume the legacy activation token after every prior write.
-    await store.upsertClient(updated);
-    await tenantData?.markRegistrationTokenUsed(token.token, issuedAt);
-    await store.updateRegistrationToken({ ...token, used_at: issuedAt });
+    // Retry-safe order: persist the licensed client first, then consume the
+    // token that becomes the installation's long-lived credential.
+    await data.upsertClient(updated);
+    await data.markRegistrationTokenUsed(token.token, issuedAt);
 
     res.json({
       activated: true,
@@ -536,24 +445,21 @@ export function createControlPlaneApi(
     const heartbeat = parseInput(() =>
       parseMinimalHeartbeat({ ...heartbeatBody, installation_id: installationId })
     );
-    const client = await requireClientByInstallation(store, installationId);
-    const updated = parseInput(() => applyMinimalHeartbeat(client, heartbeat, now().toISOString()));
-    await store.upsertClient(updated);
+    const client = await requireClientByInstallation(data, installationId);
+    const receivedAt = now().toISOString();
+    const updated = parseInput(() => applyMinimalHeartbeat(client, heartbeat, receivedAt));
+    await data.touchInstallation(
+      installationId,
+      reportedVersion ?? null,
+      receivedAt,
+      updated
+    );
 
     // Sync channel back to the appliance: newest published release + cloud settings.
-    let latestVersion: string | null = null;
-    let settings: Record<string, unknown> = {};
-    if (tenantData) {
-      await tenantData.touchInstallation(
-        installationId,
-        reportedVersion ?? null,
-        now().toISOString()
-      );
-      latestVersion = (await tenantData.latestRelease())?.version ?? null;
-      settings = heartbeatSettingsSchema.parse(
-        await tenantData.getInstallationSettings(installationId)
-      );
-    }
+    const latestVersion = (await data.latestRelease())?.version ?? null;
+    const settings = heartbeatSettingsSchema.parse(
+      await data.getInstallationSettings(installationId)
+    );
     res.status(202).json({
       accepted: true,
       client: updated,
@@ -578,9 +484,9 @@ export function createControlPlaneApi(
     const counters = parseInput(() =>
       parseMinimalCounters({ ...body, installation_id: installationId })
     );
-    const client = await requireClientByInstallation(store, installationId);
+    const client = await requireClientByInstallation(data, installationId);
     const updated = parseInput(() => applyQuoteCounters(client, counters));
-    await store.upsertClient(updated);
+    await data.upsertClient(updated);
     res.status(202).json({ accepted: true, client: updated });
   }));
 
@@ -594,9 +500,7 @@ export function createControlPlaneApi(
     if (!token) {
       throw new ApiError(401, "unauthorized_installation", "invalid installation token");
     }
-    const resolved = tenantData
-      ? await tenantData.resolveTenantByToken(token)
-      : await resolveLegacyTenantToken(store, token, now());
+    const resolved = await data.resolveTenantByToken(token);
     if (!resolved) {
       throw new ApiError(401, "unauthorized_installation", "invalid installation token");
     }
@@ -611,17 +515,10 @@ export function createControlPlaneApi(
     return resolved;
   }
 
-  function requireTenantDataStore(): TenantDataStore {
-    if (!tenantData) {
-      throw new ApiError(503, "tenant_data_unavailable", "tenant data store is not configured");
-    }
-    return tenantData;
-  }
-
   app.post("/api/sentinel/reports", asyncRoute(async (req, res) => {
     const body = parseInput(() => sentinelReportSchema.parse(req.body));
     const { tenant_id } = await requireInstallationToken(req, body.installation_id);
-    await requireTenantDataStore().insertSentinelReport({
+    await data.insertSentinelReport({
       tenant_id,
       installation_id: body.installation_id,
       week_start: body.week_start,
@@ -634,7 +531,7 @@ export function createControlPlaneApi(
   app.post("/api/usage", asyncRoute(async (req, res) => {
     const { tenant_id } = await requireTenantToken(req);
     const body = parseInput(() => usageEventSchema.parse(req.body));
-    await requireTenantDataStore().recordUsage({
+    await data.recordUsage({
       tenant_id,
       day: body.day,
       channel: body.channel,
@@ -646,7 +543,7 @@ export function createControlPlaneApi(
 
   app.get("/api/releases/latest", asyncRoute(async (req, res) => {
     await requireTenantToken(req);
-    const release = await requireTenantDataStore().latestRelease();
+    const release = await data.latestRelease();
     if (!release) {
       throw new ApiError(404, "not_found", "no releases published");
     }
@@ -666,20 +563,6 @@ export function createControlPlaneApi(
   });
 
   return app;
-}
-
-export function createDefaultControlPlaneStore(env: NodeJS.ProcessEnv = process.env): ControlPlaneStore {
-  if (env.DATABASE_URL?.trim()) {
-    return createPostgresControlPlaneStore({
-      connectionString: env.DATABASE_URL.trim()
-    });
-  }
-
-  if (env.QUOTEOPS_CONTROL_PLANE_STORE_PATH?.trim()) {
-    return createFileControlPlaneStore(env.QUOTEOPS_CONTROL_PLANE_STORE_PATH.trim());
-  }
-
-  return createInMemoryControlPlaneStore();
 }
 
 export function issueLicense(
@@ -710,17 +593,6 @@ function markClientLicensed(client: MinimalClientRecord): MinimalClientRecord {
   };
 }
 
-async function resolveLegacyTenantToken(
-  store: ControlPlaneStore,
-  tokenValue: string,
-  now: Date
-): Promise<{ tenant_id: string; installation_id: string } | null> {
-  const token = await store.getRegistrationToken(tokenValue);
-  if (!token) return null;
-  if (!token.used_at && Date.parse(token.expires_at) <= now.getTime()) return null;
-  return { tenant_id: token.client_id, installation_id: token.installation_id };
-}
-
 function ensureClientCanReceiveLicense(client: MinimalClientRecord): void {
   if (client.status === "suspended" || client.installation.license_status === "suspended") {
     throw new ApiError(403, "client_not_active", "client suspended");
@@ -731,13 +603,13 @@ function ensureClientCanReceiveLicense(client: MinimalClientRecord): void {
 }
 
 async function requireClient(
-  store: ControlPlaneStore,
+  data: ControlPlaneData,
   clientId: string | undefined
 ): Promise<MinimalClientRecord> {
   if (!clientId) {
     throw new ApiError(400, "bad_request", "client_id required");
   }
-  const client = await store.getClient(clientId);
+  const client = await data.getClient(clientId);
   if (!client) {
     throw new ApiError(404, "not_found", "client not found");
   }
@@ -745,10 +617,10 @@ async function requireClient(
 }
 
 async function requireClientByInstallation(
-  store: ControlPlaneStore,
+  data: ControlPlaneData,
   installationId: string
 ): Promise<MinimalClientRecord> {
-  const client = await store.getClientByInstallation(installationId);
+  const client = await data.getClientByInstallation(installationId);
   if (!client) {
     throw new ApiError(404, "not_found", "installation not found");
   }
