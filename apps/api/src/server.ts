@@ -61,7 +61,8 @@ async function createRuntime(): Promise<QuoteAgentRuntime | null> {
       {
         provider,
         model_name: process.env.QUOTEOPS_LLM_MODEL ?? config.model.model_name,
-        api_key_env: apiKeyEnv
+        api_key_env: apiKeyEnv,
+        base_url: process.env.QUOTEOPS_LLM_BASE_URL ?? config.model.base_url
       },
       process.env
     ),

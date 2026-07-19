@@ -1,6 +1,6 @@
 import { readFile, stat } from "node:fs/promises";
 import { searchKnowledge } from "@quoteops/knowledge";
-import type { QuoteWorkflowTools } from "@quoteops/agent";
+import { createChatModel, type QuoteWorkflowTools } from "@quoteops/agent";
 import { getKnowledgeService } from "./knowledge/knowledgeService.js";
 import type { HistoricalAnalysis } from "@quoteops/contracts";
 import type { HistoricalContext, QuoteCoreInput, QuoteManifest } from "@quoteops/quote-core";
@@ -149,6 +149,47 @@ export function createApplianceWorkflowTools(
         } catch (error) {
           throw new Error(
             `OpenRouter guide failed: ${error instanceof Error ? error.message : String(error)}`
+          );
+        }
+      }
+
+      if (config.model.provider === "openai") {
+        const apiKeyEnv = config.model.api_key_env;
+        if (!apiKeyEnv || !env[apiKeyEnv]) {
+          throw new Error(`Agent model API key env is missing: ${apiKeyEnv ?? "api_key_env"}`);
+        }
+
+        try {
+          const model = createChatModel(
+            {
+              provider: "openai",
+              model_name: config.model.model_name,
+              api_key_env: apiKeyEnv,
+              base_url: config.model.base_url
+            },
+            env
+          );
+          const response = await model.invoke([
+            {
+              role: "system",
+              content:
+                "You are a pricing guide for a logistics quoting appliance. Explain risks and context briefly. Never change the deterministic quote-core rate."
+            },
+            {
+              role: "user",
+              content: JSON.stringify({ base_rate_mxn, historical_context, criteria_context })
+            }
+          ]);
+          const text =
+            typeof response.content === "string" ? response.content : JSON.stringify(response.content);
+          const reason = text.trim().slice(0, 1200);
+          return {
+            recommended_rate_mxn: base_rate_mxn,
+            reason: reason || "Model returned no text; quote-core rate preserved."
+          };
+        } catch (error) {
+          throw new Error(
+            `Chat model guide failed: ${error instanceof Error ? error.message : String(error)}`
           );
         }
       }

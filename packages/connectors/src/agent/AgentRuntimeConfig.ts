@@ -78,6 +78,7 @@ export type AgentRuntimeConfig = {
     model_name: string;
     temperature: number;
     api_key_env?: string | null;
+    base_url?: string | null;
   };
   authorization: {
     approver_email: string | null;
@@ -149,7 +150,8 @@ export function defaultAgentRuntimeConfig(): AgentRuntimeConfig {
       provider: "deterministic",
       model_name: "quote-core-preserver",
       temperature: 0,
-      api_key_env: null
+      api_key_env: null,
+      base_url: null
     },
     authorization: {
       approver_email: null,
@@ -229,7 +231,10 @@ function normalizeAgentRuntimeConfig(value: unknown): AgentRuntimeConfig {
         : defaults.model.temperature,
       api_key_env: hasOwn(model, "api_key_env")
         ? parseOptionalEnvName(model.api_key_env, "Agent runtime config model.api_key_env")
-        : defaults.model.api_key_env
+        : defaults.model.api_key_env,
+      base_url: hasOwn(model, "base_url")
+        ? parseOptionalUrl(model.base_url, "Agent runtime config model.base_url")
+        : defaults.model.base_url
     },
     authorization: {
       approver_email: hasOwn(authorization, "approver_email")
@@ -328,6 +333,21 @@ function parseOptionalEnvName(value: unknown, label: string): string | null {
   }
   if (typeof value === "string" && value.trim()) {
     return value;
+  }
+  throw new Error(`${label} must be a non-empty string or null`);
+}
+
+function parseOptionalUrl(value: unknown, label: string): string | null {
+  if (value === null) {
+    return null;
+  }
+  if (typeof value === "string" && value.trim()) {
+    try {
+      new URL(value);
+      return value;
+    } catch {
+      throw new Error(`${label} must be a valid URL`);
+    }
   }
   throw new Error(`${label} must be a non-empty string or null`);
 }
