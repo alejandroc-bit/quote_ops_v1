@@ -71,7 +71,10 @@ export function createResendReplyChannel({
   fetch?: typeof fetch;
 }): Channel {
   const apiKey = requiredEnv(env.RESEND_API_KEY, "RESEND_API_KEY");
-  const from = requiredEnv(env.MAILBOX_USER, "MAILBOX_USER");
+  // MAILBOX_FROM lets the verified sender differ from the intake address
+  // (e.g. intake on the managed <id>.resend.app domain, replies from the
+  // client's verified domain).
+  const from = env.MAILBOX_FROM?.trim() || requiredEnv(env.MAILBOX_USER, "MAILBOX_USER");
   const baseUrl = env.RESEND_BASE_URL?.trim() || "https://api.resend.com";
 
   return {

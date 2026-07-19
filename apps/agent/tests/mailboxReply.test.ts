@@ -122,6 +122,23 @@ describe("provider-native mailbox reply channel", () => {
     expect(headers.authorization).toBe("Bearer re_test_key");
   });
 
+  it("prefers MAILBOX_FROM over MAILBOX_USER as the Resend sender", async () => {
+    const posts: Array<{ init: RequestInit }> = [];
+    const channel = createResendReplyChannel({
+      env: {
+        RESEND_API_KEY: "re_test_key",
+        MAILBOX_USER: "rfq@abc123.resend.app",
+        MAILBOX_FROM: "cotizaciones@inducta.io"
+      },
+      fetch: (async (_input: RequestInfo | URL, init?: RequestInit) => {
+        posts.push({ init: init ?? {} });
+        return new Response(JSON.stringify({ id: "sent-2" }), { status: 200 });
+      }) as typeof fetch
+    });
+    await channel.send({ to: "buyer@example.com", subject: "Q", body_md: "x" });
+    expect(JSON.parse(String(posts[0]!.init.body)).from).toBe("cotizaciones@inducta.io");
+  });
+
   it("fails loudly when the Resend API rejects the send", async () => {
     const channel = createResendReplyChannel({
       env: { RESEND_API_KEY: "re_test_key", MAILBOX_USER: "cotizaciones@resaux.io" },
