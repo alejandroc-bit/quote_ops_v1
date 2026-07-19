@@ -83,6 +83,34 @@ describe("provider-native mailbox reply channel", () => {
     ]);
   });
 
+  it("routes replies through a relay override (Resend) while the inbox stays on Gmail OAuth", async () => {
+    const sent: unknown[] = [];
+    const channel = createMailboxReplyChannel({
+      config: { ...gmail, auth: "oauth2" },
+      env: {
+        MAILBOX_USER: "cotizaciones@resaux.io",
+        MAILBOX_OAUTH_CLIENT_ID: "id",
+        MAILBOX_OAUTH_CLIENT_SECRET: "secret",
+        MAILBOX_OAUTH_REFRESH_TOKEN: "refresh",
+        MAILBOX_SMTP_HOST: "smtp.resend.com",
+        MAILBOX_SMTP_PORT: "465",
+        MAILBOX_SMTP_USER: "resend",
+        MAILBOX_SMTP_PASSWORD: "re_api_key"
+      },
+      sendSmtp: async (input) => { sent.push(input); }
+    });
+
+    await channel.send({ to: "buyer@example.com", subject: "Quote", body_md: "Hola" });
+
+    expect(sent).toEqual([
+      expect.objectContaining({
+        connection: { host: "smtp.resend.com", port: 465, secure: true, startTls: false },
+        auth: { type: "password", user: "resend", password: "re_api_key" },
+        envelope: { from: "cotizaciones@resaux.io", to: "buyer@example.com" }
+      })
+    ]);
+  });
+
   it("fails explicitly for custom IMAP when SMTP settings are absent", () => {
     expect(() =>
       createMailboxReplyChannel({

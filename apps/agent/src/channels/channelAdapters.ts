@@ -28,11 +28,16 @@ export function createMailboxReplyChannel({
 }): Channel {
   const connection = smtpConnection(config, env);
   const user = requiredEnv(env.MAILBOX_USER, "MAILBOX_USER");
+  // Optional relay override (e.g. Resend): inbound stays on the client's
+  // Gmail/Outlook mailbox while replies go out through a separate SMTP login.
+  const smtpUser = env.MAILBOX_SMTP_USER?.trim() || user;
+  const smtpPassword = env.MAILBOX_SMTP_PASSWORD?.trim() || null;
 
   return {
     async send(input) {
-      const auth: SmtpSendInput["auth"] =
-        config.auth === "password"
+      const auth: SmtpSendInput["auth"] = smtpPassword
+        ? { type: "password", user: smtpUser, password: smtpPassword }
+        : config.auth === "password"
           ? {
               type: "password",
               user,
@@ -159,17 +164,19 @@ function smtpConnection(
   config: AgentMailboxConfig,
   env: NodeJS.ProcessEnv
 ): SmtpSendInput["connection"] {
+  const overrideHost = env.MAILBOX_SMTP_HOST?.trim();
+  if (overrideHost) {
+    const port = positivePort(env.MAILBOX_SMTP_PORT) ?? 587;
+    const secure = parseBoolean(env.MAILBOX_SMTP_SECURE, port === 465);
+    return { host: overrideHost, port, secure, startTls: !secure };
+  }
   if (config.provider === "gmail") {
     return { host: "smtp.gmail.com", port: 465, secure: true, startTls: false };
   }
   if (config.provider === "outlook") {
     return { host: "smtp.office365.com", port: 587, secure: false, startTls: true };
   }
-  const host = env.MAILBOX_SMTP_HOST?.trim();
-  if (!host) throw new Error("mailbox_smtp_unsupported:MAILBOX_SMTP_HOST is required for custom IMAP");
-  const port = positivePort(env.MAILBOX_SMTP_PORT) ?? 587;
-  const secure = parseBoolean(env.MAILBOX_SMTP_SECURE, port === 465);
-  return { host, port, secure, startTls: !secure };
+  throw new Error("mailbox_smtp_unsupported:MAILBOX_SMTP_HOST is required for custom IMAP");
 }
 
 function connectSmtp(connection: SmtpSendInput["connection"]): Promise<SmtpConnection> {
