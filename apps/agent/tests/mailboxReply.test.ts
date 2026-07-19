@@ -3,6 +3,7 @@ import type { AgentMailboxConfig } from "@quoteops/connectors";
 import {
   buildMimeMessage,
   createMailboxReplyChannel,
+  createResendReplyChannel,
   sendSmtpMessage,
   SmtpResponseQueue,
   type SmtpConnection,
@@ -81,6 +82,55 @@ describe("provider-native mailbox reply channel", () => {
         auth: { type: "oauth2", user: "quotes@example.com", accessToken: "oauth-access" }
       })
     ]);
+  });
+
+  it("sends via the Resend HTTP API with base64 attachments and threaded headers", async () => {
+    const posts: Array<{ url: string; init: RequestInit }> = [];
+    const channel = createResendReplyChannel({
+      env: { RESEND_API_KEY: "re_test_key", MAILBOX_USER: "cotizaciones@resaux.io" },
+      fetch: (async (input: RequestInfo | URL, init?: RequestInit) => {
+        posts.push({ url: String(input), init: init ?? {} });
+        return new Response(JSON.stringify({ id: "sent-1" }), { status: 200 });
+      }) as typeof fetch
+    });
+
+    await channel.send({
+      to: "buyer@example.com",
+      subject: "Cotización",
+      body_md: "Tarifa: $18,669.44 MXN",
+      reply_to: { message_id: "<abc@cliente.mx>", references: ["<root@cliente.mx>"] },
+      attachments: [{ filename: "quote.pdf", content: Buffer.from("PDF"), content_type: "application/pdf" }]
+    });
+
+    expect(posts).toHaveLength(1);
+    expect(posts[0]!.url).toBe("https://api.resend.com/emails");
+    const body = JSON.parse(String(posts[0]!.init.body));
+    expect(body).toMatchObject({
+      from: "cotizaciones@resaux.io",
+      to: ["buyer@example.com"],
+      subject: "Cotización",
+      text: "Tarifa: $18,669.44 MXN",
+      headers: {
+        "In-Reply-To": "<abc@cliente.mx>",
+        References: "<root@cliente.mx> <abc@cliente.mx>"
+      }
+    });
+    expect(body.attachments).toEqual([
+      { filename: "quote.pdf", content: Buffer.from("PDF").toString("base64"), content_type: "application/pdf" }
+    ]);
+    const headers = posts[0]!.init.headers as Record<string, string>;
+    expect(headers.authorization).toBe("Bearer re_test_key");
+  });
+
+  it("fails loudly when the Resend API rejects the send", async () => {
+    const channel = createResendReplyChannel({
+      env: { RESEND_API_KEY: "re_test_key", MAILBOX_USER: "cotizaciones@resaux.io" },
+      fetch: (async () =>
+        new Response(JSON.stringify({ message: "domain not verified" }), { status: 403 })) as typeof fetch
+    });
+    await expect(
+      channel.send({ to: "buyer@example.com", subject: "Q", body_md: "x" })
+    ).rejects.toThrow(/Resend send failed: HTTP 403/);
   });
 
   it("routes replies through a relay override (Resend) while the inbox stays on Gmail OAuth", async () => {

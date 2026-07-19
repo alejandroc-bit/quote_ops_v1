@@ -16,7 +16,7 @@ export type AgentToolPolicy = {
   mode: AgentToolMode;
 };
 
-export type AgentMailboxProvider = "gmail" | "outlook" | "imap";
+export type AgentMailboxProvider = "gmail" | "outlook" | "imap" | "resend";
 export type AgentMailboxAuthType = "oauth2" | "password";
 
 /**
@@ -36,7 +36,7 @@ export type AgentMailboxConfig = {
 
 export const agentMailboxConfigSchema = z
   .object({
-    provider: z.enum(["gmail", "outlook", "imap"]).default("gmail"),
+    provider: z.enum(["gmail", "outlook", "imap", "resend"]).default("gmail"),
     auth: z.enum(["oauth2", "password"]).default("oauth2"),
     processed_mailbox: z.string().min(1).nullable().default(null),
     poll_interval_ms: z.number().int().positive().default(60_000),

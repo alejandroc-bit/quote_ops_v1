@@ -1,6 +1,7 @@
 import {
   ConsoleWhatsAppChannel,
   createMailboxReplyChannel,
+  createResendReplyChannel,
   createChatModel,
   createQuoteAgentRuntime,
   startMailboxIntake,
@@ -68,7 +69,10 @@ async function createRuntime(): Promise<QuoteAgentRuntime | null> {
     ),
     store,
     channels: {
-      email: createMailboxReplyChannel({ config: config.mailbox, env: process.env }),
+      email:
+        config.mailbox.provider === "resend"
+          ? createResendReplyChannel({ env: process.env })
+          : createMailboxReplyChannel({ config: config.mailbox, env: process.env }),
       whatsapp: new ConsoleWhatsAppChannel()
     },
     env: process.env

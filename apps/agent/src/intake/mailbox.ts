@@ -25,7 +25,8 @@ const PROVIDER_PRESETS: Record<
 > = {
   gmail: { host: "imap.gmail.com", port: 993 },
   outlook: { host: "outlook.office365.com", port: 993 },
-  imap: null
+  imap: null,
+  resend: null
 };
 
 export function mailboxCredentialsPresent(
@@ -33,6 +34,7 @@ export function mailboxCredentialsPresent(
   env: NodeJS.ProcessEnv
 ): boolean {
   if (!optional(env.MAILBOX_USER)) return false;
+  if (config.provider === "resend") return Boolean(optional(env.RESEND_API_KEY));
   if (config.auth === "password") return Boolean(optional(env.MAILBOX_PASSWORD));
   return (
     Boolean(optional(env.MAILBOX_OAUTH_CLIENT_ID)) &&
@@ -56,6 +58,17 @@ export async function openConfiguredMailbox({
   fetch?: typeof fetch;
 }): Promise<MailboxSource> {
   const user = required(env.MAILBOX_USER, "MAILBOX_USER");
+  if (config.provider === "resend") {
+    const { ResendMailbox } = await import("./resendMailbox.js");
+    return new ResendMailbox({
+      apiKey: required(env.RESEND_API_KEY, "RESEND_API_KEY"),
+      statePath:
+        optional(env.QUOTEOPS_RESEND_STATE_PATH) ??
+        `${optional(env.QUOTEOPS_CONNECTORS_DIR) ?? "."}/resend/processed.json`,
+      intakeAddress: user,
+      fetch: fetchFn
+    });
+  }
   const preset = PROVIDER_PRESETS[config.provider];
   const host = preset?.host ?? required(env.MAILBOX_IMAP_HOST ?? config.imap_host, "MAILBOX_IMAP_HOST");
   const port = preset?.port ?? Number(env.MAILBOX_IMAP_PORT ?? config.imap_port ?? 993);

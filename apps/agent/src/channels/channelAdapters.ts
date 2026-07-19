@@ -58,6 +58,60 @@ export function createMailboxReplyChannel({
   };
 }
 
+/**
+ * Replies through the Resend send API instead of SMTP — pairs with the
+ * `resend` mailbox provider so a client can run intake and outbound entirely
+ * on a domain they registered in Resend. From address = MAILBOX_USER.
+ */
+export function createResendReplyChannel({
+  env,
+  fetch: fetchImpl = fetch
+}: {
+  env: NodeJS.ProcessEnv;
+  fetch?: typeof fetch;
+}): Channel {
+  const apiKey = requiredEnv(env.RESEND_API_KEY, "RESEND_API_KEY");
+  const from = requiredEnv(env.MAILBOX_USER, "MAILBOX_USER");
+  const baseUrl = env.RESEND_BASE_URL?.trim() || "https://api.resend.com";
+
+  return {
+    async send(input) {
+      const headers: Record<string, string> = {};
+      if (input.reply_to) {
+        const messageId = safeHeader(input.reply_to.message_id);
+        if (messageId) {
+          headers["In-Reply-To"] = messageId;
+          const references = [...input.reply_to.references.map(safeHeader), messageId]
+            .filter(Boolean)
+            .filter((value, index, values) => values.indexOf(value) === index);
+          headers["References"] = references.join(" ");
+        }
+      }
+      const attachments = (input.attachments ?? []).map((attachment) => ({
+        filename: attachment.filename,
+        content: attachment.content.toString("base64"),
+        ...(attachment.content_type ? { content_type: attachment.content_type } : {})
+      }));
+      const response = await fetchImpl(`${baseUrl}/emails`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${apiKey}`, "content-type": "application/json" },
+        body: JSON.stringify({
+          from,
+          to: [input.to],
+          subject: input.subject ?? "Cotización",
+          text: input.body_md,
+          ...(Object.keys(headers).length > 0 ? { headers } : {}),
+          ...(attachments.length > 0 ? { attachments } : {})
+        })
+      });
+      if (!response.ok) {
+        const raw = await response.text();
+        throw new Error(`Resend send failed: HTTP ${response.status}: ${raw.slice(0, 200)}`);
+      }
+    }
+  };
+}
+
 export class ConsoleWhatsAppChannel implements Channel {
   async send(input: Parameters<Channel["send"]>[0]): Promise<void> {
     console.log(`[whatsapp-stub] to=${input.to} body=${input.body_md}`);
