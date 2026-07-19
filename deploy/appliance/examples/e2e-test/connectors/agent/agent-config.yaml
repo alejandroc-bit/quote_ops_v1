@@ -1,0 +1,29 @@
+model:
+  provider: openai
+  model_name: meta/llama-3.1-70b-instruct
+  temperature: 0
+  api_key_env: NVIDIA_NIM_API_KEY
+  base_url: https://integrate.api.nvidia.com/v1
+authorization:
+  approver_email: alejandro.c+e2etest@loadlink.mx
+  allowed_domains:
+    - e2etest.mx
+  tools:
+    route.resolve:
+      effect: read
+      mode: allowed
+    tms.searchHistorical:
+      effect: read
+      mode: allowed
+    tms.writeQuoteResult:
+      effect: write
+      mode: allowed
+    email.sendQuote:
+      effect: send
+      mode: approval_required
+    approval.decide:
+      effect: approve
+      mode: approval_required
+mailbox:
+  provider: gmail
+  auth: oauth2

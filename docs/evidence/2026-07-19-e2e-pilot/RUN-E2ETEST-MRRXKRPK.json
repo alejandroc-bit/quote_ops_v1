@@ -1,0 +1,757 @@
+{
+  "run_id": "RUN-E2ETEST-MRRXKRPK",
+  "raw_rfq": {
+    "raw": {
+      "body": "Solicitar caja seca 53 de Guadalajara, Jalisco a Monterrey, Nuevo Leon.",
+      "subject": "Playground RFQ Guadalajara to Monterrey",
+      "attachments": []
+    },
+    "parsed": {
+      "lanes": [
+        {
+          "cargo": {
+            "hazmat": false,
+            "sector": "industrial",
+            "commodity": "carga general",
+            "value_mxn": 400000,
+            "weight_kg": 18000,
+            "commodity_category": "general",
+            "temperature_controlled": false
+          },
+          "origin": {
+            "city": "Guadalajara",
+            "state": "Jalisco",
+            "country": "MX"
+          },
+          "lane_id": "RFQ-2026-716296-L01",
+          "service": {
+            "route_policy": "cuota",
+            "return_policy": "sin_retorno",
+            "requested_pickup_at": null
+          },
+          "commercial": {
+            "customer_id": "E2E-CUST-DEMO",
+            "customer_type": "industrial",
+            "target_rate_mxn": null,
+            "business_unit_id": "DV_53_FT"
+          },
+          "confidence": {
+            "overall": 0.92,
+            "missing_fields": [],
+            "review_reasons": []
+          },
+          "destination": {
+            "city": "Monterrey",
+            "state": "Nuevo Leon",
+            "country": "MX"
+          },
+          "equipment_request": "caja seca 53",
+          "vehicle_profile_id": "T3S3_53_DRYVAN"
+        }
+      ]
+    },
+    "rfq_id": "RFQ-2026-716296",
+    "source": "manual",
+    "requester": {
+      "name": "Compras E2E Test",
+      "email": "compras@e2etest.mx",
+      "company_alias": "E2E Test Corp"
+    },
+    "received_at": "2026-07-19T15:08:36.296Z"
+  },
+  "manifest": {
+    "client_id": "E2ETEST",
+    "route_policy": {
+      "sakbe_required": true
+    },
+    "business_units": [
+      {
+        "default": true,
+        "keywords": [
+          "caja seca",
+          "dry van"
+        ],
+        "business_unit_id": "DV_53_FT",
+        "requester_email_domains": [
+          "e2etest.mx"
+        ]
+      }
+    ],
+    "vehicle_profiles": [
+      {
+        "keywords": [
+          "full",
+          "53"
+        ],
+        "pricing_model": "profitability",
+        "insurance_rate": 0.003,
+        "business_unit_id": "DV_53_FT",
+        "tires_per_km_mxn": 2.01,
+        "insurance_min_mxn": 1200,
+        "margin_target_pct": 0.2,
+        "minimum_margin_pct": 0.12,
+        "vehicle_profile_id": "T3S3_53_DRYVAN",
+        "fuel_empty_km_per_l": 3.2,
+        "payload_capacity_kg": 29000,
+        "fuel_loaded_km_per_l": 2.8,
+        "maintenance_per_km_mxn": 3.6,
+        "profitability_rb_table": [
+          {
+            "max_km": 100,
+            "rb_pct": 0.6
+          },
+          {
+            "max_km": 500,
+            "rb_pct": 0.6
+          },
+          {
+            "max_km": 1000,
+            "rb_pct": 0.57
+          },
+          {
+            "max_km": 2000,
+            "rb_pct": 0.55
+          },
+          {
+            "max_km": 3000,
+            "rb_pct": 0.52
+          },
+          {
+            "max_km": null,
+            "rb_pct": 0.5
+          }
+        ],
+        "depreciation_per_km_mxn": 3.1792,
+        "operator_cost_per_km_mxn": 2.75,
+        "fixed_overhead_per_km_mxn": 3.625,
+        "diesel_price_mxn_per_liter": 29
+      }
+    ]
+  },
+  "client_id": "E2ETEST",
+  "base_quote": {
+    "rb_pct": 0.57,
+    "status": "APPROVED",
+    "profile": {
+      "profile_id": "E2ETEST:DV_53_FT:T3S3_53_DRYVAN",
+      "business_unit_id": "DV_53_FT",
+      "vehicle_profile_id": "T3S3_53_DRYVAN"
+    },
+    "quote_id": "quote-v2-RFQ-2026-716296-L01",
+    "route_source": "sakbe",
+    "base_rate_mxn": 18669.44,
+    "pricing_model": "profitability",
+    "review_reasons": [],
+    "direct_cost_mxn": 8027.86,
+    "margin_real_pct": 0.57,
+    "rb_base_cost_mxn": 8027.86,
+    "historical_context": null,
+    "quote_core_version": "quote-core-2.0.0"
+  },
+  "batch_queue": [
+    {
+      "lane": {
+        "cargo": {
+          "hazmat": false,
+          "sector": "industrial",
+          "commodity": "carga general",
+          "value_mxn": 400000,
+          "weight_kg": 18000,
+          "commodity_category": "general"
+        },
+        "origin": {
+          "city": "Guadalajara",
+          "state": "Jalisco",
+          "country": "MX"
+        },
+        "rfq_id": "RFQ-2026-716296",
+        "lane_id": "RFQ-2026-716296-L01",
+        "service": {
+          "route_policy": "cuota",
+          "return_policy": "sin_retorno"
+        },
+        "client_id": "e2e test corp",
+        "commercial": {
+          "target_rate_mxn": null
+        },
+        "destination": {
+          "city": "Monterrey",
+          "state": "Nuevo Leon",
+          "country": "MX"
+        },
+        "requester_email": "compras@e2etest.mx",
+        "business_unit_id": "DV_53_FT",
+        "vehicle_profile_id": "T3S3_53_DRYVAN"
+      },
+      "lane_id": "RFQ-2026-716296-L01",
+      "sequence": 1,
+      "child_rfq_id": "RFQ-2026-716296-L01"
+    }
+  ],
+  "email_draft": {
+    "body": "Tarifa recomendada: $18669 MXN.",
+    "subject": "1 cotizacion QuoteOps"
+  },
+  "node_status": {
+    "audit": "completed",
+    "quoteCore": "completed",
+    "writeback": "completed",
+    "commsAgent": "completed",
+    "normalizer": "completed",
+    "approvalGate": "completed",
+    "batchSplitter": "completed",
+    "intakePlanner": "completed",
+    "routeEvidence": "completed",
+    "tmsHistorical": "completed",
+    "profileResolver": "completed",
+    "criteriaRetriever": "completed",
+    "historicalAnalyst": "completed",
+    "pricingRecommendation": "completed"
+  },
+  "audit_events": [
+    {
+      "run_id": "RUN-E2ETEST-MRRXKRPK",
+      "node_id": "intakePlanner",
+      "payload": {
+        "lanes": 1,
+        "rfq_id": "RFQ-2026-716296"
+      },
+      "event_id": "evt_02dcf418-8f7f-47b6-bf51-8649fa1e4911",
+      "event_type": "completed",
+      "occurred_at": "2026-07-19T15:08:36.305Z",
+      "payload_hash": "6106e1b060698d4680ff4378cd6c160b82849a6ee0e3abd772e61907cb89466b",
+      "audit_version": "audit-v2.0.0"
+    },
+    {
+      "run_id": "RUN-E2ETEST-MRRXKRPK",
+      "node_id": "normalizer",
+      "payload": {
+        "rfq_id": "RFQ-2026-716296"
+      },
+      "event_id": "evt_5dc04c8b-88eb-4940-9e7f-d31aefaa1320",
+      "event_type": "completed",
+      "occurred_at": "2026-07-19T15:08:36.313Z",
+      "payload_hash": "8500594acab23fd520da2b95a4cb41d6463bae43c3685430128235f47ac7e6c1",
+      "audit_version": "audit-v2.0.0"
+    },
+    {
+      "run_id": "RUN-E2ETEST-MRRXKRPK",
+      "node_id": "profileResolver",
+      "payload": {
+        "manifest_version": "manifest-local"
+      },
+      "event_id": "evt_fca70bac-3632-44cb-87cf-18adabb767b0",
+      "event_type": "completed",
+      "occurred_at": "2026-07-19T15:08:36.313Z",
+      "payload_hash": "193cdd34c5c91434c1bd0e389361b9553c252f005cc6fb107935fff24660d7b6",
+      "audit_version": "audit-v2.0.0"
+    },
+    {
+      "run_id": "RUN-E2ETEST-MRRXKRPK",
+      "node_id": "batchSplitter",
+      "payload": {
+        "children": 1
+      },
+      "event_id": "evt_e9fdee8f-b7c2-47cc-b39d-9864413c8baa",
+      "event_type": "completed",
+      "occurred_at": "2026-07-19T15:08:36.313Z",
+      "payload_hash": "97bb9bee5fff9dc4a69f56b46b06dbd2a56bcb9d0380cccaae2ffccfe5bf730a",
+      "audit_version": "audit-v2.0.0"
+    },
+    {
+      "run_id": "RUN-E2ETEST-MRRXKRPK",
+      "node_id": "routeEvidence",
+      "payload": {
+        "source": "sakbe",
+        "status": "resolved"
+      },
+      "event_id": "evt_4d78badc-c6ca-44b4-afc5-aaabef6e4ba0",
+      "event_type": "completed",
+      "occurred_at": "2026-07-19T15:08:36.428Z",
+      "payload_hash": "92701396875ac2a5ebe3011e90ae65466e0a3eeaabfcd0cae6922e363498c600",
+      "audit_version": "audit-v2.0.0"
+    },
+    {
+      "run_id": "RUN-E2ETEST-MRRXKRPK",
+      "node_id": "quoteCore",
+      "payload": {
+        "status": "APPROVED",
+        "review_reasons": []
+      },
+      "event_id": "evt_f9e28858-6385-4dea-9459-24ef1265d85d",
+      "event_type": "completed",
+      "occurred_at": "2026-07-19T15:08:36.428Z",
+      "payload_hash": "31b4680d6ed01bdffa5581d97f498854d2e762285cbd2b8f6f102da7c4d01d59",
+      "audit_version": "audit-v2.0.0"
+    },
+    {
+      "run_id": "RUN-E2ETEST-MRRXKRPK",
+      "node_id": "tmsHistorical",
+      "payload": {
+        "selected_layer": "route_unit_cost"
+      },
+      "event_id": "evt_515e40f2-13d3-4481-942f-472663c0869e",
+      "event_type": "completed",
+      "occurred_at": "2026-07-19T15:08:36.434Z",
+      "payload_hash": "512b102d7eec51a1b3ebff9d5a27f1d7a3931c79934e68974286cac22b5bbcb0",
+      "audit_version": "audit-v2.0.0"
+    },
+    {
+      "run_id": "RUN-E2ETEST-MRRXKRPK",
+      "node_id": "criteriaRetriever",
+      "payload": {
+        "criteria_count": 0,
+        "knowledge_hits": 0
+      },
+      "event_id": "evt_7a0cf4d7-0da1-4794-801e-c1cc5a4c94b5",
+      "event_type": "completed",
+      "occurred_at": "2026-07-19T15:08:36.434Z",
+      "payload_hash": "25dc96757c190b25d786fcc78d3ad61684efc5ee8d99b0e25d50b2356ee9f71d",
+      "audit_version": "audit-v2.0.0"
+    },
+    {
+      "run_id": "RUN-E2ETEST-MRRXKRPK",
+      "node_id": "historicalAnalyst",
+      "payload": {
+        "has_historical_context": true
+      },
+      "event_id": "evt_91a6a620-1b01-4340-88f9-e96493dab4b1",
+      "event_type": "completed",
+      "occurred_at": "2026-07-19T15:08:36.434Z",
+      "payload_hash": "0ea8d10b4baf57f70b22a64c0b4037edc3e1a407e46035976cff4c0b3a49434d",
+      "audit_version": "audit-v2.0.0"
+    },
+    {
+      "run_id": "RUN-E2ETEST-MRRXKRPK",
+      "node_id": "pricingRecommendation",
+      "payload": {
+        "policy": "quote_core_rate_preserved",
+        "recommended_rate_mxn": 18669.44,
+        "model_suggested_rate_mxn": 18669.44
+      },
+      "event_id": "evt_c1016e1d-d067-402c-b16e-233f568f1326",
+      "event_type": "completed",
+      "occurred_at": "2026-07-19T15:10:29.447Z",
+      "payload_hash": "63bf8998e2e9dfe5142c8af0af903fa6b71184a610311225ba95c7f29e30ab13",
+      "audit_version": "audit-v2.0.0"
+    },
+    {
+      "run_id": "RUN-E2ETEST-MRRXKRPK",
+      "node_id": "approvalGate",
+      "payload": {
+        "reasons": [],
+        "required": false
+      },
+      "event_id": "evt_b1226d18-3f7b-4a18-b41e-3172296b0d1b",
+      "event_type": "completed",
+      "occurred_at": "2026-07-19T15:10:29.448Z",
+      "payload_hash": "7ec3c17a3faa4b6c9f203dd89cbc824c793d07316d483e522d3f8f7c6ab4a28e",
+      "audit_version": "audit-v2.0.0"
+    },
+    {
+      "run_id": "RUN-E2ETEST-MRRXKRPK",
+      "node_id": "commsAgent",
+      "payload": {
+        "subject": "1 cotizacion QuoteOps"
+      },
+      "event_id": "evt_d81b43ca-ce4c-495c-82a5-f01195a66d70",
+      "event_type": "completed",
+      "occurred_at": "2026-07-19T15:10:29.449Z",
+      "payload_hash": "77daba3998f8a600384ff25a6583813461edf4f4b65f02bf2726338e9f212655",
+      "audit_version": "audit-v2.0.0"
+    },
+    {
+      "run_id": "RUN-E2ETEST-MRRXKRPK",
+      "node_id": "writeback",
+      "payload": {
+        "results": [
+          "queued"
+        ]
+      },
+      "event_id": "evt_79ce43a4-1475-4e61-b99d-0cab7b72fef6",
+      "event_type": "completed",
+      "occurred_at": "2026-07-19T15:10:29.458Z",
+      "payload_hash": "814d2dea7a2852ba55777c2761401ec3c41e35014cebe7495df66be8ddc47f2d",
+      "audit_version": "audit-v2.0.0"
+    },
+    {
+      "run_id": "RUN-E2ETEST-MRRXKRPK",
+      "node_id": "audit",
+      "payload": {
+        "node_count": 14,
+        "children_quoted": 1
+      },
+      "event_id": "evt_759418fe-0da5-4ecb-8b94-4709f506ba01",
+      "event_type": "completed",
+      "occurred_at": "2026-07-19T15:10:29.458Z",
+      "payload_hash": "967f3493c9f895a76eb076f68547de143fa02b31db040f9f64b4fc27748b8461",
+      "audit_version": "audit-v2.0.0"
+    }
+  ],
+  "child_results": [
+    {
+      "lane": {
+        "cargo": {
+          "hazmat": false,
+          "sector": "industrial",
+          "commodity": "carga general",
+          "value_mxn": 400000,
+          "weight_kg": 18000,
+          "commodity_category": "general"
+        },
+        "origin": {
+          "city": "Guadalajara",
+          "state": "Jalisco",
+          "country": "MX"
+        },
+        "rfq_id": "RFQ-2026-716296",
+        "lane_id": "RFQ-2026-716296-L01",
+        "service": {
+          "route_policy": "cuota",
+          "return_policy": "sin_retorno"
+        },
+        "client_id": "e2e test corp",
+        "commercial": {
+          "target_rate_mxn": null
+        },
+        "destination": {
+          "city": "Monterrey",
+          "state": "Nuevo Leon",
+          "country": "MX"
+        },
+        "requester_email": "compras@e2etest.mx",
+        "business_unit_id": "DV_53_FT",
+        "vehicle_profile_id": "T3S3_53_DRYVAN"
+      },
+      "lane_id": "RFQ-2026-716296-L01",
+      "base_quote": {
+        "rb_pct": 0.57,
+        "status": "APPROVED",
+        "profile": {
+          "profile_id": "E2ETEST:DV_53_FT:T3S3_53_DRYVAN",
+          "business_unit_id": "DV_53_FT",
+          "vehicle_profile_id": "T3S3_53_DRYVAN"
+        },
+        "quote_id": "quote-v2-RFQ-2026-716296-L01",
+        "route_source": "sakbe",
+        "base_rate_mxn": 18669.44,
+        "pricing_model": "profitability",
+        "review_reasons": [],
+        "direct_cost_mxn": 8027.86,
+        "margin_real_pct": 0.57,
+        "rb_base_cost_mxn": 8027.86,
+        "historical_context": null,
+        "quote_core_version": "quote-core-2.0.0"
+      },
+      "child_rfq_id": "RFQ-2026-716296-L01",
+      "recommendation": {
+        "reason": "**Pricing Guide for Logistics Quoting Appliance**\n\n**Context:**\nThe provided data is a historical context for a logistics quoting appliance, which includes a base rate and various comparable layers such as route unit cost, commodity category, sector, weight band, and service type. The data is based on a time window from 2025-07-19 to 2026-07-19.\n\n**Risks:**\nThe risks associated with this quote include:\n\n1. **Market Volatility:** The logistics market can be volatile, and rates may fluctuate rapidly due to changes in demand, supply, or other market conditions.\n2. **Insufficient Data:** The data provided may not be comprehensive or up-to-date, which could lead to inaccurate quotes or missed opportunities.\n3. **Commodity and Sector Risks:** The commodity category and sector may be subject to specific risks, such as changes in regulations, weather events, or global economic trends.\n4. **Weight Band and Service Type Risks:** The weight band and service type may also be subject to specific risks, such as changes in fuel prices, traffic congestion, or labor disputes.\n\n**Quote:**\nBased on the provided data, the deterministic quote-core rate is:\n\n* **Base Rate (MXN):** 18,669.44\n\nThis rate i",
+        "status": "completed",
+        "recommended_rate_mxn": 18669.44
+      },
+      "route_evidence": {
+        "source": "sakbe",
+        "status": "resolved",
+        "km_loaded": 540,
+        "tolls_mxn": 950,
+        "estimated_minutes": 400,
+        "requires_return_route": false
+      },
+      "criteria_context": {
+        "nodes": [],
+        "client_id": "E2ETEST",
+        "retrieved_for": "pricing_recommendation",
+        "knowledge_hits": [],
+        "criteria_version": "criteria-local"
+      },
+      "historical_context": {
+        "comparables": [
+          {
+            "count": 5,
+            "layer": "route_unit_cost",
+            "max_rate_mxn": 21400,
+            "min_rate_mxn": 18100,
+            "p25_rate_mxn": 19200,
+            "p75_rate_mxn": 20600,
+            "match_quality": "exact_route_exact_unit",
+            "avg_margin_pct": 0.57,
+            "median_rate_mxn": 19850,
+            "avg_direct_cost_mxn": 8526.9
+          },
+          {
+            "count": 5,
+            "layer": "commodity_category",
+            "sector": "industrial",
+            "max_rate_mxn": 21400,
+            "min_rate_mxn": 18100,
+            "p25_rate_mxn": 19200,
+            "p75_rate_mxn": 20600,
+            "match_quality": "same_commodity_sector_same_unit",
+            "avg_margin_pct": 0.57,
+            "median_rate_mxn": 19850,
+            "commodity_category": "general",
+            "avg_direct_cost_mxn": 8526.9
+          },
+          {
+            "count": 5,
+            "layer": "sector",
+            "sector": "industrial",
+            "max_rate_mxn": 21400,
+            "min_rate_mxn": 18100,
+            "p25_rate_mxn": 19200,
+            "p75_rate_mxn": 20600,
+            "match_quality": "same_sector_same_unit",
+            "avg_margin_pct": 0.57,
+            "median_rate_mxn": 19850,
+            "avg_direct_cost_mxn": 8526.9
+          },
+          {
+            "count": 5,
+            "layer": "weight_band",
+            "weight_band": "15t_20t",
+            "max_rate_mxn": 21400,
+            "min_rate_mxn": 18100,
+            "p25_rate_mxn": 19200,
+            "p75_rate_mxn": 20600,
+            "match_quality": "same_weight_band_same_unit",
+            "avg_margin_pct": 0.57,
+            "median_rate_mxn": 19850,
+            "avg_direct_cost_mxn": 8526.9
+          },
+          {
+            "count": 5,
+            "layer": "service_type",
+            "max_rate_mxn": 21400,
+            "min_rate_mxn": 18100,
+            "p25_rate_mxn": 19200,
+            "p75_rate_mxn": 20600,
+            "match_quality": "same_service_type_same_unit",
+            "avg_margin_pct": 0.57,
+            "median_rate_mxn": 19850,
+            "avg_direct_cost_mxn": 8526.9
+          }
+        ],
+        "time_window": {
+          "to": "2026-07-19",
+          "from": "2025-07-19"
+        },
+        "max_rate_mxn": 21400,
+        "selected_layer": "route_unit_cost",
+        "median_rate_mxn": 19850,
+        "insufficient_data": []
+      }
+    }
+  ],
+  "approval_state": {
+    "reasons": [],
+    "required": false
+  },
+  "criteria_nodes": [],
+  "normalized_rfq": {
+    "raw": {
+      "body": "Solicitar caja seca 53 de Guadalajara, Jalisco a Monterrey, Nuevo Leon.",
+      "subject": "Playground RFQ Guadalajara to Monterrey",
+      "attachments": []
+    },
+    "parsed": {
+      "lanes": [
+        {
+          "cargo": {
+            "hazmat": false,
+            "sector": "industrial",
+            "commodity": "carga general",
+            "value_mxn": 400000,
+            "weight_kg": 18000,
+            "commodity_category": "general",
+            "temperature_controlled": false
+          },
+          "origin": {
+            "city": "Guadalajara",
+            "state": "Jalisco",
+            "country": "MX"
+          },
+          "lane_id": "RFQ-2026-716296-L01",
+          "service": {
+            "route_policy": "cuota",
+            "return_policy": "sin_retorno",
+            "requested_pickup_at": null
+          },
+          "commercial": {
+            "customer_id": "E2E-CUST-DEMO",
+            "customer_type": "industrial",
+            "target_rate_mxn": null,
+            "business_unit_id": "DV_53_FT"
+          },
+          "confidence": {
+            "overall": 0.92,
+            "missing_fields": [],
+            "review_reasons": []
+          },
+          "destination": {
+            "city": "Monterrey",
+            "state": "Nuevo Leon",
+            "country": "MX"
+          },
+          "equipment_request": "caja seca 53",
+          "vehicle_profile_id": "T3S3_53_DRYVAN"
+        }
+      ]
+    },
+    "rfq_id": "RFQ-2026-716296",
+    "source": "manual",
+    "requester": {
+      "name": "Compras E2E Test",
+      "email": "compras@e2etest.mx",
+      "company_alias": "E2E Test Corp"
+    },
+    "received_at": "2026-07-19T15:08:36.296Z"
+  },
+  "recommendation": {
+    "reason": "**Pricing Guide for Logistics Quoting Appliance**\n\n**Context:**\nThe provided data is a historical context for a logistics quoting appliance, which includes a base rate and various comparable layers such as route unit cost, commodity category, sector, weight band, and service type. The data is based on a time window from 2025-07-19 to 2026-07-19.\n\n**Risks:**\nThe risks associated with this quote include:\n\n1. **Market Volatility:** The logistics market can be volatile, and rates may fluctuate rapidly due to changes in demand, supply, or other market conditions.\n2. **Insufficient Data:** The data provided may not be comprehensive or up-to-date, which could lead to inaccurate quotes or missed opportunities.\n3. **Commodity and Sector Risks:** The commodity category and sector may be subject to specific risks, such as changes in regulations, weather events, or global economic trends.\n4. **Weight Band and Service Type Risks:** The weight band and service type may also be subject to specific risks, such as changes in fuel prices, traffic congestion, or labor disputes.\n\n**Quote:**\nBased on the provided data, the deterministic quote-core rate is:\n\n* **Base Rate (MXN):** 18,669.44\n\nThis rate i",
+    "status": "completed",
+    "recommended_rate_mxn": 18669.44
+  },
+  "route_evidence": {
+    "source": "sakbe",
+    "status": "resolved",
+    "km_loaded": 540,
+    "tolls_mxn": 950,
+    "estimated_minutes": 400,
+    "requires_return_route": false
+  },
+  "active_child_rfq": {
+    "cargo": {
+      "hazmat": false,
+      "sector": "industrial",
+      "commodity": "carga general",
+      "value_mxn": 400000,
+      "weight_kg": 18000,
+      "commodity_category": "general"
+    },
+    "origin": {
+      "city": "Guadalajara",
+      "state": "Jalisco",
+      "country": "MX"
+    },
+    "rfq_id": "RFQ-2026-716296",
+    "lane_id": "RFQ-2026-716296-L01",
+    "service": {
+      "route_policy": "cuota",
+      "return_policy": "sin_retorno"
+    },
+    "client_id": "e2e test corp",
+    "commercial": {
+      "target_rate_mxn": null
+    },
+    "destination": {
+      "city": "Monterrey",
+      "state": "Nuevo Leon",
+      "country": "MX"
+    },
+    "requester_email": "compras@e2etest.mx",
+    "business_unit_id": "DV_53_FT",
+    "vehicle_profile_id": "T3S3_53_DRYVAN"
+  },
+  "criteria_context": {
+    "nodes": [],
+    "client_id": "E2ETEST",
+    "retrieved_for": "pricing_recommendation",
+    "knowledge_hits": [],
+    "criteria_version": "criteria-local"
+  },
+  "criteria_version": "criteria-local",
+  "manifest_version": "manifest-local",
+  "writeback_result": {
+    "status": "queued",
+    "quote_id": "quote-v2-RFQ-2026-716296-L01"
+  },
+  "writeback_results": [
+    {
+      "status": "queued",
+      "quote_id": "quote-v2-RFQ-2026-716296-L01"
+    }
+  ],
+  "connector_versions": {
+    "tms": "playground.tms-adapter@local",
+    "route_provider": "sakbe-live@local"
+  },
+  "historical_context": {
+    "comparables": [
+      {
+        "count": 5,
+        "layer": "route_unit_cost",
+        "max_rate_mxn": 21400,
+        "min_rate_mxn": 18100,
+        "p25_rate_mxn": 19200,
+        "p75_rate_mxn": 20600,
+        "match_quality": "exact_route_exact_unit",
+        "avg_margin_pct": 0.57,
+        "median_rate_mxn": 19850,
+        "avg_direct_cost_mxn": 8526.9
+      },
+      {
+        "count": 5,
+        "layer": "commodity_category",
+        "sector": "industrial",
+        "max_rate_mxn": 21400,
+        "min_rate_mxn": 18100,
+        "p25_rate_mxn": 19200,
+        "p75_rate_mxn": 20600,
+        "match_quality": "same_commodity_sector_same_unit",
+        "avg_margin_pct": 0.57,
+        "median_rate_mxn": 19850,
+        "commodity_category": "general",
+        "avg_direct_cost_mxn": 8526.9
+      },
+      {
+        "count": 5,
+        "layer": "sector",
+        "sector": "industrial",
+        "max_rate_mxn": 21400,
+        "min_rate_mxn": 18100,
+        "p25_rate_mxn": 19200,
+        "p75_rate_mxn": 20600,
+        "match_quality": "same_sector_same_unit",
+        "avg_margin_pct": 0.57,
+        "median_rate_mxn": 19850,
+        "avg_direct_cost_mxn": 8526.9
+      },
+      {
+        "count": 5,
+        "layer": "weight_band",
+        "weight_band": "15t_20t",
+        "max_rate_mxn": 21400,
+        "min_rate_mxn": 18100,
+        "p25_rate_mxn": 19200,
+        "p75_rate_mxn": 20600,
+        "match_quality": "same_weight_band_same_unit",
+        "avg_margin_pct": 0.57,
+        "median_rate_mxn": 19850,
+        "avg_direct_cost_mxn": 8526.9
+      },
+      {
+        "count": 5,
+        "layer": "service_type",
+        "max_rate_mxn": 21400,
+        "min_rate_mxn": 18100,
+        "p25_rate_mxn": 19200,
+        "p75_rate_mxn": 20600,
+        "match_quality": "same_service_type_same_unit",
+        "avg_margin_pct": 0.57,
+        "median_rate_mxn": 19850,
+        "avg_direct_cost_mxn": 8526.9
+      }
+    ],
+    "time_window": {
+      "to": "2026-07-19",
+      "from": "2025-07-19"
+    },
+    "max_rate_mxn": 21400,
+    "selected_layer": "route_unit_cost",
+    "median_rate_mxn": 19850,
+    "insufficient_data": []
+  },
+  "quote_core_version": "quote-core-2.0.0",
+  "runtime_review_reasons": [],
+  "tools": {}
+}

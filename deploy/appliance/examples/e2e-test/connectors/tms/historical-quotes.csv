@@ -1,0 +1,6 @@
+quote_id,rfq_id,lane_id,customer_id,origin_city,origin_state,origin_country,destination_city,destination_state,destination_country,vehicle_profile_id,equipment_request,commodity,commodity_category,sector,weight_kg,rate_mxn,direct_cost_mxn,margin_pct,quoted_at,service_type,status
+QUOTE-E2E-A1,RFQ-2026-090001,RFQ-2026-090001-L01,E2E-CUST-DEMO,Guadalajara,Jalisco,MX,Monterrey,Nuevo Leon,MX,T3S3_53_DRYVAN,caja seca 53,carga general,general,industrial,18000,18100,7783.00,0.57,2026-03-10,cuota,won
+QUOTE-E2E-A2,RFQ-2026-090002,RFQ-2026-090002-L01,E2E-CUST-DEMO,Guadalajara,Jalisco,MX,Monterrey,Nuevo Leon,MX,T3S3_53_DRYVAN,caja seca 53,carga general,general,industrial,18000,19200,8256.00,0.57,2026-04-15,cuota,won
+QUOTE-E2E-A3,RFQ-2026-090003,RFQ-2026-090003-L01,E2E-CUST-DEMO,Guadalajara,Jalisco,MX,Monterrey,Nuevo Leon,MX,T3S3_53_DRYVAN,caja seca 53,carga general,general,industrial,18000,19850,8535.50,0.57,2026-05-10,cuota,won
+QUOTE-E2E-A4,RFQ-2026-090004,RFQ-2026-090004-L01,E2E-CUST-DEMO,Guadalajara,Jalisco,MX,Monterrey,Nuevo Leon,MX,T3S3_53_DRYVAN,caja seca 53,carga general,general,industrial,18000,20600,8858.00,0.57,2026-06-05,cuota,won
+QUOTE-E2E-A5,RFQ-2026-090005,RFQ-2026-090005-L01,E2E-CUST-DEMO,Guadalajara,Jalisco,MX,Monterrey,Nuevo Leon,MX,T3S3_53_DRYVAN,caja seca 53,carga general,general,industrial,18000,21400,9202.00,0.57,2026-06-28,cuota,won

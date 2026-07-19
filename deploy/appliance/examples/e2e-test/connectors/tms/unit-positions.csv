@@ -1,0 +1,3 @@
+unit_id,vehicle_profile_id,city,state,country,available_at
+UNIT-E2E-01,T3S3_53_DRYVAN,Guadalajara,Jalisco,MX,2026-07-15T08:00:00-06:00
+UNIT-E2E-02,T3S3_53_DRYVAN,Queretaro,Queretaro,MX,2026-07-16T08:00:00-06:00

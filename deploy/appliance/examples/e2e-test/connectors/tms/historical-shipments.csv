@@ -1,0 +1,3 @@
+shipment_id,rfq_id,customer_id,status
+SHIP-E2E-A1,RFQ-2026-090001,E2E-CUST-DEMO,delivered
+SHIP-E2E-A2,RFQ-2026-090002,E2E-CUST-DEMO,delivered

@@ -1,0 +1,38 @@
+{
+  "sakbe|v1|cuota|guadalajara-jalisco-mx|monterrey-nuevo-leon-mx|t3s3": {
+    "cache_key": "sakbe|v1|cuota|guadalajara-jalisco-mx|monterrey-nuevo-leon-mx|t3s3",
+    "origin_city": "Guadalajara",
+    "origin_state": "Jalisco",
+    "origin_country": "MX",
+    "destination_city": "Monterrey",
+    "destination_state": "Nuevo Leon",
+    "destination_country": "MX",
+    "route_policy": "cuota",
+    "vehicle_profile_id": "T3S3_53_DRYVAN",
+    "nom_configuration": "T3S3",
+    "km_loaded": 540,
+    "estimated_minutes": 400,
+    "tolls_mxn": 950,
+    "source": "e2e_fixture",
+    "confidence": 1,
+    "is_active": true
+  },
+  "sakbe|v1|cuota|queretaro-queretaro-mx|puebla-puebla-mx|t3s3": {
+    "cache_key": "sakbe|v1|cuota|queretaro-queretaro-mx|puebla-puebla-mx|t3s3",
+    "origin_city": "Queretaro",
+    "origin_state": "Queretaro",
+    "origin_country": "MX",
+    "destination_city": "Puebla",
+    "destination_state": "Puebla",
+    "destination_country": "MX",
+    "route_policy": "cuota",
+    "vehicle_profile_id": "T3S3_53_DRYVAN",
+    "nom_configuration": "T3S3",
+    "km_loaded": 280,
+    "estimated_minutes": 220,
+    "tolls_mxn": 620,
+    "source": "e2e_fixture",
+    "confidence": 1,
+    "is_active": true
+  }
+}
