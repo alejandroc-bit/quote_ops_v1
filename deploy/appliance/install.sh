@@ -318,6 +318,9 @@ done
 [[ "$QUOTEOPS_SAKBE_CACHE_MODE" =~ ^(cache_first|live_only)$ ]] || die "--sakbe-cache-mode must be cache_first or live_only"
 [[ -f "$MANIFEST_PATH" ]] || die "manifest not found: $MANIFEST_PATH"
 [[ -r "$MANIFEST_PATH" ]] || die "manifest is not readable: $MANIFEST_PATH"
+MANIFEST_CLIENT_ID="$(sed -n 's/^client_id:[[:space:]]*//p' "$MANIFEST_PATH" | head -1 | tr -d '"' | tr -d "'")"
+[[ -z "$MANIFEST_CLIENT_ID" || "$MANIFEST_CLIENT_ID" == "$CLIENT_ID" ]] \
+  || die "manifest client_id ($MANIFEST_CLIENT_ID) does not match --client ($CLIENT_ID); activation would target the wrong tenant"
 if [[ -n "$CONNECTORS_PATH" ]]; then
   [[ -d "$CONNECTORS_PATH" ]] || die "connectors directory not found: $CONNECTORS_PATH"
 fi
