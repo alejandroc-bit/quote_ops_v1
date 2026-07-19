@@ -2,6 +2,7 @@ import { readFile } from "node:fs/promises";
 import { parse as parseYaml } from "yaml";
 import { loadAgentRuntimeConfig, type AgentRuntimeConfig } from "@quoteops/connectors";
 import type { QuoteManifest } from "@quoteops/quote-core";
+import { createChatModel } from "../llm/chatModel.js";
 import type { QuoteAgentRuntime } from "../graph/runtime.js";
 import {
   buildRfqFromEmail,
@@ -171,7 +172,7 @@ async function tryLoadAgentConfig(env: NodeJS.ProcessEnv): Promise<AgentRuntimeC
   }
 }
 
-function buildIntakeModel(
+export function buildIntakeModel(
   agentConfig: AgentRuntimeConfig | null,
   env: NodeJS.ProcessEnv,
   fetchFn: typeof fetch
@@ -192,6 +193,17 @@ function buildIntakeModel(
     const apiKey = env[agentConfig.model.api_key_env || "GEMINI_API_KEY"];
     if (!apiKey?.trim()) return null;
     return geminiIntakeModel({ apiKey: apiKey.trim(), modelName: agentConfig.model.model_name });
+  }
+
+  if (agentConfig.model.provider === "openai") {
+    const apiKeyEnv = agentConfig.model.api_key_env;
+    if (!apiKeyEnv || !env[apiKeyEnv]?.trim()) return null;
+    return openaiIntakeModel({
+      modelName: agentConfig.model.model_name,
+      apiKeyEnv,
+      baseUrl: agentConfig.model.base_url,
+      env
+    });
   }
 
   return null;
@@ -271,6 +283,32 @@ function geminiIntakeModel({
       ]
     });
     return response.text ?? "";
+  };
+}
+
+function openaiIntakeModel({
+  modelName,
+  apiKeyEnv,
+  baseUrl,
+  env
+}: {
+  modelName: string;
+  apiKeyEnv: string;
+  baseUrl?: string | null;
+  env: NodeJS.ProcessEnv;
+}): IntakeModel {
+  const model = createChatModel({ provider: "openai", model_name: modelName, api_key_env: apiKeyEnv, base_url: baseUrl }, env);
+  return async (parts: IntakeModelPart[]) => {
+    const content = parts.map((part) =>
+      part.type === "text"
+        ? { type: "text" as const, text: part.text }
+        : {
+            type: "image_url" as const,
+            image_url: { url: `data:${part.mimeType};base64,${part.dataBase64}` }
+          }
+    );
+    const response = await model.invoke([{ role: "user", content }]);
+    return typeof response.content === "string" ? response.content : JSON.stringify(response.content);
   };
 }
 
