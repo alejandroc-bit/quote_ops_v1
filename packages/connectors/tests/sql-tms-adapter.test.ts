@@ -5,6 +5,7 @@ import { describe, expect, it } from "vitest";
 import {
   FileImportTmsAdapter,
   SqlTmsAdapter,
+  createSqlExecutor,
   translateMssqlParams,
   translatePgParams,
   type HistoricalSearchQuery,
@@ -218,5 +219,24 @@ describe("SQL param translation", () => {
     expect(translateMssqlParams("WHERE a = :city AND b = :n::text")).toBe(
       "WHERE a = @city AND b = @n::text"
     );
+  });
+});
+
+describe("createSqlExecutor", () => {
+  it("loads the mssql CommonJS default export before attempting a connection", async () => {
+    let failure: unknown;
+    try {
+      const executor = await createSqlExecutor(
+        "mssql",
+        "Server=127.0.0.1,1;Database=quoteops_import_shape;User ID=test;Password=test;Encrypt=false;TrustServerCertificate=true;Connect Timeout=1"
+      );
+      await executor.close();
+    } catch (error) {
+      failure = error;
+    }
+
+    expect(failure).toBeInstanceOf(Error);
+    expect(failure).not.toBeInstanceOf(TypeError);
+    expect(failure).toMatchObject({ name: "ConnectionError" });
   });
 });

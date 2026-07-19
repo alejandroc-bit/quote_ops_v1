@@ -42,8 +42,8 @@ export function translateMssqlParams(sql: string): string {
 
 /**
  * Builds a live executor from a connection URL. Drivers are imported lazily so
- * a client using one dialect never pays to load the other two. Not covered by
- * unit tests (needs a real DB); the pure translators above are the tested part.
+ * a client using one dialect never pays to load the other two. Driver loading
+ * is covered with offline connection-failure tests; queries need a real DB.
  */
 export async function createSqlExecutor(
   dialect: SqlDialect,
@@ -80,7 +80,7 @@ export async function createSqlExecutor(
     };
   }
 
-  const mssql = await import("mssql");
+  const { default: mssql } = await import("mssql");
   const pool = new mssql.ConnectionPool(connectionUrl);
   const connected = await pool.connect();
   return {
