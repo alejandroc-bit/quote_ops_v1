@@ -9,14 +9,20 @@ import {
   type QuoteWorkflowState,
   type QuoteWorkflowTools,
   type QuoteAgentRuntime,
-  type AgentGraphResult
+  type AgentGraphResult,
+  mailboxCredentialsPresent
 } from "@quoteops/agent";
 import type { Rfq } from "@quoteops/contracts";
 import {
   verifyInstallationLicense,
   type InstallationLicense
 } from "@quoteops/shared";
-import { loadTmsAdapterConfig, tmsMappingConfigSchema } from "@quoteops/connectors";
+import {
+  loadAgentRuntimeConfig,
+  loadTmsAdapterConfig,
+  tmsMappingConfigSchema,
+  type AgentRuntimeConfig
+} from "@quoteops/connectors";
 import { ingestKnowledgeDocument } from "@quoteops/knowledge";
 import { applyApprovalDecision } from "./approval/applyApprovalDecision.js";
 import {
@@ -78,6 +84,8 @@ export type LocalSetupState = {
   };
   required_steps: SetupStepId[];
 };
+
+const DEFAULT_AGENT_CONFIG_PATH = "/opt/quoteops-v1/connectors/agent/agent-config.yaml";
 
 export function createQuoteOpsApi(
   dependencies: Partial<QuoteOpsApiDependencies> = {}
@@ -521,10 +529,11 @@ async function runControlPlaneMinimalSync({
   }
 
   const testRfqReady = await hasPassingTestRfq(workflowRuns, store);
-  const setup = await buildLocalSetupState({ env, manifest, testRfqReady });
+  const providerReadiness = await loadProviderReadiness(env);
+  const setup = await buildLocalSetupState({ env, manifest, testRfqReady, providerReadiness });
   const heartbeat = {
     client_id: clientId,
-    ai_key_status: hasAiProviderKey(env) ? "configured" : "missing",
+    ai_key_status: hasAiProviderKey(providerReadiness, env) ? "configured" : "missing",
     onboarding_status: minimalOnboardingStatus(setup),
     version
   };
@@ -611,12 +620,15 @@ export function startControlPlaneSyncScheduler({
 async function buildLocalSetupState({
   env,
   manifest,
-  testRfqReady
+  testRfqReady,
+  providerReadiness
 }: {
   env: NodeJS.ProcessEnv;
   manifest: QuoteManifest | null;
   testRfqReady: boolean;
+  providerReadiness?: ProviderReadiness;
 }): Promise<LocalSetupState> {
+  const resolvedProviderReadiness = providerReadiness ?? (await loadProviderReadiness(env));
   const clientId = manifest?.client_id ?? optionalEnv(env.QUOTEOPS_CLIENT_ID) ?? null;
   const installationId = optionalEnv(env.QUOTEOPS_INSTALLATION_ID) ?? null;
   const activationRequired = true;
@@ -626,7 +638,7 @@ async function buildLocalSetupState({
   if (activationStatus !== "unlocked") {
     requiredSteps.push("activate_license");
   }
-  if (!(await hasConfiguredSecrets(env))) {
+  if (!(await hasConfiguredSecrets(resolvedProviderReadiness, env))) {
     requiredSteps.push("configure_secrets");
   }
   if (!hasTmsConnection(env)) {
@@ -638,10 +650,10 @@ async function buildLocalSetupState({
   if (!(await hasKnowledgeBase(env))) {
     requiredSteps.push("connect_knowledge_base");
   }
-  if (!hasAgentMailbox(env)) {
+  if (!hasAgentMailbox(resolvedProviderReadiness, env)) {
     requiredSteps.push("connect_mailbox");
   }
-  if (!hasSakbeRouteEvidence(env)) {
+  if (!hasSakbeRouteEvidence(resolvedProviderReadiness, env)) {
     requiredSteps.push("connect_sakbe");
   }
   if (!testRfqReady) {
@@ -863,13 +875,11 @@ function minimalOnboardingStatus(setup: LocalSetupState):
   return "licensed";
 }
 
-function hasAiProviderKey(env: NodeJS.ProcessEnv): boolean {
-  return hasAnyEnv(env, [
-    "OPENROUTER_API_KEY",
-    "GEMINI_API_KEY",
-    "ANTHROPIC_API_KEY",
-    "OPENAI_API_KEY"
-  ]);
+function hasAiProviderKey(readiness: ProviderReadiness, env: NodeJS.ProcessEnv): boolean {
+  return Boolean(
+    readiness.agentConfig &&
+      hasConfiguredModelKey(readiness.agentConfig, readiness, env)
+  );
 }
 
 async function persistActivatedLicense({
@@ -1038,39 +1048,88 @@ export async function assertApplianceLicenseForClient({
   assertApplianceLicensed(state);
 }
 
-async function hasConfiguredSecrets(env: NodeJS.ProcessEnv): Promise<boolean> {
-  const configuredKeys = new Set<string>();
-  for (const key of [
-    "INEGI_SAKBE_KEY",
-    "QUOTEOPS_SAKBE_API_KEY",
-    "OPENROUTER_API_KEY",
-    "GEMINI_API_KEY",
-    "ANTHROPIC_API_KEY",
-    "OPENAI_API_KEY",
-    "QUOTEOPS_EMBEDDING_API_KEY",
-    "TMS_API_KEY",
-    "QUOTEOPS_TMS_API_KEY",
-    "TMS_AUTH_TOKEN",
-    "MAILBOX_PASSWORD",
-    "MAILBOX_OAUTH_REFRESH_TOKEN"
-  ]) {
-    if (optionalEnv(env[key])) configuredKeys.add(key);
-  }
+type ProviderReadiness = {
+  agentConfig: AgentRuntimeConfig | null;
+  secretFileKeys: Set<string>;
+};
 
-  const secretsFile = optionalEnv(env.QUOTEOPS_SECRETS_ENV_FILE);
-  if (secretsFile) {
-    for (const key of await readSecretKeysFromEnvFile(secretsFile)) {
-      configuredKeys.add(key);
+async function loadProviderReadiness(env: NodeJS.ProcessEnv): Promise<ProviderReadiness> {
+  const agentConfigPath = optionalEnv(env.QUOTEOPS_AGENT_CONFIG_PATH) ?? DEFAULT_AGENT_CONFIG_PATH;
+  const [agentConfig, secretFileKeys] = await Promise.all([
+    loadAgentRuntimeConfig(agentConfigPath).catch(() => null),
+    readSecretKeysFromEnvFile(optionalEnv(env.QUOTEOPS_SECRETS_ENV_FILE) ?? "")
+  ]);
+  return { agentConfig, secretFileKeys };
+}
+
+async function hasConfiguredSecrets(
+  readiness: ProviderReadiness,
+  env: NodeJS.ProcessEnv
+): Promise<boolean> {
+  const config = readiness.agentConfig;
+  if (!config) return false;
+
+  return (
+    hasSakbeRouteEvidence(readiness, env) &&
+    hasConfiguredModelKey(config, readiness, env) &&
+    hasConfiguredEmbeddingsKey(config, readiness, env) &&
+    (await hasTmsCredentials(readiness, env))
+  );
+}
+
+function hasConfiguredModelKey(
+  config: AgentRuntimeConfig,
+  readiness: ProviderReadiness,
+  env: NodeJS.ProcessEnv
+): boolean {
+  if (config.model.provider === "deterministic" || config.model.provider === "claude_cli") {
+    return true;
+  }
+  return Boolean(
+    config.model.api_key_env && hasConfiguredKey(config.model.api_key_env, readiness, env)
+  );
+}
+
+function hasConfiguredEmbeddingsKey(
+  config: AgentRuntimeConfig,
+  readiness: ProviderReadiness,
+  env: NodeJS.ProcessEnv
+): boolean {
+  return !config.embeddings || hasConfiguredKey(config.embeddings.api_key_env, readiness, env);
+}
+
+async function hasTmsCredentials(
+  readiness: ProviderReadiness,
+  env: NodeJS.ProcessEnv
+): Promise<boolean> {
+  const adapterPath = optionalEnv(env.QUOTEOPS_TMS_ADAPTER_CONFIG_PATH);
+  if (!adapterPath) return false;
+
+  try {
+    const config = await loadTmsAdapterConfig(adapterPath);
+    if (config.provider === "file_import") return true;
+    if (config.provider === "sql") {
+      return hasConfiguredKey(config.connection_url_env, readiness, env);
     }
-  }
 
-  return [
-    ["INEGI_SAKBE_KEY", "QUOTEOPS_SAKBE_API_KEY"],
-    ["OPENROUTER_API_KEY", "GEMINI_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY"],
-    ["QUOTEOPS_EMBEDDING_API_KEY"],
-    ["TMS_API_KEY", "QUOTEOPS_TMS_API_KEY", "TMS_AUTH_TOKEN"],
-    ["MAILBOX_PASSWORD", "MAILBOX_OAUTH_REFRESH_TOKEN"]
-  ].every((group) => group.some((key) => configuredKeys.has(key)));
+    const requiredKeys = new Set<string>([config.base_url_env]);
+    for (const value of Object.values(config.headers ?? {})) {
+      for (const key of value.matchAll(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g)) {
+        requiredKeys.add(key[1]);
+      }
+    }
+    return [...requiredKeys].every((key) => hasConfiguredKey(key, readiness, env));
+  } catch {
+    return false;
+  }
+}
+
+function hasConfiguredKey(
+  key: string,
+  readiness: ProviderReadiness,
+  env: NodeJS.ProcessEnv
+): boolean {
+  return Boolean(optionalEnv(env[key]) || readiness.secretFileKeys.has(key));
 }
 
 function hasTmsConnection(env: NodeJS.ProcessEnv): boolean {
@@ -1178,14 +1237,30 @@ async function fileExists(path: string): Promise<boolean> {
   }
 }
 
-function hasAgentMailbox(env: NodeJS.ProcessEnv): boolean {
-  // the agent mailbox tool needs an address plus either an app password or OAuth refresh token
-  if (!hasAnyEnv(env, ["MAILBOX_USER"])) return false;
-  return hasAnyEnv(env, ["MAILBOX_PASSWORD", "MAILBOX_OAUTH_REFRESH_TOKEN"]);
+function hasAgentMailbox(readiness: ProviderReadiness, env: NodeJS.ProcessEnv): boolean {
+  if (!readiness.agentConfig?.mailbox) return false;
+  return mailboxCredentialsPresent(
+    readiness.agentConfig.mailbox,
+    envWithSecretFilePresence(readiness, env)
+  );
 }
 
-function hasSakbeRouteEvidence(env: NodeJS.ProcessEnv): boolean {
-  return hasAnyEnv(env, ["INEGI_SAKBE_KEY", "QUOTEOPS_SAKBE_API_KEY"]);
+function envWithSecretFilePresence(
+  readiness: ProviderReadiness,
+  env: NodeJS.ProcessEnv
+): NodeJS.ProcessEnv {
+  const effectiveEnv = { ...env };
+  for (const key of readiness.secretFileKeys) {
+    if (!optionalEnv(effectiveEnv[key])) effectiveEnv[key] = "configured";
+  }
+  return effectiveEnv;
+}
+
+function hasSakbeRouteEvidence(readiness: ProviderReadiness, env: NodeJS.ProcessEnv): boolean {
+  return (
+    hasConfiguredKey("INEGI_SAKBE_KEY", readiness, env) ||
+    hasConfiguredKey("QUOTEOPS_SAKBE_API_KEY", readiness, env)
+  );
 }
 
 async function hasPassingTestRfq(

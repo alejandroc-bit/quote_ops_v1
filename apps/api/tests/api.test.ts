@@ -47,6 +47,7 @@ afterEach(async () => {
     process.env.QUOTEOPS_INSTALLATION_ID = originalInstallationId;
   }
   await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
+  readyEnvDir = null;
 });
 
 describe("QuoteOps API", () => {
@@ -1081,6 +1082,157 @@ describe("QuoteOps API", () => {
     );
   });
 
+  it("derives setup and heartbeat readiness from the configured NVIDIA NIM and Resend providers", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "quoteops-provider-readiness-"));
+    tempDirs.push(dir);
+    const agentConfigPath = join(dir, "agent-config.yaml");
+    const malformedAgentConfigPath = join(dir, "malformed-agent-config.yaml");
+    await writeFile(
+      agentConfigPath,
+      [
+        "model:",
+        "  provider: openai",
+        "  model_name: nvidia/llama-3.3-nemotron-super-49b-v1",
+        "  temperature: 0",
+        "  api_key_env: NVIDIA_NIM_API_KEY",
+        "authorization:",
+        "  tools: {}",
+        "mailbox:",
+        "  provider: resend",
+        ""
+      ].join("\n"),
+      "utf8"
+    );
+    await writeFile(malformedAgentConfigPath, "model: not-an-object\n", "utf8");
+    const cloudBaseUrl = await startCloudTestServer("provider-ready-token");
+    await fetch(`${cloudBaseUrl}/api/admin/clients`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${TEST_ADMIN_TOKEN}` },
+      body: JSON.stringify({
+        client_id: "cliente-demo",
+        legal_name: "Cliente Demo SA de CV",
+        authorized_email: "ops@cliente.com"
+      })
+    });
+    await fetch(`${cloudBaseUrl}/api/admin/clients/cliente-demo/install-pack`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${TEST_ADMIN_TOKEN}` },
+      body: "{}"
+    });
+    await fetch(`${cloudBaseUrl}/api/onboarding/activate`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        client_id: "cliente-demo",
+        installation_id: "cliente-demo-prod-001",
+        email: "ops@cliente.com",
+        registration_token: "provider-ready-token"
+      })
+    });
+
+    const providerReadyEnv = await setupReadyEnv({
+      QUOTEOPS_AGENT_CONFIG_PATH: agentConfigPath,
+      QUOTEOPS_CONTROL_PLANE_URL: cloudBaseUrl,
+      QUOTEOPS_REGISTRATION_TOKEN: "provider-ready-token",
+      QUOTEOPS_VERSION: "v1.0.0",
+      NVIDIA_NIM_API_KEY: "nim-present",
+      RESEND_API_KEY: "resend-present",
+      MAILBOX_PASSWORD: "",
+      MAILBOX_OAUTH_CLIENT_ID: "",
+      MAILBOX_OAUTH_CLIENT_SECRET: "",
+      MAILBOX_OAUTH_REFRESH_TOKEN: "",
+      OPENROUTER_API_KEY: "",
+      QUOTEOPS_EMBEDDING_API_KEY: "",
+      TMS_API_KEY: ""
+    });
+
+    await withEnv(providerReadyEnv, async () => {
+      const baseUrl = await startApi({
+        defaultManifest: Promise.resolve(workflowInput.manifest)
+      });
+      const setupResponse = await fetch(`${baseUrl}/api/setup-state`);
+      const setup = await setupResponse.json();
+
+      expect(setupResponse.status).toBe(200);
+      expect(setup.required_steps).not.toContain("configure_secrets");
+      expect(setup.required_steps).not.toContain("connect_mailbox");
+
+      const syncResponse = await fetch(`${baseUrl}/api/control-plane/sync-minimal`, {
+        method: "POST"
+      });
+      const sync = await syncResponse.json();
+      expect(syncResponse.status).toBe(202);
+      expect(sync.heartbeat.ai_key_status).toBe("configured");
+    });
+
+    clearApplianceTestApps();
+
+    await withEnv(
+      { ...providerReadyEnv, NVIDIA_NIM_API_KEY: "" },
+      async () => {
+        const baseUrl = await startApi({
+          defaultManifest: Promise.resolve(workflowInput.manifest)
+        });
+        const response = await fetch(`${baseUrl}/api/setup-state`);
+        const setup = await response.json();
+
+        expect(response.status).toBe(200);
+        expect(setup.required_steps).toContain("configure_secrets");
+      }
+    );
+
+    clearApplianceTestApps();
+
+    await withEnv(
+      { ...providerReadyEnv, RESEND_API_KEY: "" },
+      async () => {
+        const baseUrl = await startApi({
+          defaultManifest: Promise.resolve(workflowInput.manifest)
+        });
+        const response = await fetch(`${baseUrl}/api/setup-state`);
+        const setup = await response.json();
+
+        expect(response.status).toBe(200);
+        expect(setup.required_steps).not.toContain("configure_secrets");
+        expect(setup.required_steps).toContain("connect_mailbox");
+      }
+    );
+
+    clearApplianceTestApps();
+
+    await withEnv(
+      { ...providerReadyEnv, QUOTEOPS_AGENT_CONFIG_PATH: join(dir, "missing-agent-config.yaml") },
+      async () => {
+        const baseUrl = await startApi({
+          defaultManifest: Promise.resolve(workflowInput.manifest)
+        });
+        const response = await fetch(`${baseUrl}/api/setup-state`);
+        const setup = await response.json();
+
+        expect(response.status).toBe(200);
+        expect(setup.required_steps).toContain("configure_secrets");
+        expect(setup.required_steps).toContain("connect_mailbox");
+      }
+    );
+
+    clearApplianceTestApps();
+
+    await withEnv(
+      { ...providerReadyEnv, QUOTEOPS_AGENT_CONFIG_PATH: malformedAgentConfigPath },
+      async () => {
+        const baseUrl = await startApi({
+          defaultManifest: Promise.resolve(workflowInput.manifest)
+        });
+        const response = await fetch(`${baseUrl}/api/setup-state`);
+        const setup = await response.json();
+
+        expect(response.status).toBe(200);
+        expect(setup.required_steps).toContain("configure_secrets");
+        expect(setup.required_steps).toContain("connect_mailbox");
+      }
+    );
+  });
+
   it("keeps the test RFQ step required until an approved run has route and writeback evidence", async () => {
     await withEnv(
       await setupReadyEnv({
@@ -1334,6 +1486,28 @@ async function setupReadyEnv(
     readyEnvDir = await mkdtemp(join(tmpdir(), "quoteops-ready-env-"));
     tempDirs.push(readyEnvDir);
     await writeFile(join(readyEnvDir, "tms-adapter.yaml"), "provider: file_import\n");
+    await writeFile(
+      join(readyEnvDir, "agent-config.yaml"),
+      [
+        "model:",
+        "  provider: openrouter",
+        "  model_name: nvidia/nemotron-3-ultra-550b-a55b:free",
+        "  temperature: 0",
+        "  api_key_env: OPENROUTER_API_KEY",
+        "authorization:",
+        "  tools: {}",
+        "mailbox:",
+        "  provider: imap",
+        "  auth: password",
+        "  imap_host: imap.cliente.com",
+        "embeddings:",
+        "  provider: openai_compatible",
+        "  model: text-embedding-3-small",
+        "  api_key_env: QUOTEOPS_EMBEDDING_API_KEY",
+        ""
+      ].join("\n"),
+      "utf8"
+    );
     await mkdir(join(readyEnvDir, "knowledge"), { recursive: true });
     await writeFile(join(readyEnvDir, "knowledge", "criterios.md"), "# criterios\n");
   }
@@ -1349,6 +1523,7 @@ async function setupReadyEnv(
     TMS_API_KEY: "tms-present",
     MAILBOX_USER: "agente@cliente.com",
     MAILBOX_PASSWORD: "mailbox-present",
+    QUOTEOPS_AGENT_CONFIG_PATH: join(readyEnvDir, "agent-config.yaml"),
     QUOTEOPS_TMS_ADAPTER_CONFIG_PATH: join(readyEnvDir, "tms-adapter.yaml"),
     QUOTEOPS_KNOWLEDGE_DIR: join(readyEnvDir, "knowledge"),
     ...overrides
