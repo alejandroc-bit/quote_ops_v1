@@ -111,6 +111,11 @@ grep -q 'image: postgres:16-alpine' "$COMPOSE_FILE" || fail "appliance compose m
 [[ "$(grep -c 'QUOTEOPS_LICENSE_PATH: /opt/quoteops-v1/secrets/license.json' "$COMPOSE_FILE")" -ge 2 ]] || fail "appliance compose must wire QUOTEOPS_LICENSE_PATH to mounted secrets for agent and api"
 [[ "$(grep -c 'QUOTEOPS_LICENSE_PUBLIC_KEY_PATH: /opt/quoteops-v1/secrets/license-public-key.pem' "$COMPOSE_FILE")" -ge 2 ]] || fail "appliance compose must wire QUOTEOPS_LICENSE_PUBLIC_KEY_PATH to mounted secrets for agent and api"
 [[ "$(grep -c -- '- quoteops_secrets:/opt/quoteops-v1/secrets' "$COMPOSE_FILE")" -ge 3 ]] || fail "appliance compose must mount quoteops_secrets into agent, api and onboard"
+awk '
+  /^  quoteops-api:$/ { in_api = 1; next }
+  in_api && /^  [A-Za-z0-9_.-]+:$/ { exit }
+  in_api { print }
+' "$COMPOSE_FILE" | grep -q 'QUOTEOPS_TMS_MAPPING_CONFIG_PATH: ${QUOTEOPS_TMS_MAPPING_CONFIG_PATH:-}' || fail "appliance compose must wire the TMS mapping path into quoteops-api"
 
 if docker_daemon_available; then
   validate_schema_sql_with_postgres
@@ -312,6 +317,7 @@ YAML
     QUOTEOPS_CRITERIA_DIR="$WORK_DIR/criteria" \
     QUOTEOPS_CONNECTORS_DIR="$WORK_DIR/connectors" \
     QUOTEOPS_SECRETS_ENV_FILE="$WORK_DIR/secrets/client.env" \
+    QUOTEOPS_TMS_MAPPING_CONFIG_PATH=/opt/quoteops-v1/connectors/tms-mapping.json \
     QUOTEOPS_SAKBE_CACHE_MODE=cache_first \
     QUOTEOPS_LOG_DIR="$WORK_DIR/logs" \
     QUOTEOPS_BACKUP_DIR="$WORK_DIR/backups" \
@@ -324,6 +330,11 @@ YAML
 
   COMPOSE_RENDERED="$(compose_config -f "$APPLIANCE_DIR/docker-compose.yml")"
   printf '%s\n' "$COMPOSE_RENDERED" | grep -q 'image: ghcr.io/alejandroc-bit/quote-ops-agent:v2.0.0' || fail "compose must render quote-ops-agent:v2.0.0"
+  printf '%s\n' "$COMPOSE_RENDERED" | awk '
+    /^  quoteops-api:$/ { in_api = 1; next }
+    in_api && /^  [A-Za-z0-9_.-]+:$/ { exit }
+    in_api { print }
+  ' | grep -q 'QUOTEOPS_TMS_MAPPING_CONFIG_PATH: /opt/quoteops-v1/connectors/tms-mapping.json' || fail "compose must render the TMS mapping path for quoteops-api"
   compose_config -f "$APPLIANCE_DIR/docker-compose.yml" -f "$APPLIANCE_DIR/docker-compose.local.yml" >/dev/null
 else
   echo "smoke.sh: docker compose not available; skipped compose config validation"
