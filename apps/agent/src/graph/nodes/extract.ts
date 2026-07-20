@@ -29,11 +29,11 @@ export async function extractNode(state: QuoteAgentState, context: NodeContext) 
       email: state.message,
       manifest: context.manifest,
       rfqId: rfqIdFromRun(state.run_id, context.now()),
-      model:
-        state.intake_kind === "bulk_file"
-          ? null
-          : async (parts) =>
-              context.model.withStructuredOutput(extractedLanesSchema).invoke(parts)
+      // buildRfqFromEmail ignores the model when a real XLSX attachment is
+      // present. Keeping it available here makes extraction robust if graph
+      // state ever contains an inconsistent intake_kind.
+      model: async (parts) =>
+        context.model.withStructuredOutput(extractedLanesSchema).invoke(parts)
     });
     const lanes: ResolvedLane[] = rfq.parsed.lanes.map((lane) =>
       laneToQuoteInput(rfq.rfq_id, rfq.requester.email, context.manifest.client_id, lane)

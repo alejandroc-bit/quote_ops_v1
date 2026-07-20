@@ -140,16 +140,41 @@ export async function startMailboxIntake(
   }
 
   const intervalMs = config.poll_interval_ms;
-  const timer = setInterval(() => {
-    runMailboxIntakeOnce({ env, graphRuntime, authorizeGraphRun }).catch((error) => {
-      console.error(
-        `[mailbox-intake] poll failed: ${error instanceof Error ? error.message : error}`
-      );
-    });
-  }, intervalMs);
+  const poll = createSerializedMailboxPoll({
+    run: () => runMailboxIntakeOnce({ env, graphRuntime, authorizeGraphRun }),
+    log: (message) => console.log(`[mailbox-intake] ${message}`),
+    logError: (message) => console.error(`[mailbox-intake] ${message}`)
+  });
+  const timer = setInterval(poll, intervalMs);
   timer.unref?.();
   console.log(`[mailbox-intake] polling ${config.provider} every ${intervalMs}ms`);
   return timer;
+}
+
+export function createSerializedMailboxPoll({
+  run,
+  log,
+  logError
+}: {
+  run: () => Promise<unknown>;
+  log: (message: string) => void;
+  logError: (message: string) => void;
+}): () => void {
+  let inFlight = false;
+  return () => {
+    if (inFlight) {
+      log("poll skipped: previous cycle still in flight");
+      return;
+    }
+    inFlight = true;
+    void run()
+      .catch((error) => {
+        logError(`poll failed: ${error instanceof Error ? error.message : error}`);
+      })
+      .finally(() => {
+        inFlight = false;
+      });
+  };
 }
 
 async function openMailboxFromConfig(

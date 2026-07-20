@@ -31,6 +31,9 @@ export async function classifyNode(state: QuoteAgentState, context: NodeContext)
         content: `${state.message.subject}\n${state.message.body_text}`
       }
     ]);
-    return { intake_kind: classified.kind };
+    // File-backed intake is determined from the actual attachment, not an LLM
+    // label. A false `bulk_file` classification would otherwise disable the
+    // model in extraction even though there is no spreadsheet to parse.
+    return { intake_kind: classified.kind === "bulk_file" ? "multi_text" : classified.kind };
   });
 }
