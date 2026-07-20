@@ -66,7 +66,19 @@ class ScriptedChatModel implements StructuredChatModel {
 
   withStructuredOutput<T>(schema: { parse(value: unknown): T }) {
     return {
-      invoke: async () => schema.parse(this.replies.shift())
+      invoke: async (input: unknown) => {
+        // Mirrors LangChain's coercion contract: invoke() takes role-tagged
+        // messages, never raw intake parts (regression for extract.ts).
+        if (
+          !Array.isArray(input) ||
+          input.some((message) => typeof message !== "object" || message === null || !("role" in message))
+        ) {
+          throw new Error(
+            "Unable to coerce message from array: only human, AI, system, developer, or tool message coercion is currently supported."
+          );
+        }
+        return schema.parse(this.replies.shift());
+      }
     };
   }
 }

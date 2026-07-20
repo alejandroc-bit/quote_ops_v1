@@ -32,8 +32,21 @@ export async function extractNode(state: QuoteAgentState, context: NodeContext) 
       // buildRfqFromEmail ignores the model when a real XLSX attachment is
       // present. Keeping it available here makes extraction robust if graph
       // state ever contains an inconsistent intake_kind.
+      // LangChain invoke() expects role-tagged messages, not raw intake parts.
       model: async (parts) =>
-        context.model.withStructuredOutput(extractedLanesSchema).invoke(parts)
+        context.model.withStructuredOutput(extractedLanesSchema).invoke([
+          {
+            role: "user",
+            content: parts.map((part) =>
+              part.type === "text"
+                ? { type: "text" as const, text: part.text }
+                : {
+                    type: "image_url" as const,
+                    image_url: { url: `data:${part.mimeType};base64,${part.dataBase64}` }
+                  }
+            )
+          }
+        ])
     });
     const lanes: ResolvedLane[] = rfq.parsed.lanes.map((lane) =>
       laneToQuoteInput(rfq.rfq_id, rfq.requester.email, context.manifest.client_id, lane)
