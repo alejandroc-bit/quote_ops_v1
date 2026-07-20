@@ -211,14 +211,19 @@ function parseModelLanes(result: unknown): DraftLane[] {
     return {
       origin,
       destination,
-      equipment_text: typeof record.equipment_text === "string" ? record.equipment_text : null,
+      // models emit "" for absent fields; the RFQ contract wants null
+      equipment_text: cleanModelText(record.equipment_text),
       weight_kg: typeof record.weight_kg === "number" ? record.weight_kg : null,
-      commodity: typeof record.commodity === "string" ? record.commodity : null,
+      commodity: cleanModelText(record.commodity),
       value_mxn: typeof record.value_mxn === "number" ? record.value_mxn : null,
       hazmat: record.hazmat === true,
       target_rate_mxn: typeof record.target_rate_mxn === "number" ? record.target_rate_mxn : null
     };
   });
+}
+
+function cleanModelText(value: unknown): string | null {
+  return typeof value === "string" && value.trim() ? value.trim() : null;
 }
 
 function parseJsonBlock(text: string): unknown {
