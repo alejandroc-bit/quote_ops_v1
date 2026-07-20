@@ -1,5 +1,6 @@
 import { createServer, type ServerResponse } from "node:http";
 import pg from "pg";
+import { startMailboxIntake } from "./intake/mailboxPoller.js";
 import { startSentinel } from "./sentinel/index.js";
 
 const port = Number(process.env.PORT || 8081);
@@ -11,6 +12,10 @@ if (process.env.DATABASE_URL) {
   startSentinel({ db, env: process.env });
   sentinelActive = true;
 }
+
+void startMailboxIntake(process.env).catch(() => {
+  console.error("[mailbox-intake] failed to start safely; intake remains disabled");
+});
 
 const server = createServer((req, res) => {
   if (req.url === "/health") {
