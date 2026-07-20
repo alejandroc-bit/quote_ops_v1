@@ -358,7 +358,7 @@ export function createQuoteOpsApi(
         return;
       }
       const decision = parseApprovalDecision(req.body);
-      if (!(await store.claimRunForResume(runId))) {
+      if (!(await store.claimAgentRunForResume(runId, decision))) {
         res.status(409).json({ error: "run_not_waiting_approval" });
         return;
       }
@@ -366,7 +366,6 @@ export function createQuoteOpsApi(
         action: decision.action,
         ...(decision.rate_mxn !== undefined ? { rate_mxn: decision.rate_mxn } : {})
       }, { alreadyClaimed: true });
-      await store.saveApprovalDecision(runId, decision);
       res.json({
         run_id: runId,
         approval_decision: decision,

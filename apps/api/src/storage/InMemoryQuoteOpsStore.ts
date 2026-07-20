@@ -19,6 +19,7 @@ type StoredWorkflowRun = {
 export function createInMemoryQuoteOpsStore(): QuoteOpsStore {
   const workflowRuns = new Map<string, StoredWorkflowRun>();
   const approvalDecisions = new Map<string, ApprovalDecision>();
+  const agentApprovalDecisions = new Map<string, ApprovalDecision>();
   const heartbeats: ApplianceHeartbeat[] = [];
   const agentRuns = new Map<string, AgentRun>();
   const agentSteps = new Map<string, import("./QuoteOpsStore.js").StepEvent[]>();
@@ -118,6 +119,18 @@ export function createInMemoryQuoteOpsStore(): QuoteOpsStore {
     async claimRunForResume(runId) {
       const current = agentRuns.get(runId);
       if (!current || current.status !== "waiting_approval") return false;
+      agentRuns.set(runId, {
+        ...current,
+        status: "running",
+        summary: "Approval resume claimed",
+        updated_at: new Date().toISOString()
+      });
+      return true;
+    },
+    async claimAgentRunForResume(runId, decision) {
+      const current = agentRuns.get(runId);
+      if (!current || current.status !== "waiting_approval") return false;
+      agentApprovalDecisions.set(runId, decision);
       agentRuns.set(runId, {
         ...current,
         status: "running",

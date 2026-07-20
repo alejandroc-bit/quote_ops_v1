@@ -40,6 +40,15 @@ create table if not exists quote_runs (
   updated_at timestamptz not null default now()
 );
 
+create table if not exists agent_approval_decisions (
+  run_id text primary key references quote_runs(run_id) on delete cascade,
+  action text not null check (action in ('approve', 'adjust', 'reject', 'request_review')),
+  rate_mxn numeric,
+  reason text,
+  email_sent boolean not null default false,
+  decided_at timestamptz not null
+);
+
 create table if not exists quote_run_steps (
   run_id text not null references quote_runs(run_id) on delete cascade,
   seq integer not null,
