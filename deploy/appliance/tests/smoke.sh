@@ -50,7 +50,7 @@ validate_human_simulator_fixture() {
   FIXTURE_DIR="$fixture_dir" node --import tsx --input-type=module -e '
     import { readFile } from "node:fs/promises";
     import { join } from "node:path";
-    import { parse as parseYaml } from "yaml";
+    import { loadApplianceManifest } from "./apps/api/src/runtimeTools.ts";
     import { loadAgentRuntimeConfig } from "./packages/connectors/src/agent/AgentRuntimeConfig.ts";
     import { loadTmsAdapterConfig } from "./packages/connectors/src/tms/TmsAdapterConfig.ts";
     import { tmsMappingConfigSchema } from "./packages/contracts/src/tmsCanonical.ts";
@@ -58,16 +58,15 @@ validate_human_simulator_fixture() {
     void (async () => {
       const fixtureDir = process.env.FIXTURE_DIR;
       if (!fixtureDir) throw new Error("fixture directory is required");
-      const [manifestRaw, agent, tms, mappingRaw] = await Promise.all([
-        readFile(join(fixtureDir, "client-manifest.yaml"), "utf8"),
+      const [manifest, agent, tms, mappingRaw] = await Promise.all([
+        loadApplianceManifest(join(fixtureDir, "client-manifest.yaml")),
         loadAgentRuntimeConfig(join(fixtureDir, "connectors/agent/agent-config.yaml")),
         loadTmsAdapterConfig(join(fixtureDir, "connectors/tms-adapter.yaml")),
         readFile(join(fixtureDir, "connectors/tms-mapping.json"), "utf8")
       ]);
-      const manifest = parseYaml(manifestRaw);
       const mapping = tmsMappingConfigSchema.parse(JSON.parse(mappingRaw));
-      if (manifest.client_id !== "RESAUX") throw new Error("fixture manifest must use client_id RESAUX");
-      if (!manifest.business_units?.some((unit) => unit.requester_email_domains?.includes("resaux.io"))) {
+      if (manifest?.client_id !== "RESAUX") throw new Error("fixture manifest must use client_id RESAUX");
+      if (!manifest?.business_units.some((unit) => unit.requester_email_domains?.includes("resaux.io"))) {
         throw new Error("fixture manifest must allow requester domain resaux.io");
       }
       if (agent.model.provider !== "openai" || agent.model.model_name !== "nvidia/nemotron-3-ultra-550b-a55b") {
@@ -77,8 +76,8 @@ validate_human_simulator_fixture() {
         throw new Error("fixture agent must name the NVIDIA NIM runtime configuration");
       }
       if (agent.mailbox?.provider !== "resend") throw new Error("fixture mailbox provider must be resend");
-      if (tms.provider !== "http" || tms.base_url_env !== "MOCK_TMS_BASE_URL") {
-        throw new Error("fixture TMS adapter must be the HTTP mock TMS contract");
+      if (tms.provider !== "http" || tms.base_url_env !== "MOCK_TMS_BASE_URL" || tms.headers) {
+        throw new Error("fixture TMS adapter must use the HTTP mock TMS contract without a mock secret header");
       }
       if (mapping.client_id !== "RESAUX" || mapping.transport !== "http" || mapping.runtime_ai_calls_allowed !== false) {
         throw new Error("fixture TMS mapping must be strict and bound to RESAUX");

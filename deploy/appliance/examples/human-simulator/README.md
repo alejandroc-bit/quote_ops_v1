@@ -53,14 +53,18 @@ The runtime secret file must contain values for:
 - `RESEND_API_KEY` — Resend key with receiving and sending access.
 - `INEGI_SAKBE_KEY` — live SAKBE key.
 - `MOCK_TMS_BASE_URL` — base URL of the fixture's mock-TMS service.
-- `MOCK_TMS_API_KEY` — a test-only value required by the strict mapping
-  contract. The mock does not authenticate it; never reuse it for a real TMS.
 - `MAILBOX_USER` and `MAILBOX_FROM` — inject only the selected address on the
   currently verified Resend domain. Neither variable has a value in this pack.
 
 The `MAILBOX_USER` receiving address filters Resend intake. `MAILBOX_FROM` is
 the verified sender used by quote replies; it may be the same selected address.
 Do not substitute `resaux.io` for the verified Resend domain.
+
+The strict mapping file names `MOCK_TMS_API_KEY` because its current schema
+requires an API-key environment-variable reference for HTTP mappings. The mock
+adapter deliberately sends no auth header and the mock service does not verify
+a key, so this fixture has no `MOCK_TMS_API_KEY` runtime-secret requirement.
+Do not inject a placeholder key or reuse a real TMS credential for it.
 
 Start the HTTP mock in the appliance network before testing. The mock source is
 `deploy/appliance/mock-tms/server.mjs`; bind `MOCK_TMS_BASE_URL` to its network
