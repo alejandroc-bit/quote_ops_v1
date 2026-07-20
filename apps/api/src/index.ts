@@ -641,7 +641,7 @@ async function buildLocalSetupState({
   if (!(await hasConfiguredSecrets(resolvedProviderReadiness, env))) {
     requiredSteps.push("configure_secrets");
   }
-  if (!hasTmsConnection(env)) {
+  if (!(await hasTmsConnection(resolvedProviderReadiness, env))) {
     requiredSteps.push("connect_tms");
   }
   if (!(await hasTmsMapping(env))) {
@@ -1073,7 +1073,7 @@ async function hasConfiguredSecrets(
     hasSakbeRouteEvidence(readiness, env) &&
     hasConfiguredModelKey(config, readiness, env) &&
     hasConfiguredEmbeddingsKey(config, readiness, env) &&
-    (await hasTmsCredentials(readiness, env))
+    (await hasTmsConnection(readiness, env))
   );
 }
 
@@ -1098,7 +1098,7 @@ function hasConfiguredEmbeddingsKey(
   return !config.embeddings || hasConfiguredKey(config.embeddings.api_key_env, readiness, env);
 }
 
-async function hasTmsCredentials(
+async function hasTmsConnection(
   readiness: ProviderReadiness,
   env: NodeJS.ProcessEnv
 ): Promise<boolean> {
@@ -1130,17 +1130,6 @@ function hasConfiguredKey(
   env: NodeJS.ProcessEnv
 ): boolean {
   return Boolean(optionalEnv(env[key]) || readiness.secretFileKeys.has(key));
-}
-
-function hasTmsConnection(env: NodeJS.ProcessEnv): boolean {
-  return hasAnyEnv(env, [
-    "QUOTEOPS_TMS_ADAPTER_CONFIG_PATH",
-    "QUOTEOPS_TMS_RFQS_PATH",
-    "QUOTEOPS_TMS_HISTORICAL_QUOTES_PATH",
-    "QUOTEOPS_TMS_HISTORICAL_SHIPMENTS_PATH",
-    "QUOTEOPS_TMS_QUOTE_WRITEBACKS_PATH",
-    "TMS_BASE_URL"
-  ]);
 }
 
 async function hasTmsMapping(env: NodeJS.ProcessEnv): Promise<boolean> {
@@ -1366,10 +1355,6 @@ async function readFirstConfiguredFile(
     }
   }
   return null;
-}
-
-function hasAnyEnv(env: NodeJS.ProcessEnv, keys: string[]): boolean {
-  return keys.some((key) => Boolean(optionalEnv(env[key])));
 }
 
 function optionalEnv(value: string | undefined): string | undefined {

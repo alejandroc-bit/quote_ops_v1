@@ -1233,6 +1233,51 @@ describe("QuoteOps API", () => {
     );
   });
 
+  it("keeps the TMS connection step pending until the configured adapter and its environment resolve", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "quoteops-tms-connection-readiness-"));
+    tempDirs.push(dir);
+    const malformedAdapterPath = join(dir, "malformed-tms-adapter.yaml");
+    const httpAdapterPath = join(dir, "http-tms-adapter.yaml");
+    await writeFile(malformedAdapterPath, "provider: unsupported\n", "utf8");
+    await writeFile(
+      httpAdapterPath,
+      [
+        "provider: http",
+        "base_url_env: TMS_HTTP_BASE_URL",
+        "headers:",
+        "  Authorization: Bearer \${TMS_HTTP_TOKEN}",
+        ""
+      ].join("\n"),
+      "utf8"
+    );
+
+    const expectPendingConnection = async (overrides: Record<string, string>) => {
+      await withEnv(await setupReadyEnv(overrides), async () => {
+        const baseUrl = await startApi({
+          defaultManifest: Promise.resolve(workflowInput.manifest)
+        });
+        const response = await fetch(`${baseUrl}/api/setup-state`);
+        const setup = await response.json();
+
+        expect(response.status).toBe(200);
+        expect(setup.required_steps).toContain("connect_tms");
+      });
+      clearApplianceTestApps();
+    };
+
+    await expectPendingConnection({
+      QUOTEOPS_TMS_ADAPTER_CONFIG_PATH: join(dir, "missing-tms-adapter.yaml")
+    });
+    await expectPendingConnection({
+      QUOTEOPS_TMS_ADAPTER_CONFIG_PATH: malformedAdapterPath
+    });
+    await expectPendingConnection({
+      QUOTEOPS_TMS_ADAPTER_CONFIG_PATH: httpAdapterPath,
+      TMS_HTTP_BASE_URL: "",
+      TMS_HTTP_TOKEN: ""
+    });
+  });
+
   it("keeps the test RFQ step required until an approved run has route and writeback evidence", async () => {
     await withEnv(
       await setupReadyEnv({
