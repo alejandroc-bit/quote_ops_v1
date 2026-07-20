@@ -1,8 +1,8 @@
-From: Synthetic RFQ Sender <rfq.sender@resaux.io>
+From: Alejandro Chavez <alejandro@resaux.io>
 To: Runtime-injected verified Resend receiving address
 Subject: RFQ simulada GDL a Monterrey — caja seca 53
 Date: Mon, 20 Jul 2026 10:00:00 -0600
-Message-ID: <human-simulator-rfq-20260720@resaux.io>
+Message-ID: <human-simulator-rfq-final-20260720@resaux.io>
 
 Hola equipo,
 

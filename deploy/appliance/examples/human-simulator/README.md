@@ -31,9 +31,11 @@ The synthetic RFQ crosses these boundaries:
    `RESAUX`, then generate a **fresh one-use** install pack/token for that
    tenant. Reuse the tenant's **existing canonical installation ID** shown in
    the portal; do not invent a new ID.
-2. In Resend, verify that `inducta.io` is still the approved domain. Choose a
-   receiving/sending address on that domain at run time. Never substitute
-   `resaux.io` as the Resend domain.
+2. In Resend, identify an address that can actually receive a test message.
+   A `Verified` badge is not enough: check that the public MX record sends mail
+   to Resend. If the root domain already receives through Google or Microsoft,
+   use a dedicated receiving subdomain or the account's managed `*.resend.app`
+   domain. Never substitute `resaux.io` as the Resend receiving domain.
 3. Copy this reviewed repository and the fixture to the target Linux VPS. Do
    not copy provider keys, registration tokens, licenses, or mailbox addresses
    into Git, screenshots, shell history, or this folder.
@@ -100,10 +102,13 @@ read -r -s -p 'Live INEGI SAKBE key: ' INEGI_SAKBE_KEY; echo
 printf '%s\n' "$INEGI_SAKBE_KEY" | bash "$SECRET_TOOL" --home "$QUOTEOPS_HOME" set INEGI_SAKBE_KEY --stdin
 unset INEGI_SAKBE_KEY
 
-read -r -p 'Verified inducta.io mailbox address (user/from): ' RESEND_MAILBOX_ADDRESS
-printf '%s\n' "$RESEND_MAILBOX_ADDRESS" | bash "$SECRET_TOOL" --home "$QUOTEOPS_HOME" set MAILBOX_USER --stdin
-printf '%s\n' "$RESEND_MAILBOX_ADDRESS" | bash "$SECRET_TOOL" --home "$QUOTEOPS_HOME" set MAILBOX_FROM --stdin
-unset RESEND_MAILBOX_ADDRESS
+read -r -p 'Verified Resend receiving address (MAILBOX_USER): ' RESEND_INTAKE_ADDRESS
+printf '%s\n' "$RESEND_INTAKE_ADDRESS" | bash "$SECRET_TOOL" --home "$QUOTEOPS_HOME" set MAILBOX_USER --stdin
+unset RESEND_INTAKE_ADDRESS
+
+read -r -p 'Verified Resend sending address (MAILBOX_FROM): ' RESEND_FROM_ADDRESS
+printf '%s\n' "$RESEND_FROM_ADDRESS" | bash "$SECRET_TOOL" --home "$QUOTEOPS_HOME" set MAILBOX_FROM --stdin
+unset RESEND_FROM_ADDRESS
 
 # The mock's private Compose-network URL is also stored as a runtime value.
 printf '%s\n' 'http://mock-tms:8099' | bash "$SECRET_TOOL" --home "$QUOTEOPS_HOME" set MOCK_TMS_BASE_URL --stdin
