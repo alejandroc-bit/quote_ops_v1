@@ -5,7 +5,9 @@ import type { QuoteRfqLaneInput } from "@quoteops/quote-core";
 import type { NodeContext, ResolvedLane } from "../types.js";
 import type { QuoteAgentState } from "../state.js";
 
-const locationSchema = z.object({ city: z.string().min(1), state: z.string().min(1), country: z.string().optional() });
+// OpenAI-style structured outputs reject .optional() without .nullable();
+// downstream withCountry() already defaults a null country to "MX".
+const locationSchema = z.object({ city: z.string().min(1), state: z.string().min(1), country: z.string().nullable() });
 const extractedLanesSchema = z
   .object({
     lanes: z.array(
