@@ -28,6 +28,81 @@ docker_daemon_available() {
   command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1
 }
 
+validate_human_simulator_fixture() {
+  local fixture_dir="$APPLIANCE_DIR/examples/human-simulator"
+  local required_file
+  local fixture_files=(
+    "README.md"
+    "client-manifest.yaml"
+    "connectors/agent/agent-config.yaml"
+    "connectors/tms-adapter.yaml"
+    "connectors/tms-mapping.json"
+    "connectors/knowledge/operating-policy.md"
+    "fixtures/rfq-email.txt"
+    "verify.sh"
+  )
+
+  for required_file in "${fixture_files[@]}"; do
+    [[ -f "$fixture_dir/$required_file" ]] || fail "human simulator fixture missing: $required_file"
+  done
+  [[ -x "$fixture_dir/verify.sh" ]] || fail "human simulator verifier must be executable"
+
+  FIXTURE_DIR="$fixture_dir" node --import tsx --input-type=module -e '
+    import { readFile } from "node:fs/promises";
+    import { join } from "node:path";
+    import { parse as parseYaml } from "yaml";
+    import { loadAgentRuntimeConfig } from "./packages/connectors/src/agent/AgentRuntimeConfig.ts";
+    import { loadTmsAdapterConfig } from "./packages/connectors/src/tms/TmsAdapterConfig.ts";
+    import { tmsMappingConfigSchema } from "./packages/contracts/src/tmsCanonical.ts";
+
+    void (async () => {
+      const fixtureDir = process.env.FIXTURE_DIR;
+      if (!fixtureDir) throw new Error("fixture directory is required");
+      const [manifestRaw, agent, tms, mappingRaw] = await Promise.all([
+        readFile(join(fixtureDir, "client-manifest.yaml"), "utf8"),
+        loadAgentRuntimeConfig(join(fixtureDir, "connectors/agent/agent-config.yaml")),
+        loadTmsAdapterConfig(join(fixtureDir, "connectors/tms-adapter.yaml")),
+        readFile(join(fixtureDir, "connectors/tms-mapping.json"), "utf8")
+      ]);
+      const manifest = parseYaml(manifestRaw);
+      const mapping = tmsMappingConfigSchema.parse(JSON.parse(mappingRaw));
+      if (manifest.client_id !== "RESAUX") throw new Error("fixture manifest must use client_id RESAUX");
+      if (!manifest.business_units?.some((unit) => unit.requester_email_domains?.includes("resaux.io"))) {
+        throw new Error("fixture manifest must allow requester domain resaux.io");
+      }
+      if (agent.model.provider !== "openai" || agent.model.model_name !== "nvidia/nemotron-3-ultra-550b-a55b") {
+        throw new Error("fixture agent must use the verified NVIDIA NIM OpenAI-compatible model");
+      }
+      if (agent.model.api_key_env !== "NVIDIA_NIM_API_KEY" || agent.model.base_url !== "https://integrate.api.nvidia.com/v1") {
+        throw new Error("fixture agent must name the NVIDIA NIM runtime configuration");
+      }
+      if (agent.mailbox?.provider !== "resend") throw new Error("fixture mailbox provider must be resend");
+      if (tms.provider !== "http" || tms.base_url_env !== "MOCK_TMS_BASE_URL") {
+        throw new Error("fixture TMS adapter must be the HTTP mock TMS contract");
+      }
+      if (mapping.client_id !== "RESAUX" || mapping.transport !== "http" || mapping.runtime_ai_calls_allowed !== false) {
+        throw new Error("fixture TMS mapping must be strict and bound to RESAUX");
+      }
+    })().catch((error) => {
+      console.error(error);
+      process.exitCode = 1;
+    });
+  '
+
+  if rg -n --hidden --glob '!README.md' --glob '!*.md' \
+    '(gh[pousr]_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{20,}|nvapi-[A-Za-z0-9_-]{20,}|re_[A-Za-z0-9_-]{20,}|-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----)' \
+    "$fixture_dir" >/dev/null; then
+    fail "human simulator fixture appears to contain a committed secret"
+  fi
+  if rg -n --hidden \
+    '(gh[pousr]_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{20,}|nvapi-[A-Za-z0-9_-]{20,}|re_[A-Za-z0-9_-]{20,}|-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----)' \
+    "$fixture_dir/README.md" "$fixture_dir/connectors/knowledge/operating-policy.md" >/dev/null; then
+    fail "human simulator fixture documentation appears to contain a committed secret"
+  fi
+}
+
+validate_human_simulator_fixture
+
 validate_schema_sql_with_postgres() {
   local schema_test_dir
   local schema_sql_file

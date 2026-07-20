@@ -1,0 +1,53 @@
+{
+  "client_id": "RESAUX",
+  "endpoint_url": "http://mock-tms:8099",
+  "auth_method": "api_key",
+  "api_key_env": "MOCK_TMS_API_KEY",
+  "transport": "http",
+  "mapping_engine": "jsonpath",
+  "schema_hash": "sha256:sap-contract-simulator-v1",
+  "mappings": {
+    "units": "$[*]",
+    "performance": "$[*]",
+    "liquidations": "$[*]",
+    "availability_zones": "$[*]"
+  },
+  "mapping_json": {
+    "units": {
+      "unit_id": "unit_id",
+      "current_lat": "current_lat",
+      "current_lng": "current_lng",
+      "status": "status",
+      "next_destination_city": "next_destination_city"
+    },
+    "performance": {
+      "unit_type": "unit_type",
+      "kpl_yield": "kpl_yield",
+      "real_cost_per_km": "real_cost_per_km"
+    },
+    "liquidations": {
+      "liquidation_id": "liquidation_id",
+      "unit_id": "vehicle_profile_id",
+      "route_id": "liquidation_id",
+      "settled_cost": "direct_cost_mxn",
+      "settled_at": "quoted_at"
+    },
+    "availability_zones": {
+      "zone_id": "zone_id",
+      "city": "city",
+      "state": "state",
+      "country": "country",
+      "available_units": "available_units"
+    }
+  },
+  "capabilities": {
+    "units": true,
+    "routes": false,
+    "performance": true,
+    "pricing_history": false,
+    "liquidations": true,
+    "availability_zones": true
+  },
+  "drift_status": "not_validated",
+  "runtime_ai_calls_allowed": false
+}

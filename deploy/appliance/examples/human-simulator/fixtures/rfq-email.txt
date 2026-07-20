@@ -1,0 +1,14 @@
+From: Synthetic RFQ Sender <rfq.sender@resaux.io>
+To: Runtime-injected verified Resend receiving address
+Subject: RFQ simulada GDL a Monterrey — caja seca 53
+Date: Mon, 20 Jul 2026 10:00:00 -0600
+Message-ID: <human-simulator-rfq-20260720@resaux.io>
+
+Hola equipo,
+
+Favor de cotizar un viaje de Guadalajara, Jalisco a Monterrey, Nuevo Leon.
+Requerimos una caja seca de 53 pies para 18,000 kg de carga general.
+Servicio de una sola vuelta por cuota, recoleccion el 21 de julio.
+
+Esta solicitud es sintetica para validar intake, extraccion, SAKBE, precio,
+aprobacion y writeback del simulador humano. No representa una solicitud real.

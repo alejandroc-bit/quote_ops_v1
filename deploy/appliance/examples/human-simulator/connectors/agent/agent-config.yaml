@@ -1,0 +1,39 @@
+model:
+  provider: openai
+  model_name: nvidia/nemotron-3-ultra-550b-a55b
+  temperature: 0
+  api_key_env: NVIDIA_NIM_API_KEY
+  base_url: https://integrate.api.nvidia.com/v1
+authorization:
+  approver_email: alejandro@resaux.io
+  allowed_domains:
+    - resaux.io
+  tools:
+    email.intake:
+      effect: read
+      mode: allowed
+    knowledge.search:
+      effect: read
+      mode: allowed
+    route.resolve:
+      effect: read
+      mode: allowed
+    tms.searchHistorical:
+      effect: read
+      mode: allowed
+    tms.writeQuoteResult:
+      effect: write
+      mode: allowed
+    email.sendQuote:
+      effect: send
+      mode: approval_required
+    approval.decide:
+      effect: approve
+      mode: approval_required
+mailbox:
+  provider: resend
+  auth: password
+  processed_mailbox: null
+  poll_interval_ms: 60000
+  imap_host: null
+  imap_port: null
