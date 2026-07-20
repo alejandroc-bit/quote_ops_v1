@@ -54,7 +54,7 @@ The heartbeat `ai_key_status` uses the same model-provider rule so the cloud and
 - agent config using NVIDIA NIM via `NVIDIA_NIM_API_KEY` and Resend intake;
 - HTTP TMS adapter plus strict mapping JSON for the SAP-like mock contract;
 - small knowledge document and a synthetic RFQ payload;
-- a runbook and a verification script that query health/setup/RFQ state without printing secrets.
+- a runbook plus an aggregate health/setup verifier that prints no secrets; run-specific RFQ/provider proofs are captured separately.
 
 The actual Resend receiving address is discovered live. No unverified or different domain may be substituted. Runtime secrets are copied from `/Users/alejandro/inducta/KEYS.md` into the VPS root-only secret file and never into the generated client package.
 
