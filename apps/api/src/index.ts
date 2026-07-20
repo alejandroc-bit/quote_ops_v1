@@ -1128,8 +1128,9 @@ async function hasTmsConnection(
 
     const requiredKeys = new Set<string>([config.base_url_env]);
     for (const value of Object.values(config.headers ?? {})) {
-      for (const key of value.matchAll(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g)) {
-        requiredKeys.add(key[1]);
+      for (const match of value.matchAll(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g)) {
+        const key = match[1];
+        if (key) requiredKeys.add(key);
       }
     }
     return [...requiredKeys].every((key) => hasConfiguredKey(key, readiness, env));

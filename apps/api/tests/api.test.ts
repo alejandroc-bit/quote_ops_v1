@@ -1286,6 +1286,11 @@ describe("QuoteOps API", () => {
       TMS_HTTP_BASE_URL: "",
       TMS_HTTP_TOKEN: ""
     });
+    await expectPendingConnection({
+      QUOTEOPS_TMS_ADAPTER_CONFIG_PATH: httpAdapterPath,
+      TMS_HTTP_BASE_URL: "https://tms.example.test",
+      TMS_HTTP_TOKEN: ""
+    });
 
     await withEnv(
       await setupReadyEnv({
