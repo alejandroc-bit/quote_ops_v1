@@ -143,17 +143,19 @@ validate_schema_sql_with_postgres() {
 
   ready=0
   for _ in {1..30}; do
-    if docker exec "$container_name" pg_isready -U "$postgres_user" -d "$postgres_db" >/dev/null 2>&1; then
+    # The image entrypoint's temporary bootstrap server can answer pg_isready
+    # before POSTGRES_DB exists, then shut down before the next command. It can
+    # also create POSTGRES_DB before that shutdown, so require both the final
+    # PID 1 postgres process and a query against the requested database.
+    if docker exec "$container_name" sh -c '[ "$(cat /proc/1/comm)" = postgres ]' >/dev/null 2>&1 && \
+      docker exec "$container_name" psql -X -v ON_ERROR_STOP=1 -qAt \
+      -U "$postgres_user" -d "$postgres_db" -c 'select 1' 2>/dev/null | grep -q '^1$'; then
       ready=1
       break
     fi
     sleep 1
   done
-  [[ "$ready" == "1" ]] || fail "postgres schema smoke did not become ready"
-
-  docker exec "$container_name" psql -At -U "$postgres_user" -d postgres -c \
-    "select 1 from pg_database where datname = '$postgres_db';" | grep -q '^1$' ||
-    docker exec "$container_name" createdb -U "$postgres_user" "$postgres_db"
+  [[ "$ready" == "1" ]] || fail "postgres schema smoke did not accept a SQL query against target database $postgres_db after 30 seconds"
 
   docker exec -i --env PGOPTIONS='-c client_min_messages=warning' "$container_name" psql -v ON_ERROR_STOP=1 -U "$postgres_user" -d "$postgres_db" < "$schema_sql_file" >/dev/null
   docker exec -i --env PGOPTIONS='-c client_min_messages=warning' "$container_name" psql -v ON_ERROR_STOP=1 -U "$postgres_user" -d "$postgres_db" < "$schema_sql_file" >/dev/null
