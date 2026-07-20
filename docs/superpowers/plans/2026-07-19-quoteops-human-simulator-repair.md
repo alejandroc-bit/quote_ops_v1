@@ -109,7 +109,7 @@ git commit -m "feat(appliance): install explicit TMS mapping config"
 
 ### Step 1: Write failing fixture contract checks
 
-Add smoke checks that require every fixture file, parse the manifest/agent/TMS configs through production loaders, verify `client_id: RESAUXSIM`, allowed requester domain `resaux.io`, model key env `NVIDIA_NIM_API_KEY`, mailbox provider `resend`, explicit TMS mapping, staged knowledge, and an executable verifier. Assert the fixture contains no strings matching committed secret/token formats.
+Add smoke checks that require every fixture file, parse the manifest/agent/TMS configs through production loaders, verify `client_id: RESAUX`, allowed requester domain `resaux.io`, model key env `NVIDIA_NIM_API_KEY`, mailbox provider `resend`, explicit TMS mapping, staged knowledge, and an executable verifier. Assert the fixture contains no strings matching committed secret/token formats.
 
 ### Step 2: Verify RED
 
@@ -157,7 +157,7 @@ Give a final reviewer the design, implementation plan, commit range, focused tes
 
 Choose the next non-conflicting semantic tag, build the `agent`, `api`, and `web` images from the reviewed commit, publish to `ghcr.io/alejandroc-bit`, and record digests. Never overwrite `v0.1.2`.
 
-## Task 5: Generate a fresh cloud client/install pack
+## Task 5: Generate a fresh cloud install pack
 
 **Files:**
 
@@ -170,7 +170,7 @@ Inspect `/Users/alejandro/inducta/KEYS.md` for the named Resend, NVIDIA NIM, and
 
 ### Step 2: Create client and install pack
 
-In the live control plane, create/reset only synthetic client `RESAUXSIM` with authorized email `alejandro@resaux.io`; generate a fresh, one-use install pack and record a redacted projection. Do not persist the registration token in evidence.
+In the live control plane, use the existing tenant `RESAUX` already authorized for `alejandro@resaux.io`; generate a fresh, one-use install pack and record a redacted projection. The fresh-install simulation uses a new registration token and installation id without duplicating the tenant or rewriting another email. Do not persist the registration token in evidence.
 
 ### Step 3: Complete mailbox authorization
 
@@ -192,7 +192,7 @@ Stop/delete only `quoteops_vpse2e`, remove only its resolved installation data, 
 
 ### Step 3: Install from zero
 
-Install the fresh `RESAUXSIM` pack using the immutable image tag, new installation id, verified Resend address, `NVIDIA_NIM_API_KEY`, live SAKBÉ key, and the mock TMS HTTP endpoint/mapping. Set secret files to `0600`; do not print values.
+Install the fresh `RESAUX` pack using the immutable image tag, new installation id, verified Resend address, `NVIDIA_NIM_API_KEY`, live SAKBÉ key, and the mock TMS HTTP endpoint/mapping. Set secret files to `0600`; do not print values.
 
 ### Step 4: Activate and verify baseline
 
@@ -220,4 +220,3 @@ Run `verify.sh` against the VPS endpoint and save its redacted output. Verify `/
 ### Step 4: Final security and requirement audit
 
 Search the evidence directory and Git diff for key/token patterns. Confirm no secrets, raw authorization URLs, or mailbox contents are committed. Map each requested requirement to a concrete artifact and distinguish simulated SAP compatibility from a real SAP integration.
-

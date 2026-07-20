@@ -50,7 +50,7 @@ The heartbeat `ai_key_status` uses the same model-provider rule so the cloud and
 
 `deploy/appliance/examples/human-simulator/` contains only non-secret artifacts:
 
-- manifest for client `RESAUXSIM`, requester domain `resaux.io`, and a deterministic dry-van pricing profile;
+- manifest for client `RESAUX`, requester domain `resaux.io`, and a deterministic dry-van pricing profile;
 - agent config using NVIDIA NIM via `NVIDIA_NIM_API_KEY` and Resend intake;
 - HTTP TMS adapter plus strict mapping JSON for the SAP-like mock contract;
 - small knowledge document and a synthetic RFQ payload;
@@ -60,7 +60,7 @@ The actual Resend receiving address is discovered live. No unverified or differe
 
 ### 4. Clean deployment and evidence
 
-Before reset, record the exact Hostinger project/container state. Delete only the Compose project and install directory associated with `quoteops_vpse2e`. Generate a fresh cloud client/install pack for `RESAUXSIM` with authorized email `alejandro@resaux.io`, open the delivered authorization link from Alejandro's mailbox, and install with a new registration token and installation id.
+Before reset, record the exact Hostinger project/container state. Delete only the Compose project and install directory associated with `quoteops_vpse2e`. Live discovery showed that `alejandro@resaux.io` already belongs to tenant `RESAUX`, with a previous installation visible in the portal. To preserve the exact authorized email and the control plane's email uniqueness, generate a fresh one-use install pack for `RESAUX` and treat it as a new customer installation with a new registration token and installation id; do not create a duplicate tenant or rewrite another customer's email. Open the delivered authorization link from Alejandro's mailbox.
 
 Build and publish a new immutable image tag from this branch. The VPS installation must pin that tag. Evidence records digests/versions and redacts all credentials.
 
@@ -89,4 +89,3 @@ The human-simulator sends a synthetic RFQ through the configured Resend receivin
 - Fixture configs parse using production schemas; the verifier fails closed on any pending setup step.
 - Full `npm test`, TypeScript build, web build, and appliance smoke pass from the repair branch.
 - Live VPS proof covers all eight checks above; anything not evidenced is reported as not verified.
-
