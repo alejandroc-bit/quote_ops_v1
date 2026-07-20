@@ -1,4 +1,4 @@
-import { access, appendFile, mkdir, readFile } from "node:fs/promises";
+import { access, appendFile, mkdir, open, readFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import { parse } from "csv-parse/sync";
 import {
@@ -335,7 +335,12 @@ function isWritebackPathKey(key: keyof FileImportTmsAdapterConfig): boolean {
 
 async function ensureWritableTarget(path: string): Promise<void> {
   await mkdir(dirname(path), { recursive: true });
-  await access(dirname(path));
+  // Opening with append is the same non-destructive operation used by the
+  // writeback queue. It proves that a missing target can be created and an
+  // existing target can be appended to; checking mode bits or access() alone
+  // is not reliable for privileged processes.
+  const handle = await open(path, "a");
+  await handle.close();
 }
 
 async function appendJsonLine(path: string, payload: unknown): Promise<void> {

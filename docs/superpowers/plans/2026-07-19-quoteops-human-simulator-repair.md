@@ -170,7 +170,7 @@ Inspect `/Users/alejandro/inducta/KEYS.md` for the named Resend, NVIDIA NIM, and
 
 ### Step 2: Create client and install pack
 
-In the live control plane, use the existing tenant `RESAUX` already authorized for `alejandro@resaux.io`; generate a fresh, one-use install pack and record a redacted projection. The fresh-install simulation uses a new registration token and installation id without duplicating the tenant or rewriting another email. Do not persist the registration token in evidence.
+In the live control plane, use the existing tenant `RESAUX` already authorized for `alejandro@resaux.io`; generate a fresh, one-use install pack and record a redacted projection. The fresh-install simulation uses a new registration token with RESAUX's stable canonical installation ID, without duplicating the tenant or rewriting another email. Do not persist the registration token in evidence.
 
 ### Step 3: Complete mailbox authorization
 
@@ -192,7 +192,7 @@ Stop/delete only `quoteops_vpse2e`, remove only its resolved installation data, 
 
 ### Step 3: Install from zero
 
-Install the fresh `RESAUX` pack using the immutable image tag, new installation id, verified Resend address, `NVIDIA_NIM_API_KEY`, live SAKBÉ key, and the mock TMS HTTP endpoint/mapping. Set secret files to `0600`; do not print values.
+Install the fresh `RESAUX` pack using the immutable image tag, RESAUX's stable canonical installation ID, and a freshly generated one-use registration token. Inject the verified Resend address, `NVIDIA_NIM_API_KEY`, live SAKBÉ key, and the mock TMS HTTP endpoint/mapping. Set secret files to `0600`; do not print values.
 
 ### Step 4: Activate and verify baseline
 
@@ -215,7 +215,7 @@ Capture redacted evidence for Resend receiving/processing, NVIDIA extraction, SA
 
 ### Step 3: Run the fixture verifier
 
-Run `verify.sh` against the VPS endpoint and save its redacted output. Verify `/api/setup-state.required_steps` is empty and all containers are healthy.
+Run `verify.sh` against the VPS endpoint and save its redacted output. It proves only aggregate health and that `/api/setup-state.required_steps` is empty. Retain separate run-specific evidence for Resend intake, NVIDIA extraction, SAKBÉ routing, pricing, approval, mock-TMS quote/status writebacks, and control-plane heartbeat.
 
 ### Step 4: Final security and requirement audit
 

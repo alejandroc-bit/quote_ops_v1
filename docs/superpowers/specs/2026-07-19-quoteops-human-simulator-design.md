@@ -60,7 +60,7 @@ The actual Resend receiving address is discovered live. No unverified or differe
 
 ### 4. Clean deployment and evidence
 
-Before reset, record the exact Hostinger project/container state. Delete only the Compose project and install directory associated with `quoteops_vpse2e`. Live discovery showed that `alejandro@resaux.io` already belongs to tenant `RESAUX`, with a previous installation visible in the portal. To preserve the exact authorized email and the control plane's email uniqueness, generate a fresh one-use install pack for `RESAUX` and treat it as a new customer installation with a new registration token and installation id; do not create a duplicate tenant or rewrite another customer's email. Open the delivered authorization link from Alejandro's mailbox.
+Before reset, record the exact Hostinger project/container state. Delete only the Compose project and install directory associated with `quoteops_vpse2e`. Live discovery showed that `alejandro@resaux.io` already belongs to tenant `RESAUX`, with a previous installation visible in the portal. To preserve the exact authorized email and the control plane's email uniqueness, generate a fresh one-use install pack and registration token for `RESAUX`, while reusing its stable canonical installation ID; do not create a duplicate tenant, invent a new installation ID, or rewrite another customer's email. Open the delivered authorization link from Alejandro's mailbox.
 
 Build and publish a new immutable image tag from this branch. The VPS installation must pin that tag. Evidence records digests/versions and redacts all credentials.
 
@@ -73,7 +73,9 @@ The human-simulator sends a synthetic RFQ through the configured Resend receivin
 5. Required approval was completed through the authorized user path when applicable.
 6. The HTTP mock TMS received quote/status writeback.
 7. `/api/setup-state` has no remaining required steps.
-8. The control plane reports the new installation heartbeat and configured AI status.
+8. The control plane reports the RESAUX installation heartbeat and configured AI status.
+
+`verify.sh` establishes only aggregate health and setup readiness. Resend receipt/processing, NVIDIA extraction, SAKBÉ route evidence, pricing, approval, TMS writebacks, and the heartbeat remain separate run-specific proofs in the evidence bundle.
 
 ## Safety and secret handling
 

@@ -19,6 +19,7 @@ import {
 } from "@quoteops/shared";
 import {
   loadAgentRuntimeConfig,
+  createTmsAdapterFromConfig,
   loadTmsAdapterConfig,
   tmsMappingConfigSchema,
   type AgentRuntimeConfig
@@ -1108,7 +1109,7 @@ async function hasTmsConnection(
   try {
     const config = await loadTmsAdapterConfig(adapterPath);
     if (config.provider === "file_import") {
-      return [
+      const configuredPathEnvKeys = [
         config.rfqs_path_env,
         config.historical_quotes_path_env,
         config.historical_shipments_path_env,
@@ -1120,7 +1121,16 @@ async function hasTmsConnection(
         config.availability_zones_path_env,
         config.quote_writebacks_path_env,
         config.status_writebacks_path_env
-      ].every((key) => !key || hasConfiguredKey(key, readiness, env));
+      ].filter((key): key is string => Boolean(key));
+
+      // A file-import adapter cannot be considered connected merely because
+      // its env-var names exist. Build the production adapter and check each
+      // configured input/writeback path, keeping the legacy empty adapter
+      // configuration valid for packs that stage their CSVs later.
+      if (!configuredPathEnvKeys.every((key) => Boolean(optionalEnv(env[key])))) {
+        return false;
+      }
+      return (await (await createTmsAdapterFromConfig(adapterPath, { env })).healthCheck()).ok;
     }
     if (config.provider === "sql") {
       return hasConfiguredKey(config.connection_url_env, readiness, env);

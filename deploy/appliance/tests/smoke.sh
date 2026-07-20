@@ -28,6 +28,12 @@ docker_daemon_available() {
   command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1
 }
 
+file_mode() {
+  # Node is a runtime prerequisite and reports POSIX mode bits consistently on
+  # GNU/Linux and BSD/macOS, unlike the incompatible stat command variants.
+  node -e 'const mode = require("node:fs").statSync(process.argv[1]).mode & 0o777; process.stdout.write(mode.toString(8).padStart(3, "0"));' "$1"
+}
+
 validate_human_simulator_fixture() {
   local fixture_dir="$APPLIANCE_DIR/examples/human-simulator"
   local required_file
@@ -77,7 +83,7 @@ validate_human_simulator_fixture() {
       }
       if (agent.mailbox?.provider !== "resend") throw new Error("fixture mailbox provider must be resend");
       if (tms.provider !== "http" || tms.base_url_env !== "MOCK_TMS_BASE_URL" || tms.headers) {
-        throw new Error("fixture TMS adapter must use the HTTP mock TMS contract without a mock secret header");
+        throw new Error("fixture mock adapter must send no credential header; mapping API-key fields are schema metadata only");
       }
       if (mapping.client_id !== "RESAUX" || mapping.transport !== "http" || mapping.runtime_ai_calls_allowed !== false) {
         throw new Error("fixture TMS mapping must be strict and bound to RESAUX");
@@ -325,7 +331,7 @@ if grep -q 'registration-token-test' "$INSTALL_GUARD_DIR/home-one/.env"; then
 fi
 grep -q '^QUOTEOPS_TMS_MAPPING_CONFIG_PATH="/opt/quoteops-v1/connectors/tms-mapping.json"$' "$INSTALL_GUARD_DIR/home-one/.env" || fail "install.sh did not write TMS mapping config path"
 cmp -s "$INSTALL_TMS_MAPPING" "$INSTALL_CONNECTORS_TARGET/tms-mapping.json" || fail "install.sh did not copy TMS mapping config"
-[[ "$(stat -f '%Lp' "$INSTALL_CONNECTORS_TARGET/tms-mapping.json")" == "600" ]] || fail "install.sh did not protect TMS mapping config"
+[[ "$(file_mode "$INSTALL_CONNECTORS_TARGET/tms-mapping.json")" == "600" ]] || fail "install.sh did not protect TMS mapping config"
 install_mapping_guard_run "$INSTALL_GUARD_DIR/home-mapping-one" >/dev/null
 rm -f "$INSTALL_MAPPING_CONNECTORS_TARGET/agent/agent-config.yaml"
 if install_mapping_guard_run "$INSTALL_GUARD_DIR/home-mapping-two" >"$INSTALL_GUARD_DIR/mapping-guard.log" 2>&1; then

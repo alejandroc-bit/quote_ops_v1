@@ -1239,12 +1239,23 @@ describe("QuoteOps API", () => {
     const malformedAdapterPath = join(dir, "malformed-tms-adapter.yaml");
     const httpAdapterPath = join(dir, "http-tms-adapter.yaml");
     const fileImportAdapterPath = join(dir, "file-import-tms-adapter.yaml");
+    const usableRfqPath = join(dir, "rfqs.csv");
+    const usableWritebackPath = join(dir, "writebacks", "quotes.ndjson");
+    const notADirectoryPath = join(dir, "not-a-directory");
     await writeFile(malformedAdapterPath, "provider: unsupported\n", "utf8");
     await writeFile(
       fileImportAdapterPath,
-      ["provider: file_import", "rfqs_path_env: CLIENT_RFQS_PATH", ""].join("\n"),
+      [
+        "provider: file_import",
+        "rfqs_path_env: CLIENT_RFQS_PATH",
+        "quote_writebacks_path_env: CLIENT_QUOTE_WRITEBACKS_PATH",
+        ""
+      ].join("\n"),
       "utf8"
     );
+    await writeFile(usableRfqPath, "rfq_id,lane_id\n", "utf8");
+    await mkdir(join(dir, "writebacks"), { recursive: true });
+    await writeFile(notADirectoryPath, "not a directory\n", "utf8");
     await writeFile(
       httpAdapterPath,
       [
@@ -1279,7 +1290,20 @@ describe("QuoteOps API", () => {
     });
     await expectPendingConnection({
       QUOTEOPS_TMS_ADAPTER_CONFIG_PATH: fileImportAdapterPath,
-      CLIENT_RFQS_PATH: ""
+      CLIENT_RFQS_PATH: "",
+      CLIENT_QUOTE_WRITEBACKS_PATH: usableWritebackPath
+    });
+    await expectPendingConnection({
+      QUOTEOPS_TMS_ADAPTER_CONFIG_PATH: fileImportAdapterPath,
+      CLIENT_RFQS_PATH: join(dir, "missing-rfqs.csv"),
+      CLIENT_QUOTE_WRITEBACKS_PATH: usableWritebackPath
+    });
+    // A file used as a would-be parent is deterministically unusable on both
+    // root and unprivileged test runs; chmod alone is not reliable for root.
+    await expectPendingConnection({
+      QUOTEOPS_TMS_ADAPTER_CONFIG_PATH: fileImportAdapterPath,
+      CLIENT_RFQS_PATH: usableRfqPath,
+      CLIENT_QUOTE_WRITEBACKS_PATH: join(notADirectoryPath, "quotes.ndjson")
     });
     await expectPendingConnection({
       QUOTEOPS_TMS_ADAPTER_CONFIG_PATH: httpAdapterPath,
@@ -1295,7 +1319,8 @@ describe("QuoteOps API", () => {
     await withEnv(
       await setupReadyEnv({
         QUOTEOPS_TMS_ADAPTER_CONFIG_PATH: fileImportAdapterPath,
-        CLIENT_RFQS_PATH: join(dir, "rfqs.json")
+        CLIENT_RFQS_PATH: usableRfqPath,
+        CLIENT_QUOTE_WRITEBACKS_PATH: usableWritebackPath
       }),
       async () => {
         const baseUrl = await startApi({
