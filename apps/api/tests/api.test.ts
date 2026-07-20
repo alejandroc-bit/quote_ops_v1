@@ -1238,7 +1238,13 @@ describe("QuoteOps API", () => {
     tempDirs.push(dir);
     const malformedAdapterPath = join(dir, "malformed-tms-adapter.yaml");
     const httpAdapterPath = join(dir, "http-tms-adapter.yaml");
+    const fileImportAdapterPath = join(dir, "file-import-tms-adapter.yaml");
     await writeFile(malformedAdapterPath, "provider: unsupported\n", "utf8");
+    await writeFile(
+      fileImportAdapterPath,
+      ["provider: file_import", "rfqs_path_env: CLIENT_RFQS_PATH", ""].join("\n"),
+      "utf8"
+    );
     await writeFile(
       httpAdapterPath,
       [
@@ -1272,10 +1278,31 @@ describe("QuoteOps API", () => {
       QUOTEOPS_TMS_ADAPTER_CONFIG_PATH: malformedAdapterPath
     });
     await expectPendingConnection({
+      QUOTEOPS_TMS_ADAPTER_CONFIG_PATH: fileImportAdapterPath,
+      CLIENT_RFQS_PATH: ""
+    });
+    await expectPendingConnection({
       QUOTEOPS_TMS_ADAPTER_CONFIG_PATH: httpAdapterPath,
       TMS_HTTP_BASE_URL: "",
       TMS_HTTP_TOKEN: ""
     });
+
+    await withEnv(
+      await setupReadyEnv({
+        QUOTEOPS_TMS_ADAPTER_CONFIG_PATH: fileImportAdapterPath,
+        CLIENT_RFQS_PATH: join(dir, "rfqs.json")
+      }),
+      async () => {
+        const baseUrl = await startApi({
+          defaultManifest: Promise.resolve(workflowInput.manifest)
+        });
+        const response = await fetch(`${baseUrl}/api/setup-state`);
+        const setup = await response.json();
+
+        expect(response.status).toBe(200);
+        expect(setup.required_steps).not.toContain("connect_tms");
+      }
+    );
   });
 
   it("keeps the test RFQ step required until an approved run has route and writeback evidence", async () => {

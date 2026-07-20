@@ -1107,7 +1107,21 @@ async function hasTmsConnection(
 
   try {
     const config = await loadTmsAdapterConfig(adapterPath);
-    if (config.provider === "file_import") return true;
+    if (config.provider === "file_import") {
+      return [
+        config.rfqs_path_env,
+        config.historical_quotes_path_env,
+        config.historical_shipments_path_env,
+        config.customers_path_env,
+        config.agreements_path_env,
+        config.unit_positions_path_env,
+        config.units_path_env,
+        config.performance_path_env,
+        config.availability_zones_path_env,
+        config.quote_writebacks_path_env,
+        config.status_writebacks_path_env
+      ].every((key) => !key || hasConfiguredKey(key, readiness, env));
+    }
     if (config.provider === "sql") {
       return hasConfiguredKey(config.connection_url_env, readiness, env);
     }
