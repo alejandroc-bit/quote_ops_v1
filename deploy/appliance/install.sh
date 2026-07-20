@@ -11,6 +11,7 @@ MANIFEST_PATH=""
 CONNECTORS_PATH=""
 AGENT_CONFIG_PATH=""
 TMS_ADAPTER_CONFIG_PATH=""
+TMS_MAPPING_CONFIG_PATH=""
 QUOTEOPS_VERSION="${QUOTEOPS_VERSION:-v0.1.0}"
 QUOTEOPS_IMAGE_REGISTRY="${QUOTEOPS_IMAGE_REGISTRY:-ghcr.io/alejandroc-bit}"
 QUOTEOPS_SITE_ADDRESS="${QUOTEOPS_SITE_ADDRESS:-:80}"
@@ -46,6 +47,7 @@ Options:
   --connectors-dir PATH    Connector data root (default: <home>/connectors)
   --agent-config PATH      Copy agent config YAML/JSON into connectors/agent
   --tms-adapter-config PATH Copy TMS adapter config YAML/JSON into connectors/tms-adapter.yaml
+  --tms-mapping-config PATH Copy strict TMS mapping JSON into connectors/tms-mapping.json
   --version VERSION        QuoteOps image tag (default: v0.1.0)
   --image-registry IMAGE   Image registry/prefix (default: ghcr.io/alejandroc-bit)
   --site-address ADDRESS   Caddy site address (default: :80)
@@ -223,6 +225,11 @@ while [[ $# -gt 0 ]]; do
       TMS_ADAPTER_CONFIG_PATH="$2"
       shift 2
       ;;
+    --tms-mapping-config)
+      require_value "$1" "${2:-}"
+      TMS_MAPPING_CONFIG_PATH="$2"
+      shift 2
+      ;;
     --version)
       require_value "$1" "${2:-}"
       QUOTEOPS_VERSION="$2"
@@ -332,6 +339,10 @@ if [[ -n "$TMS_ADAPTER_CONFIG_PATH" ]]; then
   [[ -f "$TMS_ADAPTER_CONFIG_PATH" ]] || die "TMS adapter config not found: $TMS_ADAPTER_CONFIG_PATH"
   [[ -r "$TMS_ADAPTER_CONFIG_PATH" ]] || die "TMS adapter config is not readable: $TMS_ADAPTER_CONFIG_PATH"
 fi
+if [[ -n "$TMS_MAPPING_CONFIG_PATH" ]]; then
+  [[ -f "$TMS_MAPPING_CONFIG_PATH" ]] || die "TMS mapping config not found: $TMS_MAPPING_CONFIG_PATH"
+  [[ -r "$TMS_MAPPING_CONFIG_PATH" ]] || die "TMS mapping config is not readable: $TMS_MAPPING_CONFIG_PATH"
+fi
 validate_identifier "--postgres-db" "$POSTGRES_DB"
 validate_identifier "--postgres-user" "$POSTGRES_USER"
 
@@ -345,6 +356,9 @@ if [[ -n "$AGENT_CONFIG_PATH" ]]; then
 fi
 if [[ -n "$TMS_ADAPTER_CONFIG_PATH" ]]; then
   TMS_ADAPTER_CONFIG_PATH="$(absolute_path "$TMS_ADAPTER_CONFIG_PATH")"
+fi
+if [[ -n "$TMS_MAPPING_CONFIG_PATH" ]]; then
+  TMS_MAPPING_CONFIG_PATH="$(absolute_path "$TMS_MAPPING_CONFIG_PATH")"
 fi
 if [[ -z "$AGENT_CONFIG_PATH" ]]; then
   if [[ -z "$CONNECTORS_PATH" || ! -f "$CONNECTORS_PATH/agent/agent-config.yaml" ]]; then
@@ -379,11 +393,15 @@ TARGET_MANIFEST="$QUOTEOPS_MANIFEST_DIR/client-manifest.yaml"
 guard_target "manifest copy" "$TARGET_MANIFEST"
 TARGET_AGENT_CONFIG="$QUOTEOPS_CONNECTORS_DIR/agent/agent-config.yaml"
 TARGET_TMS_ADAPTER_CONFIG="$QUOTEOPS_CONNECTORS_DIR/tms-adapter.yaml"
+TARGET_TMS_MAPPING_CONFIG="$QUOTEOPS_CONNECTORS_DIR/tms-mapping.json"
 if [[ -n "$AGENT_CONFIG_PATH" || ( -n "$CONNECTORS_PATH" && -e "$CONNECTORS_PATH/agent/agent-config.yaml" ) ]]; then
   guard_target "agent config copy" "$TARGET_AGENT_CONFIG"
 fi
 if [[ -n "$TMS_ADAPTER_CONFIG_PATH" || ( -n "$CONNECTORS_PATH" && -e "$CONNECTORS_PATH/tms-adapter.yaml" ) ]]; then
   guard_target "TMS adapter config copy" "$TARGET_TMS_ADAPTER_CONFIG"
+fi
+if [[ -n "$TMS_MAPPING_CONFIG_PATH" || ( -n "$CONNECTORS_PATH" && -e "$CONNECTORS_PATH/tms-mapping.json" ) ]]; then
+  guard_target "TMS mapping config copy" "$TARGET_TMS_MAPPING_CONFIG"
 fi
 if [[ -n "$CONNECTORS_PATH" && "$FORCE" -ne 1 ]]; then
   guard_connector_pack_overwrite "$CONNECTORS_PATH" "$QUOTEOPS_CONNECTORS_DIR"
@@ -420,6 +438,9 @@ trap cleanup EXIT
   write_env_line QUOTEOPS_SECRETS_ENV_FILE "$SECRETS_ENV_FILE"
   write_env_line QUOTEOPS_AGENT_CONFIG_PATH "/opt/quoteops-v1/connectors/agent/agent-config.yaml"
   write_env_line QUOTEOPS_TMS_ADAPTER_CONFIG_PATH "/opt/quoteops-v1/connectors/tms-adapter.yaml"
+  if [[ -n "$TMS_MAPPING_CONFIG_PATH" || ( -n "$CONNECTORS_PATH" && -e "$CONNECTORS_PATH/tms-mapping.json" ) ]]; then
+    write_env_line QUOTEOPS_TMS_MAPPING_CONFIG_PATH "/opt/quoteops-v1/connectors/tms-mapping.json"
+  fi
   write_env_line QUOTEOPS_ROUTE_CACHE_PATH "/opt/quoteops-v1/connectors/sakbe/route-cache.json"
   write_env_line QUOTEOPS_SAKBE_CACHE_MODE "$QUOTEOPS_SAKBE_CACHE_MODE"
   write_env_line QUOTEOPS_SAKBE_LIVE_ENABLED "$QUOTEOPS_SAKBE_LIVE_ENABLED"
@@ -489,6 +510,13 @@ YAML
 fi
 chmod 600 "$TARGET_TMS_ADAPTER_CONFIG"
 
+if [[ -n "$TMS_MAPPING_CONFIG_PATH" ]]; then
+  cp "$TMS_MAPPING_CONFIG_PATH" "$TARGET_TMS_MAPPING_CONFIG"
+fi
+if [[ -f "$TARGET_TMS_MAPPING_CONFIG" ]]; then
+  chmod 600 "$TARGET_TMS_MAPPING_CONFIG"
+fi
+
 if [[ -n "$AGENT_CONFIG_PATH" ]]; then
   cp "$AGENT_CONFIG_PATH" "$TARGET_AGENT_CONFIG"
 fi
@@ -513,6 +541,9 @@ echo "Manifest: $TARGET_MANIFEST"
 echo "Connectors: $QUOTEOPS_CONNECTORS_DIR"
 echo "Agent config: $TARGET_AGENT_CONFIG"
 echo "TMS adapter config: $TARGET_TMS_ADAPTER_CONFIG"
+if [[ -f "$TARGET_TMS_MAPPING_CONFIG" ]]; then
+  echo "TMS mapping config: $TARGET_TMS_MAPPING_CONFIG"
+fi
 echo
 echo "Next: run the guided TRON onboarding (captures the AI key, secrets, TMS, units and knowledge):"
 echo "  docker compose --env-file \"$ENV_FILE\" -f \"$COMPOSE_FILE\" run --rm quoteops-onboard"

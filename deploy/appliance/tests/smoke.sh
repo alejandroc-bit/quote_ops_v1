@@ -136,6 +136,7 @@ done
 bash "$APPLIANCE_DIR/install.sh" --help | grep -q -- '--registration-token' || fail "install help missing registration token"
 bash "$APPLIANCE_DIR/install.sh" --help | grep -q -- '--control-plane-url' || fail "install help missing control plane url"
 bash "$APPLIANCE_DIR/install.sh" --help | grep -q -- '--no-pull' || fail "install help missing no-pull"
+bash "$APPLIANCE_DIR/install.sh" --help | grep -q -- '--tms-mapping-config' || fail "install help missing TMS mapping config"
 
 SECRET_TEST_DIR="$(mktemp -d "${TMPDIR:-/tmp}/quoteops-secrets-smoke.XXXXXX")"
 TEMP_DIRS+=("$SECRET_TEST_DIR")
@@ -150,9 +151,11 @@ TEMP_DIRS+=("$INSTALL_GUARD_DIR")
 INSTALL_MANIFEST="$INSTALL_GUARD_DIR/client-manifest.yaml"
 INSTALL_CONNECTORS_SRC="$INSTALL_GUARD_DIR/connectors-src"
 INSTALL_CONNECTORS_TARGET="$INSTALL_GUARD_DIR/connectors-target"
+INSTALL_TMS_MAPPING="$INSTALL_GUARD_DIR/tms-mapping.json"
+INSTALL_MAPPING_CONNECTORS_TARGET="$INSTALL_GUARD_DIR/mapping-connectors-target"
 mkdir -p "$INSTALL_CONNECTORS_SRC/agent" "$INSTALL_CONNECTORS_SRC/tms" "$INSTALL_CONNECTORS_TARGET"
 cat > "$INSTALL_MANIFEST" <<'YAML'
-client_id: SMOKE
+client_id: smoke
 business_units: []
 vehicle_profiles: []
 cost_profiles: []
@@ -180,6 +183,26 @@ authorization:
       mode: approval_required
 YAML
 printf 'rfq_id,lane_id\nRFQ-1,LANE-1\n' > "$INSTALL_CONNECTORS_SRC/tms/rfqs.csv"
+cat > "$INSTALL_TMS_MAPPING" <<'JSON'
+{
+  "client_id": "smoke",
+  "endpoint_url": "https://tms.example.com/api",
+  "auth_method": "api_key",
+  "api_key_env": "TMS_API_KEY",
+  "transport": "http",
+  "mapping_engine": "jsonpath",
+  "schema_hash": "sha256:smoke-v1",
+  "mappings": {
+    "routes": "$.routes[*]"
+  },
+  "mapping_json": {
+    "routes": {
+      "route_id": "routeId"
+    }
+  },
+  "runtime_ai_calls_allowed": false
+}
+JSON
 
 install_guard_run() {
   local home_dir="$1"
@@ -195,16 +218,42 @@ install_guard_run() {
     "$@"
 }
 
+install_mapping_guard_run() {
+  local home_dir="$1"
+  shift
+  bash "$APPLIANCE_DIR/install.sh" \
+    --client smoke \
+    --manifest "$INSTALL_MANIFEST" \
+    --agent-config "$INSTALL_CONNECTORS_SRC/agent/agent-config.yaml" \
+    --tms-mapping-config "$INSTALL_TMS_MAPPING" \
+    --connectors-dir "$INSTALL_MAPPING_CONNECTORS_TARGET" \
+    --home "$home_dir" \
+    --skip-start \
+    --postgres-password test-password \
+    "$@"
+}
+
 install_guard_run "$INSTALL_GUARD_DIR/home-one" \
   --control-plane-url "https://quoteops.inducta.example" \
   --registration-token "registration-token-test" \
-  --installation-id "smoke-install-001" >/dev/null
+  --installation-id "smoke-install-001" \
+  --tms-mapping-config "$INSTALL_TMS_MAPPING" >/dev/null
 grep -q '^QUOTEOPS_CONTROL_PLANE_URL="https://quoteops.inducta.example"$' "$INSTALL_GUARD_DIR/home-one/.env" || fail "install.sh did not write control plane url"
 grep -q '^QUOTEOPS_INSTALLATION_ID="smoke-install-001"$' "$INSTALL_GUARD_DIR/home-one/.env" || fail "install.sh did not write installation id"
 grep -q '^QUOTEOPS_REGISTRATION_TOKEN="registration-token-test"$' "$INSTALL_GUARD_DIR/home-one/secrets/client.env" || fail "install.sh did not write registration token to secrets"
 if grep -q 'registration-token-test' "$INSTALL_GUARD_DIR/home-one/.env"; then
   fail "install.sh wrote registration token to main env"
 fi
+grep -q '^QUOTEOPS_TMS_MAPPING_CONFIG_PATH="/opt/quoteops-v1/connectors/tms-mapping.json"$' "$INSTALL_GUARD_DIR/home-one/.env" || fail "install.sh did not write TMS mapping config path"
+cmp -s "$INSTALL_TMS_MAPPING" "$INSTALL_CONNECTORS_TARGET/tms-mapping.json" || fail "install.sh did not copy TMS mapping config"
+[[ "$(stat -f '%Lp' "$INSTALL_CONNECTORS_TARGET/tms-mapping.json")" == "600" ]] || fail "install.sh did not protect TMS mapping config"
+install_mapping_guard_run "$INSTALL_GUARD_DIR/home-mapping-one" >/dev/null
+rm -f "$INSTALL_MAPPING_CONNECTORS_TARGET/agent/agent-config.yaml"
+if install_mapping_guard_run "$INSTALL_GUARD_DIR/home-mapping-two" >"$INSTALL_GUARD_DIR/mapping-guard.log" 2>&1; then
+  fail "install.sh overwrote TMS mapping config without --force"
+fi
+grep -q 'TMS mapping config copy already exists' "$INSTALL_GUARD_DIR/mapping-guard.log" || fail "install.sh did not identify the TMS mapping overwrite guard"
+install_mapping_guard_run "$INSTALL_GUARD_DIR/home-mapping-force" --force >/dev/null
 rm -f "$INSTALL_CONNECTORS_TARGET/agent/agent-config.yaml"
 printf 'rfq_id,lane_id\nRFQ-2,LANE-2\n' > "$INSTALL_CONNECTORS_SRC/tms/rfqs.csv"
 if install_guard_run "$INSTALL_GUARD_DIR/home-two" >/dev/null 2>&1; then
@@ -223,7 +272,7 @@ SH
 chmod +x "$MOCK_DOCKER_DIR/docker"
 PATH="$MOCK_DOCKER_DIR:$PATH" MOCK_DOCKER_LOG="$MOCK_DOCKER_LOG" \
   bash "$APPLIANCE_DIR/install.sh" \
-    --client smoke-no-pull \
+    --client smoke \
     --manifest "$INSTALL_MANIFEST" \
     --connectors "$INSTALL_CONNECTORS_SRC" \
     --connectors-dir "$INSTALL_CONNECTORS_TARGET" \
