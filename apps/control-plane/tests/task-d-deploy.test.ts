@@ -43,13 +43,13 @@ describe("Task D appliance defaults", () => {
 
     expect(compose.name).toBe("${COMPOSE_PROJECT_NAME:-quoteops_v1}");
     expect(compose.services["quoteops-agent"]?.image).toBe(
-      "${QUOTEOPS_IMAGE_REGISTRY:-ghcr.io/alejandroc-bit}/quote-ops-agent:${QUOTEOPS_VERSION:-v0.1.0}"
+      "${QUOTEOPS_AGENT_IMAGE:?QUOTEOPS_AGENT_IMAGE is required}"
     );
     expect(compose.services["quoteops-api"]?.image).toBe(
-      "${QUOTEOPS_IMAGE_REGISTRY:-ghcr.io/alejandroc-bit}/quote-ops-api:${QUOTEOPS_VERSION:-v0.1.0}"
+      "${QUOTEOPS_API_IMAGE:?QUOTEOPS_API_IMAGE is required}"
     );
     expect(compose.services["quoteops-web"]?.image).toBe(
-      "${QUOTEOPS_IMAGE_REGISTRY:-ghcr.io/alejandroc-bit}/quote-ops-web:${QUOTEOPS_VERSION:-v0.1.0}"
+      "${QUOTEOPS_WEB_IMAGE:?QUOTEOPS_WEB_IMAGE is required}"
     );
     expect(body).not.toMatch(/\/opt\/quoteops(?!-v1)(?:\/|\b)/);
     for (const service of ["quoteops-agent", "quoteops-api"]) {
@@ -75,14 +75,15 @@ describe("Task D appliance defaults", () => {
     }
   });
 
-  it("renders installer env with exact home, project, registry, paths, and v* version contract", async () => {
+  it("renders installer env with exact home, project, paths, and release-local version contract", async () => {
     const install = await read("deploy/appliance/install.sh");
     expect(install).toContain('QUOTEOPS_HOME="${QUOTEOPS_HOME:-/opt/quoteops-v1}"');
     expect(install).toContain('COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-quoteops_v1}"');
     expect(install).toContain(
       'QUOTEOPS_IMAGE_REGISTRY="${QUOTEOPS_IMAGE_REGISTRY:-ghcr.io/alejandroc-bit}"'
     );
-    expect(install).toContain('QUOTEOPS_VERSION="${QUOTEOPS_VERSION:-v0.1.0}"');
+    expect(install).toContain('QUOTEOPS_VERSION="${QUOTEOPS_VERSION:-}"');
+    expect(install).toContain('QUOTEOPS_VERSION="v0.1.0"');
     expect(install).toContain('[[ "$QUOTEOPS_VERSION" =~ ^v[0-9]+[.][0-9]+[.][0-9]+$ ]]');
     expect(install).not.toMatch(/QUOTEOPS_VERSION=.*quoteops-v/);
     for (const path of [
@@ -94,8 +95,8 @@ describe("Task D appliance defaults", () => {
       expect(install).toContain(path);
     }
     expect(install).toContain('write_env_line COMPOSE_PROJECT_NAME "$COMPOSE_PROJECT_NAME"');
-    expect(install).toContain('write_env_line QUOTEOPS_IMAGE_REGISTRY "$QUOTEOPS_IMAGE_REGISTRY"');
-    expect(install).toContain('write_env_line QUOTEOPS_VERSION "$QUOTEOPS_VERSION"');
+    expect(install).toContain('validate_release_env "$staging/release.env" "$install_mode"');
+    expect(install).not.toContain('write_env_line QUOTEOPS_VERSION "$QUOTEOPS_VERSION"');
     expect(install).toContain('QUOTEOPS_SETTINGS_DIR="${QUOTEOPS_SETTINGS_DIR:-$QUOTEOPS_HOME/settings}"');
     expect(install).toContain('write_env_line QUOTEOPS_SETTINGS_DIR "$QUOTEOPS_SETTINGS_DIR"');
   });

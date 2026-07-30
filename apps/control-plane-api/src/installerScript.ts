@@ -1,4 +1,6 @@
 import { createHash } from "node:crypto";
+import { readFile } from "node:fs/promises";
+import { join, resolve } from "node:path";
 import { gunzipSync } from "node:zlib";
 import type { InstallPack } from "@quoteops/control-plane";
 import {
@@ -7,6 +9,45 @@ import {
 } from "@quoteops/shared";
 
 export const MAX_INSTALLER_RESPONSE_BYTES = 4_000_000;
+const BOOTSTRAP_PLACEHOLDER = "__QUOTEOPS_CONTROL_PLANE_URL__";
+
+export async function loadBootstrapScript({
+  applianceReleaseRoot,
+  applianceReleaseVersion,
+  controlPlaneUrl
+}: {
+  applianceReleaseRoot: string;
+  applianceReleaseVersion: string;
+  controlPlaneUrl: string;
+}): Promise<string> {
+  if (!/^v\d+\.\d+\.\d+$/.test(applianceReleaseVersion)) {
+    throw new Error("invalid_appliance_release_version");
+  }
+  const physicalRoot = resolve(applianceReleaseRoot);
+  const releaseDirectory = join(physicalRoot, applianceReleaseVersion);
+  const [bootstrapBytes, checksumBytes] = await Promise.all([
+    readFile(join(releaseDirectory, "bootstrap.sh")),
+    readFile(join(releaseDirectory, "SHA256SUMS"), "utf8")
+  ]);
+  const bootstrapEntries = checksumBytes
+    .split("\n")
+    .map((line) => /^([a-f0-9]{64})  bootstrap\.sh$/.exec(line))
+    .filter((match): match is RegExpExecArray => match !== null);
+  if (
+    bootstrapEntries.length !== 1 ||
+    sha256(bootstrapBytes) !== bootstrapEntries[0]![1]
+  ) {
+    throw new Error("bootstrap_checksum_mismatch");
+  }
+  const template = bootstrapBytes.toString("utf8");
+  if (template.split(BOOTSTRAP_PLACEHOLDER).length !== 2) {
+    throw new Error("bootstrap_placeholder_invalid");
+  }
+  return template.replace(
+    BOOTSTRAP_PLACEHOLDER,
+    escapeShellDoubleQuoted(controlPlaneUrl)
+  );
+}
 
 const CLIENT_OVERLAY_FILES = new Set([
   "client-manifest.yaml",
@@ -401,6 +442,10 @@ function canonicalJson(value: unknown): string {
 
 function shellSingleQuote(value: string): string {
   return value.replace(/'/g, "'\\''");
+}
+
+function escapeShellDoubleQuoted(value: string): string {
+  return value.replace(/[\\"$`]/g, "\\$&");
 }
 
 function escapeEgrep(value: string): string {

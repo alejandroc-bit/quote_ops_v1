@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import { resolve } from "node:path";
 import cors from "cors";
 import express, { type Express, type Request, type Response } from "express";
 import { z } from "zod";
@@ -23,6 +24,7 @@ import {
   type LicenseKeyPair
 } from "@quoteops/shared";
 import {
+  loadBootstrapScript,
   renderInstallerScript,
   validateReleaseArchive
 } from "./installerScript.js";
@@ -110,6 +112,8 @@ export type ControlPlaneApiDependencies = {
   verifySessionToken?: SessionTokenVerifier | null;
   isVendorAdminEmail?: VendorAdminEmailVerifier | null;
   controlPlaneUrl?: string;
+  applianceReleaseRoot?: string;
+  applianceReleaseVersion?: string;
   keyPair?: LicenseKeyPair;
   now?: () => Date;
   data?: ControlPlaneData;
@@ -174,6 +178,13 @@ export function createControlPlaneApi(
   const configuredControlPlaneUrl =
     dependencies.controlPlaneUrl ??
     process.env.QUOTEOPS_CONTROL_PLANE_URL ??
+    null;
+  const applianceReleaseRoot =
+    dependencies.applianceReleaseRoot ??
+    resolve(process.cwd(), "dist", "appliance");
+  const applianceReleaseVersion =
+    dependencies.applianceReleaseVersion ??
+    process.env.QUOTEOPS_APPLIANCE_RELEASE_VERSION ??
     null;
   const verifySessionToken =
     dependencies.verifySessionToken !== undefined
@@ -264,6 +275,35 @@ export function createControlPlaneApi(
       service: "quoteops-control-plane-api",
       clients: clients.length
     });
+  }));
+
+  app.get("/install/quoteops", asyncRoute(async (_req, res) => {
+    const controlPlaneUrl = requireControlPlaneOrigin(configuredControlPlaneUrl);
+    if (!applianceReleaseVersion) {
+      throw new ApiError(
+        503,
+        "bootstrap_unavailable",
+        "deployed appliance release is not configured"
+      );
+    }
+    let script: string;
+    try {
+      script = await loadBootstrapScript({
+        applianceReleaseRoot,
+        applianceReleaseVersion,
+        controlPlaneUrl
+      });
+    } catch {
+      throw new ApiError(
+        503,
+        "bootstrap_unavailable",
+        "deployed bootstrap failed verification"
+      );
+    }
+    res.setHeader("content-type", "text/x-shellscript; charset=utf-8");
+    res.setHeader("cache-control", "no-store");
+    res.setHeader("referrer-policy", "no-referrer");
+    res.send(script);
   }));
 
   app.post("/api/portal/profile/claim", asyncRoute(async (req, res) => {

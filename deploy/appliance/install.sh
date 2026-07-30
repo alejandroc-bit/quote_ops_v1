@@ -1,18 +1,20 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 077
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 COMPOSE_FILE="${COMPOSE_FILE:-$SCRIPT_DIR/docker-compose.yml}"
 QUOTEOPS_HOME="${QUOTEOPS_HOME:-/opt/quoteops-v1}"
 ENV_FILE="${QUOTEOPS_ENV_FILE:-$QUOTEOPS_HOME/.env}"
 SECRETS_ENV_FILE="${QUOTEOPS_SECRETS_ENV_FILE:-$QUOTEOPS_HOME/secrets/client.env}"
+CLOUDFLARE_ENV_FILE="$QUOTEOPS_HOME/secrets/cloudflare.env"
 CLIENT_ID=""
 MANIFEST_PATH=""
 CONNECTORS_PATH=""
 AGENT_CONFIG_PATH=""
 TMS_ADAPTER_CONFIG_PATH=""
 TMS_MAPPING_CONFIG_PATH=""
-QUOTEOPS_VERSION="${QUOTEOPS_VERSION:-v0.1.0}"
+QUOTEOPS_VERSION="${QUOTEOPS_VERSION:-}"
 QUOTEOPS_IMAGE_REGISTRY="${QUOTEOPS_IMAGE_REGISTRY:-ghcr.io/alejandroc-bit}"
 QUOTEOPS_SITE_ADDRESS="${QUOTEOPS_SITE_ADDRESS:-:80}"
 QUOTEOPS_HTTP_PORT="${QUOTEOPS_HTTP_PORT:-80}"
@@ -21,6 +23,7 @@ QUOTEOPS_SAKBE_LIVE_ENABLED="${QUOTEOPS_SAKBE_LIVE_ENABLED:-true}"
 QUOTEOPS_SAKBE_CACHE_MODE="${QUOTEOPS_SAKBE_CACHE_MODE:-cache_first}"
 QUOTEOPS_CONTROL_PLANE_URL="${QUOTEOPS_CONTROL_PLANE_URL:-}"
 QUOTEOPS_REGISTRATION_TOKEN="${QUOTEOPS_REGISTRATION_TOKEN:-}"
+QUOTEOPS_REGISTRATION_TOKEN_FILE=""
 QUOTEOPS_INSTALLATION_ID="${QUOTEOPS_INSTALLATION_ID:-}"
 INEGI_SAKBE_KEY="${INEGI_SAKBE_KEY:-}"
 GEMINI_API_KEY="${GEMINI_API_KEY:-}"
@@ -33,6 +36,9 @@ START_STACK=1
 PULL_IMAGES=1
 ENV_FILE_SET=0
 SECRETS_ENV_FILE_SET=0
+VERSION_SET=0
+GUIDED=0
+EXISTING_INSTALL=0
 
 usage() {
   cat <<USAGE
@@ -48,7 +54,7 @@ Options:
   --agent-config PATH      Copy agent config YAML/JSON into connectors/agent
   --tms-adapter-config PATH Copy TMS adapter config YAML/JSON into connectors/tms-adapter.yaml
   --tms-mapping-config PATH Copy strict TMS mapping JSON into connectors/tms-mapping.json
-  --version VERSION        QuoteOps image tag (default: v0.1.0)
+  --version VERSION        Pinned appliance release (required with --guided)
   --image-registry IMAGE   Image registry/prefix (default: ghcr.io/alejandroc-bit)
   --site-address ADDRESS   Caddy site address (default: :80)
   --http-port PORT         Host HTTP port (default: 80)
@@ -59,8 +65,10 @@ Options:
   --sakbe-live BOOL        Allow live SAKBE calls after cache miss (default: true)
   --sakbe-cache-mode MODE  SAKBE cache mode: cache_first or live_only (default: cache_first)
   --control-plane-url URL  Inducta control-plane base URL for activation and aggregate sync
-  --registration-token TOK Short-lived client installation token (stored in secrets env)
+  --registration-token TOK Legacy direct-install token (rejected with --guided)
+  --registration-token-file PATH Read registration token from a protected 0600 file
   --installation-id ID     Stable appliance installation id
+  --guided                 Require checksum-verified release-local runtime assets
   --force                  Replace existing env file and manifest copy
   --skip-start             Prepare files without running docker compose up
   --no-pull                Skip docker compose pull; validate config and start pre-loaded images
@@ -127,6 +135,214 @@ generate_secret() {
   openssl rand -hex 32
 }
 
+file_owner_id() {
+  if stat -f '%u' "$1" >/dev/null 2>&1; then
+    stat -f '%u' "$1"
+  else
+    stat -c '%u' "$1"
+  fi
+}
+
+file_mode() {
+  if stat -f '%Lp' "$1" >/dev/null 2>&1; then
+    stat -f '%Lp' "$1"
+  else
+    stat -c '%a' "$1"
+  fi
+}
+
+validate_secret_file() {
+  local path="$1"
+  [[ -f "$path" && ! -L "$path" ]] || die "secret file must be a regular non-symlink file: $path"
+  [[ "$(file_owner_id "$path")" == "$(id -u)" ]] || die "secret file must be owned by the current user: $path"
+  [[ "$(file_mode "$path")" == "600" ]] || die "secret file must have mode 0600: $path"
+}
+
+read_env_value() {
+  local key="$1"
+  local file="$2"
+  local value
+  value="$(sed -n "s/^${key}=//p" "$file" | head -1)"
+  value="${value#\"}"
+  value="${value%\"}"
+  printf '%s\n' "$value"
+}
+
+ensure_secret_key() {
+  local file="$1"
+  local key="$2"
+  local value="$3"
+  local existing
+  local temporary
+  existing="$(read_env_value "$key" "$file")"
+  if [[ -n "$existing" ]]; then
+    printf '%s\n' "$existing"
+    return
+  fi
+  temporary="$file.tmp.$$"
+  cp "$file" "$temporary"
+  write_env_line "$key" "$value" >> "$temporary"
+  chmod 600 "$temporary"
+  mv "$temporary" "$file"
+  printf '%s\n' "$value"
+}
+
+validate_release_env() {
+  local file="$1"
+  local mode="$2"
+  local key
+  local value
+  local count
+  local allowed='QUOTEOPS_VERSION QUOTEOPS_PLATFORM QUOTEOPS_AGENT_IMAGE QUOTEOPS_API_IMAGE QUOTEOPS_WEB_IMAGE QUOTEOPS_POSTGRES_IMAGE QUOTEOPS_REDIS_IMAGE QUOTEOPS_CADDY_IMAGE QUOTEOPS_CLOUDFLARED_IMAGE'
+
+  [[ -f "$file" && ! -L "$file" ]] || die "release.env is missing or unsafe"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -z "$line" ]] && continue
+    [[ "$line" =~ ^([A-Z0-9_]+)=([^[:space:]]+)$ ]] || die "release.env contains an invalid line"
+    key="${BASH_REMATCH[1]}"
+    value="${BASH_REMATCH[2]}"
+    case " $allowed " in
+      *" $key "*) ;;
+      *) die "release.env contains a forbidden key: $key" ;;
+    esac
+    [[ "$value" != *latest* && "$value" != *LATEST* ]] || die "release.env cannot use latest"
+  done < "$file"
+  for key in $allowed; do
+    count="$(grep -c "^${key}=" "$file" || true)"
+    [[ "$count" == "1" ]] || die "release.env must contain exactly one $key"
+  done
+  [[ "$(read_env_value QUOTEOPS_VERSION "$file")" == "$QUOTEOPS_VERSION" ]] ||
+    die "release.env version does not match --version"
+  [[ "$(read_env_value QUOTEOPS_PLATFORM "$file")" == "linux/amd64" ]] ||
+    die "release.env platform must be linux/amd64"
+  if [[ "$mode" == "release_pinned" ]]; then
+    for key in QUOTEOPS_AGENT_IMAGE QUOTEOPS_API_IMAGE QUOTEOPS_WEB_IMAGE QUOTEOPS_POSTGRES_IMAGE QUOTEOPS_REDIS_IMAGE QUOTEOPS_CADDY_IMAGE QUOTEOPS_CLOUDFLARED_IMAGE; do
+      value="$(read_env_value "$key" "$file")"
+      [[ "$value" =~ @sha256:[a-f0-9]{64}$ ]] ||
+        die "guided release image is not digest-pinned: $key"
+    done
+  fi
+}
+
+write_legacy_release_env() {
+  local destination="$1"
+  cat > "$destination" <<EOF
+QUOTEOPS_VERSION=$QUOTEOPS_VERSION
+QUOTEOPS_PLATFORM=linux/amd64
+QUOTEOPS_AGENT_IMAGE=$QUOTEOPS_IMAGE_REGISTRY/quote-ops-agent:$QUOTEOPS_VERSION
+QUOTEOPS_API_IMAGE=$QUOTEOPS_IMAGE_REGISTRY/quote-ops-api:$QUOTEOPS_VERSION
+QUOTEOPS_WEB_IMAGE=$QUOTEOPS_IMAGE_REGISTRY/quote-ops-web:$QUOTEOPS_VERSION
+QUOTEOPS_POSTGRES_IMAGE=postgres:16-alpine
+QUOTEOPS_REDIS_IMAGE=redis:7-alpine
+QUOTEOPS_CADDY_IMAGE=caddy:2-alpine
+QUOTEOPS_CLOUDFLARED_IMAGE=cloudflare/cloudflared:2026.7.3
+EOF
+  chmod 644 "$destination"
+}
+
+stage_release() {
+  local releases_dir="$QUOTEOPS_HOME/releases"
+  local destination="$releases_dir/$QUOTEOPS_VERSION"
+  local staging="$destination.tmp"
+  local install_mode="$1"
+  local asset
+  local source
+  local required_assets='docker-compose.yml Caddyfile install.sh quoteops.sh verify-install.sh upgrade.sh backup.sh restore.sh secrets.sh'
+
+  mkdir -p "$releases_dir"
+  chmod 700 "$releases_dir"
+  for asset in $required_assets; do
+    source="$SCRIPT_DIR/$asset"
+    [[ -f "$source" && ! -L "$source" ]] || die "required runtime asset is missing or unsafe: $asset"
+  done
+  if [[ "$install_mode" == "release_pinned" ]]; then
+    validate_release_env "$SCRIPT_DIR/release.env" "$install_mode"
+  fi
+  if [[ -e "$destination" || -L "$destination" ]]; then
+    [[ -d "$destination" && ! -L "$destination" ]] || die "release destination is unsafe"
+    validate_release_env "$destination/release.env" "$install_mode"
+    for asset in $required_assets; do
+      cmp -s "$SCRIPT_DIR/$asset" "$destination/$asset" ||
+        die "installed release differs from immutable source: $asset"
+    done
+    printf '%s\n' "$destination"
+    return
+  fi
+  [[ ! -e "$staging" && ! -L "$staging" ]] || die "release staging path already exists"
+  mkdir "$staging"
+  for asset in $required_assets; do
+    cp "$SCRIPT_DIR/$asset" "$staging/$asset"
+    if [[ "$asset" == *.sh ]]; then chmod 755 "$staging/$asset"; else chmod 644 "$staging/$asset"; fi
+  done
+  if [[ "$install_mode" == "release_pinned" ]]; then
+    cp "$SCRIPT_DIR/release.env" "$staging/release.env"
+    chmod 644 "$staging/release.env"
+  else
+    write_legacy_release_env "$staging/release.env"
+  fi
+  validate_release_env "$staging/release.env" "$install_mode"
+  mv "$staging" "$destination"
+  printf '%s\n' "$destination"
+}
+
+switch_current_release() {
+  local release_dir="$1"
+  local releases_dir="$QUOTEOPS_HOME/releases"
+  local current="$QUOTEOPS_HOME/current"
+  local temporary="$QUOTEOPS_HOME/.current.$$.tmp"
+  [[ "$release_dir" == "$releases_dir"/v* && -d "$release_dir" && ! -L "$release_dir" ]] ||
+    die "refusing unsafe release target"
+  if [[ -e "$current" && ! -L "$current" ]]; then
+    die "current must be a symlink"
+  fi
+  [[ ! -e "$temporary" && ! -L "$temporary" ]] || die "temporary current link already exists"
+  ln -s "$release_dir" "$temporary"
+  if ! mv -Tf "$temporary" "$current" 2>/dev/null; then
+    mv -hf "$temporary" "$current"
+  fi
+  [[ -L "$current" && "$(readlink "$current")" == "$release_dir" ]] ||
+    die "atomic current switch failed"
+}
+
+validate_bin_override() {
+  local bin_dir="$1"
+  local physical_tmp
+  local physical_parent
+  local e2e_root
+  [[ "${QUOTEOPS_BOOTSTRAP_TEST_MODE:-}" == "macbook" && "$(uname -s)" == "Darwin" ]] ||
+    die "QUOTEOPS_BIN_DIR override requires bounded macbook test mode"
+  physical_tmp="$(cd "${TMPDIR:-/tmp}" && pwd -P)"
+  case "$QUOTEOPS_HOME" in
+    "$physical_tmp"/quoteops-mac-e2e.*/quoteops-v1) ;;
+    *) die "QUOTEOPS_BIN_DIR override requires a bounded temporary QUOTEOPS_HOME" ;;
+  esac
+  e2e_root="$(dirname "$QUOTEOPS_HOME")"
+  mkdir -p "$bin_dir"
+  physical_parent="$(cd "$bin_dir" && pwd -P)"
+  case "$physical_parent" in
+    "$e2e_root"/bin|"$e2e_root"/usr-local-bin) ;;
+    *) die "QUOTEOPS_BIN_DIR escaped the bounded test root" ;;
+  esac
+}
+
+require_compose_224() {
+  local version
+  local major
+  local minor
+  local patch
+  docker compose version >/dev/null 2>&1 || die "Docker Compose v2 is required"
+  version="$(docker compose version --short 2>/dev/null | sed 's/^v//')"
+  [[ "$version" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+) ]] ||
+    die "cannot determine Docker Compose version"
+  major="${BASH_REMATCH[1]}"
+  minor="${BASH_REMATCH[2]}"
+  patch="${BASH_REMATCH[3]}"
+  if (( major < 2 || (major == 2 && minor < 24) )); then
+    die "Docker Compose 2.24.0 or newer is required"
+  fi
+  : "$patch"
+}
+
 validate_identifier() {
   local label="$1"
   local value="$2"
@@ -160,6 +376,12 @@ guard_connector_pack_overwrite() {
     fi
 
     if [[ -e "$target_path" || -L "$target_path" ]]; then
+      if [[ "$EXISTING_INSTALL" -eq 1 &&
+            -f "$source_path" && ! -L "$source_path" &&
+            -f "$target_path" && ! -L "$target_path" ]] &&
+         cmp -s "$source_path" "$target_path"; then
+        continue
+      fi
       die "connector pack file already exists: $target_path (use --force to replace)"
     fi
   done < <(find "$source_dir" -mindepth 1 -print0)
@@ -186,6 +408,7 @@ while [[ $# -gt 0 ]]; do
       if [[ "$SECRETS_ENV_FILE_SET" -eq 0 ]]; then
         SECRETS_ENV_FILE="$QUOTEOPS_HOME/secrets/client.env"
       fi
+      CLOUDFLARE_ENV_FILE="$QUOTEOPS_HOME/secrets/cloudflare.env"
       shift 2
       ;;
     --env-file)
@@ -233,6 +456,7 @@ while [[ $# -gt 0 ]]; do
     --version)
       require_value "$1" "${2:-}"
       QUOTEOPS_VERSION="$2"
+      VERSION_SET=1
       shift 2
       ;;
     --image-registry)
@@ -290,6 +514,11 @@ while [[ $# -gt 0 ]]; do
       QUOTEOPS_REGISTRATION_TOKEN="$2"
       shift 2
       ;;
+    --registration-token-file)
+      require_value "$1" "${2:-}"
+      QUOTEOPS_REGISTRATION_TOKEN_FILE="$2"
+      shift 2
+      ;;
     --installation-id)
       require_value "$1" "${2:-}"
       QUOTEOPS_INSTALLATION_ID="$2"
@@ -307,6 +536,10 @@ while [[ $# -gt 0 ]]; do
       PULL_IMAGES=0
       shift
       ;;
+    --guided)
+      GUIDED=1
+      shift
+      ;;
     -h|--help)
       usage
       exit 0
@@ -319,12 +552,36 @@ done
 
 [[ -n "$CLIENT_ID" ]] || die "--client is required"
 [[ -n "$MANIFEST_PATH" ]] || die "--manifest is required"
+if [[ "$GUIDED" -eq 1 ]]; then
+  [[ "$VERSION_SET" -eq 1 ]] || die "--version is required with --guided"
+  [[ -z "$QUOTEOPS_REGISTRATION_TOKEN" ]] ||
+    die "--registration-token is forbidden with --guided; use --registration-token-file"
+  [[ -n "$QUOTEOPS_REGISTRATION_TOKEN_FILE" ]] ||
+    die "--registration-token-file is required with --guided"
+  INSTALL_MODE="release_pinned"
+else
+  INSTALL_MODE="legacy_direct"
+  if [[ "$VERSION_SET" -eq 0 && -z "$QUOTEOPS_VERSION" ]]; then
+    QUOTEOPS_VERSION="v0.1.0"
+    printf '%s\n' "install.sh: warning: implicit v0.1.0 direct install is deprecated; pass --version" >&2
+  fi
+fi
+[[ -n "$QUOTEOPS_VERSION" ]] || die "--version is required"
 [[ "$CLIENT_ID" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || die "--client may only contain letters, numbers, dot, underscore, or dash"
 [[ "$QUOTEOPS_VERSION" =~ ^v[0-9]+[.][0-9]+[.][0-9]+$ ]] || die "--version must look like v0.1.0"
 [[ "$QUOTEOPS_SAKBE_LIVE_ENABLED" =~ ^(true|false|1|0|yes|no|on|off)$ ]] || die "--sakbe-live must be true or false"
 [[ "$QUOTEOPS_SAKBE_CACHE_MODE" =~ ^(cache_first|live_only)$ ]] || die "--sakbe-cache-mode must be cache_first or live_only"
 [[ -f "$MANIFEST_PATH" ]] || die "manifest not found: $MANIFEST_PATH"
 [[ -r "$MANIFEST_PATH" ]] || die "manifest is not readable: $MANIFEST_PATH"
+if [[ -n "$QUOTEOPS_REGISTRATION_TOKEN_FILE" ]]; then
+  QUOTEOPS_REGISTRATION_TOKEN_FILE="$(absolute_path "$QUOTEOPS_REGISTRATION_TOKEN_FILE")"
+  validate_secret_file "$QUOTEOPS_REGISTRATION_TOKEN_FILE"
+  QUOTEOPS_REGISTRATION_TOKEN="$(<"$QUOTEOPS_REGISTRATION_TOKEN_FILE")"
+  [[ "${#QUOTEOPS_REGISTRATION_TOKEN}" -ge 32 &&
+     "${#QUOTEOPS_REGISTRATION_TOKEN}" -le 512 &&
+     ! "$QUOTEOPS_REGISTRATION_TOKEN" =~ [^A-Za-z0-9._~-] ]] ||
+    die "registration token file contains an invalid token"
+fi
 MANIFEST_CLIENT_ID="$(sed -n 's/^client_id:[[:space:]]*//p' "$MANIFEST_PATH" | head -1 | tr -d '"' | tr -d "'")"
 [[ -z "$MANIFEST_CLIENT_ID" || "$MANIFEST_CLIENT_ID" == "$CLIENT_ID" ]] \
   || die "manifest client_id ($MANIFEST_CLIENT_ID) does not match --client ($CLIENT_ID); activation would target the wrong tenant"
@@ -366,8 +623,31 @@ if [[ -z "$AGENT_CONFIG_PATH" ]]; then
   fi
 fi
 QUOTEOPS_HOME="$(mkdir -p "$QUOTEOPS_HOME" && cd "$QUOTEOPS_HOME" && pwd -P)"
+[[ "$QUOTEOPS_HOME" != "/" ]] || die "QUOTEOPS_HOME cannot be /"
+if [[ -n "${HOME:-}" && -d "$HOME" ]]; then
+  PHYSICAL_USER_HOME="$(cd "$HOME" && pwd -P)"
+  [[ "$QUOTEOPS_HOME" != "$PHYSICAL_USER_HOME" ]] ||
+    die "QUOTEOPS_HOME cannot be a home directory"
+fi
+if [[ "${QUOTEOPS_BOOTSTRAP_TEST_MODE:-}" == "macbook" ]]; then
+  [[ "$(uname -s)" == "Darwin" ]] || die "macbook test mode requires Darwin"
+  PHYSICAL_TMPDIR="$(cd "${TMPDIR:-/tmp}" && pwd -P)"
+  case "$QUOTEOPS_HOME" in
+    "$PHYSICAL_TMPDIR"/quoteops-mac-e2e.*/quoteops-v1) ;;
+    *) die "macbook test mode requires a bounded temporary QUOTEOPS_HOME" ;;
+  esac
+elif [[ -n "${QUOTEOPS_BOOTSTRAP_TEST_MODE:-}" ]]; then
+  die "unknown bootstrap test mode"
+fi
 ENV_FILE="$(absolute_new_path "$ENV_FILE")"
 SECRETS_ENV_FILE="$(absolute_new_path "$SECRETS_ENV_FILE")"
+CLOUDFLARE_ENV_FILE="$(absolute_new_path "$CLOUDFLARE_ENV_FILE")"
+if [[ "$GUIDED" -eq 1 ]]; then
+  [[ "$ENV_FILE" == "$QUOTEOPS_HOME/.env" ]] ||
+    die "guided install requires the shared env under QUOTEOPS_HOME"
+  [[ "$SECRETS_ENV_FILE" == "$QUOTEOPS_HOME/secrets/client.env" ]] ||
+    die "guided install requires client secrets under QUOTEOPS_HOME"
+fi
 QUOTEOPS_MANIFEST_DIR="${QUOTEOPS_MANIFEST_DIR:-$QUOTEOPS_HOME/manifests}"
 QUOTEOPS_CRITERIA_DIR="${QUOTEOPS_CRITERIA_DIR:-$QUOTEOPS_HOME/criteria}"
 QUOTEOPS_CONNECTORS_DIR="${QUOTEOPS_CONNECTORS_DIR:-$QUOTEOPS_HOME/connectors}"
@@ -383,25 +663,44 @@ CADDYFILE_PATH="$(absolute_path "$CADDYFILE_PATH")"
 
 if [[ "$START_STACK" -eq 1 ]]; then
   need_command docker
-  docker compose version >/dev/null 2>&1 || die "Docker Compose v2 is required"
+  require_compose_224
 fi
 
-guard_target "env file" "$ENV_FILE"
-guard_target "secrets env file" "$SECRETS_ENV_FILE"
+if [[ -f "$ENV_FILE" ]]; then
+  EXISTING_INSTALL=1
+  EXISTING_CLIENT_ID="$(read_env_value QUOTEOPS_CLIENT_ID "$ENV_FILE")"
+  [[ -z "$EXISTING_CLIENT_ID" || "$EXISTING_CLIENT_ID" == "$CLIENT_ID" ]] ||
+    die "existing appliance belongs to client $EXISTING_CLIENT_ID"
+fi
 
 TARGET_MANIFEST="$QUOTEOPS_MANIFEST_DIR/client-manifest.yaml"
-guard_target "manifest copy" "$TARGET_MANIFEST"
+if [[ -e "$TARGET_MANIFEST" ]] && ! cmp -s "$MANIFEST_PATH" "$TARGET_MANIFEST" && [[ "$FORCE" -ne 1 ]]; then
+  die "manifest copy already exists: $TARGET_MANIFEST (use --force to replace)"
+fi
 TARGET_AGENT_CONFIG="$QUOTEOPS_CONNECTORS_DIR/agent/agent-config.yaml"
 TARGET_TMS_ADAPTER_CONFIG="$QUOTEOPS_CONNECTORS_DIR/tms-adapter.yaml"
 TARGET_TMS_MAPPING_CONFIG="$QUOTEOPS_CONNECTORS_DIR/tms-mapping.json"
 if [[ -n "$AGENT_CONFIG_PATH" || ( -n "$CONNECTORS_PATH" && -e "$CONNECTORS_PATH/agent/agent-config.yaml" ) ]]; then
+  if [[ "$EXISTING_INSTALL" -eq 1 && -e "$TARGET_AGENT_CONFIG" ]] &&
+     cmp -s "${AGENT_CONFIG_PATH:-$CONNECTORS_PATH/agent/agent-config.yaml}" "$TARGET_AGENT_CONFIG"; then
+    :
+  else
   guard_target "agent config copy" "$TARGET_AGENT_CONFIG"
+  fi
 fi
 if [[ -n "$TMS_ADAPTER_CONFIG_PATH" || ( -n "$CONNECTORS_PATH" && -e "$CONNECTORS_PATH/tms-adapter.yaml" ) ]]; then
-  guard_target "TMS adapter config copy" "$TARGET_TMS_ADAPTER_CONFIG"
+  TMS_ADAPTER_SOURCE="${TMS_ADAPTER_CONFIG_PATH:-$CONNECTORS_PATH/tms-adapter.yaml}"
+  if [[ "$EXISTING_INSTALL" -ne 1 || ! -e "$TARGET_TMS_ADAPTER_CONFIG" ]] ||
+     ! cmp -s "$TMS_ADAPTER_SOURCE" "$TARGET_TMS_ADAPTER_CONFIG"; then
+    guard_target "TMS adapter config copy" "$TARGET_TMS_ADAPTER_CONFIG"
+  fi
 fi
 if [[ -n "$TMS_MAPPING_CONFIG_PATH" || ( -n "$CONNECTORS_PATH" && -e "$CONNECTORS_PATH/tms-mapping.json" ) ]]; then
-  guard_target "TMS mapping config copy" "$TARGET_TMS_MAPPING_CONFIG"
+  TMS_MAPPING_SOURCE="${TMS_MAPPING_CONFIG_PATH:-$CONNECTORS_PATH/tms-mapping.json}"
+  if [[ "$EXISTING_INSTALL" -ne 1 || ! -e "$TARGET_TMS_MAPPING_CONFIG" ]] ||
+     ! cmp -s "$TMS_MAPPING_SOURCE" "$TARGET_TMS_MAPPING_CONFIG"; then
+    guard_target "TMS mapping config copy" "$TARGET_TMS_MAPPING_CONFIG"
+  fi
 fi
 if [[ -n "$CONNECTORS_PATH" && "$FORCE" -ne 1 ]]; then
   guard_connector_pack_overwrite "$CONNECTORS_PATH" "$QUOTEOPS_CONNECTORS_DIR"
@@ -411,31 +710,80 @@ PROJECT_CLIENT="$(printf "%s" "$CLIENT_ID" | tr '[:upper:]' '[:lower:]' | sed 's
 [[ -n "$PROJECT_CLIENT" ]] || die "client id did not produce a valid compose project suffix"
 COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-quoteops_v1}"
 QUOTEOPS_INSTALLATION_ID="${QUOTEOPS_INSTALLATION_ID:-$PROJECT_CLIENT-local-001}"
-POSTGRES_PASSWORD="$(generate_secret)"
+RELEASE_DIR="$(stage_release "$INSTALL_MODE")"
 
-mkdir -p "$(dirname "$ENV_FILE")" "$QUOTEOPS_SECRETS_DIR" "$QUOTEOPS_MANIFEST_DIR" "$QUOTEOPS_CRITERIA_DIR" "$QUOTEOPS_CONNECTORS_DIR" "$QUOTEOPS_LOG_DIR" "$QUOTEOPS_BACKUP_DIR" "$QUOTEOPS_SETTINGS_DIR"
+mkdir -p "$QUOTEOPS_MANIFEST_DIR" "$QUOTEOPS_CRITERIA_DIR" "$QUOTEOPS_CONNECTORS_DIR" \
+  "$QUOTEOPS_SECRETS_DIR" "$QUOTEOPS_SETTINGS_DIR" "$QUOTEOPS_HOME/state" \
+  "$QUOTEOPS_LOG_DIR" "$QUOTEOPS_BACKUP_DIR"
 mkdir -p "$QUOTEOPS_CONNECTORS_DIR/agent" "$QUOTEOPS_CONNECTORS_DIR/sakbe" "$QUOTEOPS_CONNECTORS_DIR/tms" "$QUOTEOPS_CONNECTORS_DIR/knowledge"
-chmod 700 "$QUOTEOPS_HOME" "$QUOTEOPS_SECRETS_DIR" "$QUOTEOPS_MANIFEST_DIR" "$QUOTEOPS_CRITERIA_DIR" "$QUOTEOPS_CONNECTORS_DIR" "$QUOTEOPS_LOG_DIR" "$QUOTEOPS_BACKUP_DIR" "$QUOTEOPS_SETTINGS_DIR"
+chmod 700 "$QUOTEOPS_HOME" "$QUOTEOPS_SECRETS_DIR" "$QUOTEOPS_MANIFEST_DIR" \
+  "$QUOTEOPS_CRITERIA_DIR" "$QUOTEOPS_CONNECTORS_DIR" "$QUOTEOPS_LOG_DIR" \
+  "$QUOTEOPS_BACKUP_DIR" "$QUOTEOPS_SETTINGS_DIR" "$QUOTEOPS_HOME/state"
+
+if [[ ! -e "$SECRETS_ENV_FILE" ]]; then
+  : > "$SECRETS_ENV_FILE"
+  chmod 600 "$SECRETS_ENV_FILE"
+fi
+if [[ ! -e "$CLOUDFLARE_ENV_FILE" ]]; then
+  : > "$CLOUDFLARE_ENV_FILE"
+  chmod 600 "$CLOUDFLARE_ENV_FILE"
+fi
+validate_secret_file "$SECRETS_ENV_FILE"
+validate_secret_file "$CLOUDFLARE_ENV_FILE"
+
+EXISTING_POSTGRES_PASSWORD="$(read_env_value POSTGRES_PASSWORD "$SECRETS_ENV_FILE")"
+if [[ -n "$EXISTING_POSTGRES_PASSWORD" ]]; then
+  POSTGRES_PASSWORD="$EXISTING_POSTGRES_PASSWORD"
+else
+  if command -v docker >/dev/null 2>&1 &&
+     docker volume inspect "${COMPOSE_PROJECT_NAME}_quoteops_postgres" >/dev/null 2>&1; then
+    die "existing PostgreSQL data volume has no recorded password; recovery is required"
+  fi
+  POSTGRES_PASSWORD="$(generate_secret)"
+  POSTGRES_PASSWORD="$(ensure_secret_key "$SECRETS_ENV_FILE" POSTGRES_PASSWORD "$POSTGRES_PASSWORD")"
+fi
+ensure_secret_key "$SECRETS_ENV_FILE" DATABASE_URL \
+  "postgresql://$POSTGRES_USER:$POSTGRES_PASSWORD@postgres:5432/$POSTGRES_DB" >/dev/null
+if [[ -n "$INEGI_SAKBE_KEY" ]]; then
+  ensure_secret_key "$SECRETS_ENV_FILE" INEGI_SAKBE_KEY "$INEGI_SAKBE_KEY" >/dev/null
+fi
+if [[ -n "$GEMINI_API_KEY" ]]; then
+  ensure_secret_key "$SECRETS_ENV_FILE" GEMINI_API_KEY "$GEMINI_API_KEY" >/dev/null
+fi
+if [[ -n "$OPENROUTER_API_KEY" ]]; then
+  ensure_secret_key "$SECRETS_ENV_FILE" OPENROUTER_API_KEY "$OPENROUTER_API_KEY" >/dev/null
+fi
+if [[ -n "$QUOTEOPS_REGISTRATION_TOKEN" ]]; then
+  QUOTEOPS_REGISTRATION_TOKEN="$(
+    ensure_secret_key "$SECRETS_ENV_FILE" QUOTEOPS_REGISTRATION_TOKEN "$QUOTEOPS_REGISTRATION_TOKEN"
+  )"
+fi
+validate_secret_file "$SECRETS_ENV_FILE"
+if [[ -n "$QUOTEOPS_REGISTRATION_TOKEN_FILE" ]]; then
+  [[ "$QUOTEOPS_REGISTRATION_TOKEN_FILE" != "$SECRETS_ENV_FILE" ]] ||
+    die "transient registration token file cannot be the durable client env"
+  rm -f "$QUOTEOPS_REGISTRATION_TOKEN_FILE"
+  QUOTEOPS_REGISTRATION_TOKEN_FILE=""
+fi
 
 TMP_ENV="$ENV_FILE.tmp.$$"
-TMP_SECRETS_ENV="$SECRETS_ENV_FILE.tmp.$$"
 TMP_MANIFEST="$TARGET_MANIFEST.tmp.$$"
 cleanup() {
-  rm -f "$TMP_ENV" "$TMP_SECRETS_ENV" "$TMP_MANIFEST"
+  rm -f "$TMP_ENV" "$TMP_MANIFEST"
 }
 trap cleanup EXIT
 
 {
   write_env_line COMPOSE_PROJECT_NAME "$COMPOSE_PROJECT_NAME"
   write_env_line QUOTEOPS_CLIENT_ID "$CLIENT_ID"
-  write_env_line QUOTEOPS_VERSION "$QUOTEOPS_VERSION"
-  write_env_line QUOTEOPS_IMAGE_REGISTRY "$QUOTEOPS_IMAGE_REGISTRY"
+  write_env_line QUOTEOPS_INSTALL_MODE "$INSTALL_MODE"
   write_env_line QUOTEOPS_HOME "$QUOTEOPS_HOME"
   write_env_line QUOTEOPS_MANIFEST_DIR "$QUOTEOPS_MANIFEST_DIR"
   write_env_line QUOTEOPS_CRITERIA_DIR "$QUOTEOPS_CRITERIA_DIR"
   write_env_line QUOTEOPS_CONNECTORS_DIR "$QUOTEOPS_CONNECTORS_DIR"
   write_env_line QUOTEOPS_SECRETS_DIR "$QUOTEOPS_SECRETS_DIR"
-  write_env_line QUOTEOPS_SECRETS_ENV_FILE "$SECRETS_ENV_FILE"
+  write_env_line QUOTEOPS_CLIENT_ENV_FILE "$SECRETS_ENV_FILE"
+  write_env_line QUOTEOPS_CLOUDFLARE_ENV_FILE "$CLOUDFLARE_ENV_FILE"
   write_env_line QUOTEOPS_AGENT_CONFIG_PATH "/opt/quoteops-v1/connectors/agent/agent-config.yaml"
   write_env_line QUOTEOPS_TMS_ADAPTER_CONFIG_PATH "/opt/quoteops-v1/connectors/tms-adapter.yaml"
   if [[ -n "$TMS_MAPPING_CONFIG_PATH" || ( -n "$CONNECTORS_PATH" && -e "$CONNECTORS_PATH/tms-mapping.json" ) ]]; then
@@ -458,7 +806,7 @@ trap cleanup EXIT
   write_env_line QUOTEOPS_LOG_DIR "$QUOTEOPS_LOG_DIR"
   write_env_line QUOTEOPS_BACKUP_DIR "$QUOTEOPS_BACKUP_DIR"
   write_env_line QUOTEOPS_SETTINGS_DIR "$QUOTEOPS_SETTINGS_DIR"
-  write_env_line CADDYFILE_PATH "$CADDYFILE_PATH"
+  write_env_line CADDYFILE_PATH "$QUOTEOPS_HOME/current/Caddyfile"
   write_env_line QUOTEOPS_SITE_ADDRESS "$QUOTEOPS_SITE_ADDRESS"
   write_env_line QUOTEOPS_HTTP_PORT "$QUOTEOPS_HTTP_PORT"
   write_env_line QUOTEOPS_HTTPS_PORT "$QUOTEOPS_HTTPS_PORT"
@@ -466,24 +814,12 @@ trap cleanup EXIT
   write_env_line QUOTEOPS_INSTALLATION_ID "$QUOTEOPS_INSTALLATION_ID"
   write_env_line POSTGRES_DB "$POSTGRES_DB"
   write_env_line POSTGRES_USER "$POSTGRES_USER"
-  write_env_line POSTGRES_PASSWORD "$POSTGRES_PASSWORD"
 } > "$TMP_ENV"
 chmod 600 "$TMP_ENV"
-
-{
-  write_env_line INEGI_SAKBE_KEY "$INEGI_SAKBE_KEY"
-  write_env_line GEMINI_API_KEY "$GEMINI_API_KEY"
-  write_env_line OPENROUTER_API_KEY "$OPENROUTER_API_KEY"
-  if [[ -n "$QUOTEOPS_REGISTRATION_TOKEN" ]]; then
-    write_env_line QUOTEOPS_REGISTRATION_TOKEN "$QUOTEOPS_REGISTRATION_TOKEN"
-  fi
-} > "$TMP_SECRETS_ENV"
-chmod 600 "$TMP_SECRETS_ENV"
 
 cp "$MANIFEST_PATH" "$TMP_MANIFEST"
 chmod 600 "$TMP_MANIFEST"
 mv "$TMP_ENV" "$ENV_FILE"
-mv "$TMP_SECRETS_ENV" "$SECRETS_ENV_FILE"
 mv "$TMP_MANIFEST" "$TARGET_MANIFEST"
 
 if [[ -n "$CONNECTORS_PATH" ]]; then
@@ -526,12 +862,37 @@ if [[ ! -f "$TARGET_AGENT_CONFIG" ]]; then
 fi
 chmod 600 "$TARGET_AGENT_CONFIG"
 
+switch_current_release "$RELEASE_DIR"
+
+WRITE_WRAPPER=0
+if [[ -n "${QUOTEOPS_BIN_DIR:-}" ]]; then
+  validate_bin_override "$QUOTEOPS_BIN_DIR"
+  WRITE_WRAPPER=1
+elif [[ "$GUIDED" -eq 1 || "$QUOTEOPS_HOME" == "/opt/quoteops-v1" ]]; then
+  QUOTEOPS_BIN_DIR="/usr/local/bin"
+  WRITE_WRAPPER=1
+fi
+if [[ "$WRITE_WRAPPER" -eq 1 ]]; then
+  mkdir -p "$QUOTEOPS_BIN_DIR"
+  WRAPPER_FILE="$QUOTEOPS_BIN_DIR/quoteops"
+  TMP_WRAPPER="$WRAPPER_FILE.tmp.$$"
+  cat > "$TMP_WRAPPER" <<EOF
+#!/usr/bin/env bash
+exec "$QUOTEOPS_HOME/current/quoteops.sh" "\$@"
+EOF
+  chmod 755 "$TMP_WRAPPER"
+  mv "$TMP_WRAPPER" "$WRAPPER_FILE"
+fi
+
+COMPOSE_FILE="$RELEASE_DIR/docker-compose.yml"
+RELEASE_ENV_FILE="$RELEASE_DIR/release.env"
+unset POSTGRES_PASSWORD QUOTEOPS_REGISTRATION_TOKEN INEGI_SAKBE_KEY GEMINI_API_KEY OPENROUTER_API_KEY
 if [[ "$START_STACK" -eq 1 ]]; then
-  docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" config >/dev/null
+  docker compose --env-file "$ENV_FILE" --env-file "$RELEASE_ENV_FILE" -f "$COMPOSE_FILE" config >/dev/null
   if [[ "$PULL_IMAGES" -eq 1 ]]; then
-    docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" pull
+    docker compose --env-file "$ENV_FILE" --env-file "$RELEASE_ENV_FILE" -f "$COMPOSE_FILE" pull
   fi
-  docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" up -d
+  docker compose --env-file "$ENV_FILE" --env-file "$RELEASE_ENV_FILE" -f "$COMPOSE_FILE" up -d
 fi
 
 echo "QuoteOps appliance prepared for client: $CLIENT_ID"
@@ -546,5 +907,5 @@ if [[ -f "$TARGET_TMS_MAPPING_CONFIG" ]]; then
 fi
 echo
 echo "Next: run the guided TRON onboarding (captures the AI key, secrets, TMS, units and knowledge):"
-echo "  docker compose --env-file \"$ENV_FILE\" -f \"$COMPOSE_FILE\" run --rm quoteops-onboard"
+echo "  quoteops onboard"
 echo "Re-run a single step anytime: append --sync-units, --map-tms or --ingest to that command."

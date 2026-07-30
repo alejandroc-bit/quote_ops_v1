@@ -174,7 +174,7 @@ validate_schema_sql_with_postgres() {
   [[ "$constraint_def" == *"runtime_ai_calls_allowed = false"* ]] || fail "runtime_ai_calls_allowed false check missing in postgres schema"
 }
 
-for script in install.sh upgrade.sh backup.sh restore.sh secrets.sh entrypoint.sh tests/smoke.sh; do
+for script in bootstrap.sh install.sh quoteops.sh verify-install.sh upgrade.sh backup.sh restore.sh secrets.sh entrypoint.sh tests/smoke.sh; do
   bash -n "$APPLIANCE_DIR/$script"
 done
 
@@ -189,7 +189,9 @@ grep -q 'foreign key (document_id, client_id) references knowledge_documents(doc
 grep -q 'unique (document_id, chunk_index)' "$SCHEMA_FILE" || fail "knowledge_chunks document/chunk uniqueness missing"
 grep -q 'create table if not exists knowledge_chunks' "$SCHEMA_FILE" || fail "knowledge_chunks schema missing"
 grep -q 'create table if not exists knowledge_ingestion_jobs' "$SCHEMA_FILE" || fail "knowledge_ingestion_jobs schema missing"
-grep -q 'image: postgres:16-alpine' "$COMPOSE_FILE" || fail "appliance compose must use postgres:16-alpine"
+grep -q 'image: ${QUOTEOPS_POSTGRES_IMAGE:?QUOTEOPS_POSTGRES_IMAGE is required}' "$COMPOSE_FILE" || fail "appliance compose must require the pinned PostgreSQL image"
+[[ "$(grep -c 'platform: ${QUOTEOPS_PLATFORM:-linux/amd64}' "$COMPOSE_FILE")" == "4" ]] || fail "exactly four application services must pin linux/amd64"
+[[ "$(grep -c 'path: ${QUOTEOPS_CLIENT_ENV_FILE:?QUOTEOPS_CLIENT_ENV_FILE is required}' "$COMPOSE_FILE")" == "4" ]] || fail "exactly four services must receive the client secret env"
 [[ "$(grep -c 'QUOTEOPS_LICENSE_PATH: /opt/quoteops-v1/secrets/license.json' "$COMPOSE_FILE")" -ge 2 ]] || fail "appliance compose must wire QUOTEOPS_LICENSE_PATH to mounted secrets for agent and api"
 [[ "$(grep -c 'QUOTEOPS_LICENSE_PUBLIC_KEY_PATH: /opt/quoteops-v1/secrets/license-public-key.pem' "$COMPOSE_FILE")" -ge 2 ]] || fail "appliance compose must wire QUOTEOPS_LICENSE_PUBLIC_KEY_PATH to mounted secrets for agent and api"
 [[ "$(grep -c -- '- quoteops_secrets:/opt/quoteops-v1/secrets' "$COMPOSE_FILE")" -ge 3 ]] || fail "appliance compose must mount quoteops_secrets into agent, api and onboard"
@@ -349,12 +351,90 @@ fi
 install_guard_run "$INSTALL_GUARD_DIR/home-three" --force >/dev/null
 grep -q '^RFQ-2,LANE-2$' "$INSTALL_CONNECTORS_TARGET/tms/rfqs.csv" || fail "install.sh --force did not replace connector pack file"
 
+if [[ "$(uname -s)" == "Darwin" ]]; then
+  E2E_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/quoteops-mac-e2e.XXXXXX")"
+  E2E_ROOT="$(cd "$E2E_ROOT" && pwd -P)"
+  TEMP_DIRS+=("$E2E_ROOT")
+  TEST_HOME="$E2E_ROOT/quoteops-v1"
+  TEST_BIN_DIR="$E2E_ROOT/usr-local-bin"
+  TEST_TOKEN_FILE="$E2E_ROOT/registration-token"
+  TEST_REGISTRATION_TOKEN="registration-token-test-0123456789abcdef"
+  printf '%s' "$TEST_REGISTRATION_TOKEN" > "$TEST_TOKEN_FILE"
+  chmod 600 "$TEST_TOKEN_FILE"
+
+  QUOTEOPS_BOOTSTRAP_TEST_MODE=macbook QUOTEOPS_BIN_DIR="$TEST_BIN_DIR" \
+    bash "$APPLIANCE_DIR/install.sh" \
+      --client smoke \
+      --manifest "$INSTALL_MANIFEST" \
+      --connectors "$INSTALL_CONNECTORS_SRC" \
+      --home "$TEST_HOME" \
+      --skip-start \
+      --version v0.2.0 \
+      --postgres-password stable-postgres-password \
+      --control-plane-url "https://quoteops.inducta.example" \
+      --registration-token-file "$TEST_TOKEN_FILE" \
+      --installation-id smoke-install-001 >/dev/null
+
+  test -d "$TEST_HOME/releases/v0.2.0" || fail "release directory was not installed"
+  test -L "$TEST_HOME/current" || fail "current release link was not installed"
+  test "$(readlink "$TEST_HOME/current")" = "$TEST_HOME/releases/v0.2.0" || fail "current release link target is not absolute and pinned"
+  test -x "$TEST_HOME/current/quoteops.sh" || fail "release-local quoteops dispatcher is missing"
+  test -x "$TEST_BIN_DIR/quoteops" || fail "stable quoteops wrapper is missing"
+  test -d "$TEST_HOME/manifests" || fail "manifest data directory is missing"
+  test -d "$TEST_HOME/connectors" || fail "connector data directory is missing"
+  test -d "$TEST_HOME/secrets" || fail "secret data directory is missing"
+
+  CLIENT_ENV_BEFORE="$(cat "$TEST_HOME/secrets/client.env")"
+  CURRENT_BEFORE="$(readlink "$TEST_HOME/current")"
+  SECOND_TOKEN_FILE="$E2E_ROOT/second-registration-token"
+  printf '%s' "replacement-token-that-must-not-win-0123456789" > "$SECOND_TOKEN_FILE"
+  chmod 600 "$SECOND_TOKEN_FILE"
+  QUOTEOPS_BOOTSTRAP_TEST_MODE=macbook QUOTEOPS_BIN_DIR="$TEST_BIN_DIR" \
+    bash "$APPLIANCE_DIR/install.sh" \
+      --client smoke \
+      --manifest "$INSTALL_MANIFEST" \
+      --connectors "$INSTALL_CONNECTORS_SRC" \
+      --home "$TEST_HOME" \
+      --skip-start \
+      --version v0.2.0 \
+      --postgres-password replacement-password-that-must-not-win \
+      --control-plane-url "https://quoteops.inducta.example" \
+      --registration-token-file "$SECOND_TOKEN_FILE" \
+      --installation-id smoke-install-001 >/dev/null
+  test "$(cat "$TEST_HOME/secrets/client.env")" = "$CLIENT_ENV_BEFORE" || fail "idempotent install changed durable secrets"
+  grep -q '^POSTGRES_PASSWORD="stable-postgres-password"$' "$TEST_HOME/secrets/client.env" || fail "install did not preserve PostgreSQL password"
+  grep -q "^QUOTEOPS_REGISTRATION_TOKEN=\"$TEST_REGISTRATION_TOKEN\"$" "$TEST_HOME/secrets/client.env" || fail "install did not preserve registration token"
+  if grep -Eq 'POSTGRES_PASSWORD|QUOTEOPS_REGISTRATION_TOKEN|stable-postgres-password|registration-token-test' "$TEST_HOME/.env"; then
+    fail "shared env contains a password or registration token"
+  fi
+
+  OTHER_MANIFEST="$E2E_ROOT/other-client-manifest.yaml"
+  sed 's/^client_id: smoke$/client_id: other/' "$INSTALL_MANIFEST" > "$OTHER_MANIFEST"
+  if QUOTEOPS_BOOTSTRAP_TEST_MODE=macbook QUOTEOPS_BIN_DIR="$TEST_BIN_DIR" \
+    bash "$APPLIANCE_DIR/install.sh" \
+      --client other \
+      --manifest "$OTHER_MANIFEST" \
+      --connectors "$INSTALL_CONNECTORS_SRC" \
+      --home "$TEST_HOME" \
+      --skip-start \
+      --version v0.2.0 \
+      --postgres-password other-password >/dev/null 2>&1; then
+    fail "install accepted a different client id for an existing appliance"
+  fi
+  test "$(readlink "$TEST_HOME/current")" = "$CURRENT_BEFORE" || fail "client-id rejection modified current"
+fi
+
 MOCK_DOCKER_DIR="$(mktemp -d "${TMPDIR:-/tmp}/quoteops-mock-docker.XXXXXX")"
 TEMP_DIRS+=("$MOCK_DOCKER_DIR")
 MOCK_DOCKER_LOG="$MOCK_DOCKER_DIR/docker.log"
 cat > "$MOCK_DOCKER_DIR/docker" <<'SH'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$MOCK_DOCKER_LOG"
+if [[ "$*" == "compose version --short" ]]; then
+  printf '%s\n' "2.24.0"
+elif [[ "$1" == "volume" && "${2:-}" == "inspect" ]]; then
+  exit 1
+fi
 SH
 chmod +x "$MOCK_DOCKER_DIR/docker"
 PATH="$MOCK_DOCKER_DIR:$PATH" MOCK_DOCKER_LOG="$MOCK_DOCKER_LOG" \
@@ -394,11 +474,18 @@ YAML
   compose_config() {
     QUOTEOPS_CLIENT_ID=cliente-demo \
     QUOTEOPS_VERSION=v2.0.0 \
-    QUOTEOPS_IMAGE_REGISTRY=ghcr.io/alejandroc-bit \
+    QUOTEOPS_PLATFORM=linux/amd64 \
+    QUOTEOPS_AGENT_IMAGE=ghcr.io/alejandroc-bit/quote-ops-agent:v2.0.0 \
+    QUOTEOPS_API_IMAGE=ghcr.io/alejandroc-bit/quote-ops-api:v2.0.0 \
+    QUOTEOPS_WEB_IMAGE=ghcr.io/alejandroc-bit/quote-ops-web:v2.0.0 \
+    QUOTEOPS_POSTGRES_IMAGE=postgres:16-alpine \
+    QUOTEOPS_REDIS_IMAGE=redis:7-alpine \
+    QUOTEOPS_CADDY_IMAGE=caddy:2-alpine \
+    QUOTEOPS_CLOUDFLARED_IMAGE=cloudflare/cloudflared:2026.7.3 \
     QUOTEOPS_MANIFEST_DIR="$WORK_DIR/manifests" \
     QUOTEOPS_CRITERIA_DIR="$WORK_DIR/criteria" \
     QUOTEOPS_CONNECTORS_DIR="$WORK_DIR/connectors" \
-    QUOTEOPS_SECRETS_ENV_FILE="$WORK_DIR/secrets/client.env" \
+    QUOTEOPS_CLIENT_ENV_FILE="$WORK_DIR/secrets/client.env" \
     QUOTEOPS_TMS_MAPPING_CONFIG_PATH=/opt/quoteops-v1/connectors/tms-mapping.json \
     QUOTEOPS_SAKBE_CACHE_MODE=cache_first \
     QUOTEOPS_LOG_DIR="$WORK_DIR/logs" \

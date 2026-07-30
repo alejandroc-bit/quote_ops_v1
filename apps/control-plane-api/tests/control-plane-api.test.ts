@@ -3,7 +3,7 @@ import { spawnSync } from "node:child_process";
 import { type IncomingMessage, ServerResponse } from "node:http";
 import { Duplex, Readable } from "node:stream";
 import { gzipSync } from "node:zlib";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -47,6 +47,52 @@ describe("minimal control-plane API", () => {
       service: "quoteops-control-plane-api",
       clients: 0
     });
+  });
+
+  it("renders the stable one-command bootstrap without exposing credentials", async () => {
+    const applianceReleaseRoot = await createBootstrapReleaseFixture();
+    const api = await startApi({
+      applianceReleaseRoot,
+      applianceReleaseVersion: "v0.2.0",
+      controlPlaneUrl: "https://control.quoteops.example"
+    });
+    const response = await api.getTextWithHeaders("/install/quoteops", {
+      host: "attacker.example",
+      forwarded: "host=attacker.example",
+      "x-forwarded-host": "attacker.example"
+    });
+
+    expect(response.status).toBe(200);
+    expect(response.headers["content-type"]).toContain("text/x-shellscript");
+    expect(response.headers["cache-control"]).toBe("no-store");
+    expect(response.headers["referrer-policy"]).toBe("no-referrer");
+    expect(response.text).toContain(
+      'CONTROL_PLANE_URL="${QUOTEOPS_CONTROL_PLANE_URL:-https://control.quoteops.example}"'
+    );
+    expect(response.text).not.toContain("attacker.example");
+    expect(response.text).toContain('read -r -s -p "Registration token: "');
+    expect(response.text).toContain('header = "Authorization: Bearer %s"');
+    expect(response.text).toContain('QUOTEOPS_REGISTRATION_TOKEN_FILE="$TOKEN_FILE"');
+    expect(response.text).toContain('bash "$INSTALLER_FILE" "$@" </dev/tty');
+    expect(response.text).toContain('bash "$INSTALLER_FILE" "$@" </dev/null');
+    expect(response.text).not.toContain("/api/install/$QUOTEOPS_REGISTRATION_TOKEN");
+  });
+
+  it("fails closed when the deployed bootstrap is missing or fails its detached checksum", async () => {
+    const emptyRoot = await mkdtemp(join(tmpdir(), "quoteops-bootstrap-missing-"));
+    tempDirs.push(emptyRoot);
+    const missing = await startApi({
+      applianceReleaseRoot: emptyRoot,
+      applianceReleaseVersion: "v0.2.0"
+    });
+    expect((await missing.getText("/install/quoteops")).status).toBe(503);
+
+    const corruptRoot = await createBootstrapReleaseFixture("0".repeat(64));
+    const corrupt = await startApi({
+      applianceReleaseRoot: corruptRoot,
+      applianceReleaseVersion: "v0.2.0"
+    });
+    expect((await corrupt.getText("/install/quoteops")).status).toBe(503);
   });
 
   it("creates a client, generates an install pack and activates with a signed license", async () => {
@@ -1444,6 +1490,8 @@ async function startApi(options: {
   tokenGenerator?: () => string;
   tokenTtlMinutes?: number;
   controlPlaneUrl?: string;
+  applianceReleaseRoot?: string;
+  applianceReleaseVersion?: string;
   data?: ControlPlaneData;
   verifySessionToken?: (token: string) => Promise<{ user_id: string; email: string } | null>;
   isVendorAdminEmail?: (email: string) => boolean;
@@ -1481,8 +1529,34 @@ async function startApi(options: {
         text: response.text,
         headers: response.headers
       };
+    },
+    async getTextWithHeaders(path: string, headers: Record<string, string>) {
+      const response = await directRequest(app, "GET", path, undefined, null, headers);
+      return {
+        status: response.status,
+        text: response.text,
+        headers: response.headers
+      };
     }
   };
+}
+
+async function createBootstrapReleaseFixture(
+  bootstrapChecksum?: string
+): Promise<string> {
+  const root = await mkdtemp(join(tmpdir(), "quoteops-bootstrap-release-"));
+  tempDirs.push(root);
+  const releaseDir = join(root, "v0.2.0");
+  await mkdir(releaseDir);
+  const bootstrap = await readFile(
+    join(process.cwd(), "deploy", "appliance", "bootstrap.sh")
+  );
+  await writeFile(join(releaseDir, "bootstrap.sh"), bootstrap);
+  await writeFile(
+    join(releaseDir, "SHA256SUMS"),
+    `${bootstrapChecksum ?? sha256(bootstrap)}  bootstrap.sh\n`
+  );
+  return root;
 }
 
 async function createTestRelease(
@@ -1636,7 +1710,8 @@ async function directRequest(
   method: "GET" | "POST",
   path: string,
   body: Record<string, unknown> | undefined,
-  authorization: string | null
+  authorization: string | null,
+  requestHeaders: Record<string, string> = {}
 ): Promise<{
   status: number;
   body: Record<string, any>;
@@ -1668,7 +1743,8 @@ async function directRequest(
             "content-length": String(Buffer.byteLength(payload))
           }
         : {}),
-      ...(authorization ? { authorization } : {})
+      ...(authorization ? { authorization } : {}),
+      ...requestHeaders
     }
   });
 

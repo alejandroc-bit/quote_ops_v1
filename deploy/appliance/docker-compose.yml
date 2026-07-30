@@ -1,5 +1,8 @@
 name: ${COMPOSE_PROJECT_NAME:-quoteops_v1}
 
+# Reserved release-pinned image interface for Task 4's optional tunnel profile.
+x-quoteops-cloudflared-image: ${QUOTEOPS_CLOUDFLARED_IMAGE:?QUOTEOPS_CLOUDFLARED_IMAGE is required}
+
 x-quoteops-service: &quoteops-service
   restart: unless-stopped
   networks:
@@ -12,14 +15,16 @@ x-quoteops-service: &quoteops-service
 
 services:
   postgres:
-    image: postgres:16-alpine
+    image: ${QUOTEOPS_POSTGRES_IMAGE:?QUOTEOPS_POSTGRES_IMAGE is required}
     restart: unless-stopped
     networks:
       - quoteops_internal
+    env_file:
+      - path: ${QUOTEOPS_CLIENT_ENV_FILE:?QUOTEOPS_CLIENT_ENV_FILE is required}
+        required: true
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-quoteops}
       POSTGRES_USER: ${POSTGRES_USER:-quoteops}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-}
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -34,7 +39,7 @@ services:
         max-file: "5"
 
   redis:
-    image: redis:7-alpine
+    image: ${QUOTEOPS_REDIS_IMAGE:?QUOTEOPS_REDIS_IMAGE is required}
     restart: unless-stopped
     networks:
       - quoteops_internal
@@ -52,10 +57,11 @@ services:
 
   quoteops-agent:
     <<: *quoteops-service
-    image: ${QUOTEOPS_IMAGE_REGISTRY:-ghcr.io/alejandroc-bit}/quote-ops-agent:${QUOTEOPS_VERSION:-v0.1.0}
+    image: ${QUOTEOPS_AGENT_IMAGE:?QUOTEOPS_AGENT_IMAGE is required}
+    platform: ${QUOTEOPS_PLATFORM:-linux/amd64}
     env_file:
-      - path: ${QUOTEOPS_SECRETS_ENV_FILE:-/opt/quoteops-v1/secrets/client.env}
-        required: false
+      - path: ${QUOTEOPS_CLIENT_ENV_FILE:?QUOTEOPS_CLIENT_ENV_FILE is required}
+        required: true
     depends_on:
       postgres:
         condition: service_healthy
@@ -92,7 +98,6 @@ services:
       QUOTEOPS_TMS_STATUS_WRITEBACKS_PATH: /opt/quoteops-v1/connectors/tms/status-writebacks.jsonl
       QUOTEOPS_LOG_DIR: /var/log/quoteops
       QUOTEOPS_BACKUP_DIR: /opt/quoteops-v1/backups
-      DATABASE_URL: postgresql://${POSTGRES_USER:-quoteops}:${POSTGRES_PASSWORD:-}@postgres:5432/${POSTGRES_DB:-quoteops}
       REDIS_URL: redis://redis:6379/0
     volumes:
       - quoteops_manifests:/opt/quoteops-v1/manifests:ro
@@ -105,10 +110,11 @@ services:
 
   quoteops-api:
     <<: *quoteops-service
-    image: ${QUOTEOPS_IMAGE_REGISTRY:-ghcr.io/alejandroc-bit}/quote-ops-api:${QUOTEOPS_VERSION:-v0.1.0}
+    image: ${QUOTEOPS_API_IMAGE:?QUOTEOPS_API_IMAGE is required}
+    platform: ${QUOTEOPS_PLATFORM:-linux/amd64}
     env_file:
-      - path: ${QUOTEOPS_SECRETS_ENV_FILE:-/opt/quoteops-v1/secrets/client.env}
-        required: false
+      - path: ${QUOTEOPS_CLIENT_ENV_FILE:?QUOTEOPS_CLIENT_ENV_FILE is required}
+        required: true
     depends_on:
       postgres:
         condition: service_healthy
@@ -151,7 +157,6 @@ services:
       QUOTEOPS_TMS_STATUS_WRITEBACKS_PATH: /opt/quoteops-v1/connectors/tms/status-writebacks.jsonl
       QUOTEOPS_LOG_DIR: /var/log/quoteops
       QUOTEOPS_BACKUP_DIR: /opt/quoteops-v1/backups
-      DATABASE_URL: postgresql://${POSTGRES_USER:-quoteops}:${POSTGRES_PASSWORD:-}@postgres:5432/${POSTGRES_DB:-quoteops}
       REDIS_URL: redis://redis:6379/0
     volumes:
       - quoteops_manifests:/opt/quoteops-v1/manifests:ro
@@ -167,13 +172,14 @@ services:
   # run it with: docker compose run --rm quoteops-onboard
   quoteops-onboard:
     profiles: ["onboarding"]
-    image: ${QUOTEOPS_IMAGE_REGISTRY:-ghcr.io/alejandroc-bit}/quote-ops-api:${QUOTEOPS_VERSION:-v0.1.0}
+    image: ${QUOTEOPS_API_IMAGE:?QUOTEOPS_API_IMAGE is required}
+    platform: ${QUOTEOPS_PLATFORM:-linux/amd64}
     restart: "no"
     networks:
       - quoteops_internal
     env_file:
-      - path: ${QUOTEOPS_SECRETS_ENV_FILE:-/opt/quoteops-v1/secrets/client.env}
-        required: false
+      - path: ${QUOTEOPS_CLIENT_ENV_FILE:?QUOTEOPS_CLIENT_ENV_FILE is required}
+        required: true
     environment:
       NODE_ENV: production
       QUOTEOPS_SERVICE: onboard
@@ -209,7 +215,8 @@ services:
 
   quoteops-web:
     <<: *quoteops-service
-    image: ${QUOTEOPS_IMAGE_REGISTRY:-ghcr.io/alejandroc-bit}/quote-ops-web:${QUOTEOPS_VERSION:-v0.1.0}
+    image: ${QUOTEOPS_WEB_IMAGE:?QUOTEOPS_WEB_IMAGE is required}
+    platform: ${QUOTEOPS_PLATFORM:-linux/amd64}
     depends_on:
       quoteops-api:
         condition: service_started
@@ -226,7 +233,7 @@ services:
       - quoteops_logs:/var/log/quoteops
 
   caddy:
-    image: caddy:2-alpine
+    image: ${QUOTEOPS_CADDY_IMAGE:?QUOTEOPS_CADDY_IMAGE is required}
     restart: unless-stopped
     networks:
       - quoteops_internal
