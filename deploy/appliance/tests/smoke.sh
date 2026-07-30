@@ -117,6 +117,7 @@ validate_cloudflare_gate() {
   TEMP_DIRS+=("$gate_root")
   gate_home="$gate_root/home"
   mock_bin="$gate_root/bin"
+  export QUOTEOPS_VERIFY_TEST_MODE=smoke
   mkdir -p "$gate_home/current" "$gate_home/secrets" "$gate_home/settings" "$mock_bin"
   cp "$APPLIANCE_DIR/docker-compose.yml" "$gate_home/current/docker-compose.yml"
   cat > "$gate_home/current/release.env" <<'EOF'
@@ -183,6 +184,20 @@ if [[ "${MOCK_CURL_MODE:-}" == "unreachable" ]]; then
   exit 28
 fi
 if [[ -z "$config" ]]; then
+  case "${MOCK_CURL_MODE:-}" in
+    public-401-no-evidence|public-403-no-evidence)
+      if [[ -n "$headers" ]]; then
+        printf 'HTTP/2 %s\nserver: quoteops-origin\n\n' \
+          "${MOCK_CURL_MODE#public-}" | sed 's/-no-evidence//' > "$headers"
+      fi
+      if [[ "${MOCK_CURL_MODE:-}" == "public-401-no-evidence" ]]; then
+        printf '401'
+      else
+        printf '403'
+      fi
+      exit 0
+      ;;
+  esac
   if [[ -n "$headers" ]]; then
     cat > "$headers" <<'EOF'
 HTTP/2 302
@@ -290,12 +305,61 @@ EOF
   set +e
   output="$(
     PATH="$mock_bin:$PATH" QUOTEOPS_HOME="$gate_home" \
+      QUOTEOPS_VERIFY_TEST_MODE=invalid \
+      bash "$APPLIANCE_DIR/verify-install.sh" --resume-guided
+  )"
+  result=$?
+  set -e
+  [[ "$result" -eq 18 &&
+     ! -e "$gate_home/secrets/cloudflare-access-validation.env" ]] ||
+    fail "unbounded Access ownership test exception did not fail closed"
+
+  reset_access_secret
+  set +e
+  output="$(
+    PATH="$mock_bin:$PATH" QUOTEOPS_HOME="$gate_home" \
       MOCK_CURL_MODE=public-200 \
       bash "$APPLIANCE_DIR/verify-install.sh" --resume-guided
   )"
   result=$?
   set -e
   [[ "$result" -eq 15 ]] || fail "anonymous public 200 was not treated as a security failure"
+
+  for anonymous_mode in public-401-no-evidence public-403-no-evidence; do
+    reset_access_secret
+    set +e
+    output="$(
+      PATH="$mock_bin:$PATH" QUOTEOPS_HOME="$gate_home" \
+        MOCK_CURL_MODE="$anonymous_mode" \
+        bash "$APPLIANCE_DIR/verify-install.sh" --resume-guided
+    )"
+    result=$?
+    set -e
+    [[ "$result" -eq 15 ]] ||
+      fail "anonymous ${anonymous_mode#public-} without Cloudflare evidence did not return 15"
+  done
+
+  reset_access_secret
+  set +e
+  output="$(
+    PATH="$mock_bin:$PATH" QUOTEOPS_HOME="$gate_home" \
+      MOCK_TUNNEL_CONNECTIONS=0 \
+      bash "$APPLIANCE_DIR/verify-install.sh" --resume-guided
+  )"
+  result=$?
+  set -e
+  [[ "$result" -eq 13 ]] || fail "zero tunnel connections did not return 13"
+
+  reset_access_secret
+  set +e
+  output="$(
+    PATH="$mock_bin:$PATH" QUOTEOPS_HOME="$gate_home" \
+      MOCK_TUNNEL_CONNECTIONS=not-a-number \
+      bash "$APPLIANCE_DIR/verify-install.sh" --resume-guided
+  )"
+  result=$?
+  set -e
+  [[ "$result" -eq 13 ]] || fail "malformed tunnel metrics did not return 13"
 
   reset_access_secret
   SECONDS=0
@@ -319,6 +383,7 @@ EOF
   result=$?
   set -e
   [[ "$result" -eq 14 ]] || fail "never-resolving public probe did not return 14"
+  unset QUOTEOPS_VERIFY_TEST_MODE
 }
 
 validate_human_simulator_fixture
@@ -893,22 +958,52 @@ PATH="$MOCK_DOCKER_DIR:$PATH" MOCK_DOCKER_LOG="$MOCK_DOCKER_LOG" \
 test "$(cat "$VOLUME_ABSENT_HOME/secrets/client.env")" = "$ABSENT_CLIENT_ENV_BEFORE" ||
   fail "reinstall changed the generated PostgreSQL password"
 
-PATH="$MOCK_DOCKER_DIR:$PATH" MOCK_DOCKER_LOG="$MOCK_DOCKER_LOG" \
-  bash "$APPLIANCE_DIR/install.sh" \
+NO_PULL_HOME="$INSTALL_GUARD_DIR/home-no-pull"
+mkdir -p "$NO_PULL_HOME/secrets"
+printf '%s\n' 'TUNNEL_TOKEN=smoke-tunnel-token' > "$NO_PULL_HOME/secrets/cloudflare.env"
+chmod 600 "$NO_PULL_HOME/secrets/cloudflare.env"
+run_no_pull_install() {
+  PATH="$MOCK_DOCKER_DIR:$PATH" MOCK_DOCKER_LOG="$MOCK_DOCKER_LOG" \
+    bash "$APPLIANCE_DIR/install.sh" \
     --client smoke \
     --manifest "$INSTALL_MANIFEST" \
     --connectors "$INSTALL_CONNECTORS_SRC" \
     --connectors-dir "$INSTALL_CONNECTORS_TARGET" \
-    --home "$INSTALL_GUARD_DIR/home-no-pull" \
+    --home "$NO_PULL_HOME" \
     --postgres-password test-password \
     --force \
-    --no-pull >/dev/null
+    --no-pull
+}
+run_no_pull_install >/dev/null
 grep -q '^compose version$' "$MOCK_DOCKER_LOG" || fail "install.sh --no-pull did not validate Compose v2"
 grep -q '^compose .* config$' "$MOCK_DOCKER_LOG" || fail "install.sh --no-pull did not validate compose config"
 grep -q '^compose .* up -d$' "$MOCK_DOCKER_LOG" || fail "install.sh --no-pull did not start the stack"
 if grep -q '^compose .* pull$' "$MOCK_DOCKER_LOG"; then
   fail "install.sh --no-pull unexpectedly pulled images"
 fi
+
+assert_tunnel_env_rejected() {
+  local label="$1"
+  local log="$INSTALL_GUARD_DIR/cloudflare-env-$label.log"
+  if run_no_pull_install >"$log" 2>&1; then
+    fail "install accepted $label cloudflare.env"
+  fi
+  grep -q 'cloudflare.env' "$log" ||
+    fail "install did not identify rejected $label cloudflare.env"
+}
+
+printf '%s\n' \
+  'TUNNEL_TOKEN=smoke-tunnel-token' \
+  'TUNNEL_TOKEN=duplicate-token' > "$NO_PULL_HOME/secrets/cloudflare.env"
+assert_tunnel_env_rejected duplicate
+printf '%s\n' 'TUNNEL_TOKEN' > "$NO_PULL_HOME/secrets/cloudflare.env"
+assert_tunnel_env_rejected malformed
+printf '%s\n' 'TUNNEL_TOKEN=' > "$NO_PULL_HOME/secrets/cloudflare.env"
+assert_tunnel_env_rejected empty
+printf '%s\n' \
+  'TUNNEL_TOKEN=smoke-tunnel-token' \
+  'OPENROUTER_API_KEY=must-not-reach-cloudflared' > "$NO_PULL_HOME/secrets/cloudflare.env"
+assert_tunnel_env_rejected extra-assignment
 
 if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
   WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/quoteops-appliance-smoke.XXXXXX")"

@@ -167,6 +167,42 @@ validate_secret_file() {
   [[ "$(file_mode "$path")" == "600" ]] || die "secret file must have mode 0600: $path"
 }
 
+validate_cloudflare_access_file() {
+  local expected_owner=0
+  [[ -f "$CLOUDFLARE_ACCESS_ENV_FILE" && ! -L "$CLOUDFLARE_ACCESS_ENV_FILE" ]] ||
+    die "Cloudflare Access validation file must be a regular non-symlink file"
+  [[ "$(file_mode "$CLOUDFLARE_ACCESS_ENV_FILE")" == "600" ]] ||
+    die "Cloudflare Access validation file must have mode 0600"
+  if [[ "${QUOTEOPS_BOOTSTRAP_TEST_MODE:-}" == "macbook" ]]; then
+    case "$QUOTEOPS_HOME" in
+      "$(cd "${TMPDIR:-/tmp}" && pwd -P)"/quoteops-mac-e2e.*/quoteops-v1)
+        expected_owner="$(id -u)"
+        ;;
+      *) die "Cloudflare Access test ownership exception requires a bounded temporary QUOTEOPS_HOME" ;;
+    esac
+  fi
+  [[ "$(file_owner_id "$CLOUDFLARE_ACCESS_ENV_FILE")" == "$expected_owner" ]] ||
+    die "Cloudflare Access validation file must be owned by root"
+}
+
+validate_cloudflare_tunnel_env() {
+  local line
+  local assignments=0
+  validate_secret_file "$CLOUDFLARE_ENV_FILE"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ "$line" =~ ^TUNNEL_TOKEN=([A-Za-z0-9._~+/=-]+)$ ||
+          "$line" =~ ^TUNNEL_TOKEN=\"([A-Za-z0-9._~+/=-]+)\"$ ]]; then
+      assignments=$((assignments + 1))
+      [[ "$assignments" -eq 1 ]] ||
+        die "cloudflare.env must contain exactly one TUNNEL_TOKEN assignment"
+      continue
+    fi
+    die "cloudflare.env may contain only one non-empty TUNNEL_TOKEN assignment"
+  done < "$CLOUDFLARE_ENV_FILE"
+  [[ "$assignments" -eq 1 ]] ||
+    die "cloudflare.env must contain exactly one non-empty TUNNEL_TOKEN assignment"
+}
+
 read_env_value() {
   local key="$1"
   local file="$2"
@@ -214,7 +250,6 @@ cloudflare_validation_receipt_matches() {
 }
 
 load_cloudflare_gate_settings() {
-  local tunnel_token
   local access_client_id
   local access_client_secret
 
@@ -227,18 +262,13 @@ load_cloudflare_gate_settings() {
   [[ "$QUOTEOPS_PUBLIC_HOSTNAME" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] ||
     die "public hostname is invalid"
 
-  validate_secret_file "$CLOUDFLARE_ENV_FILE"
-  tunnel_token="$(read_env_value TUNNEL_TOKEN "$CLOUDFLARE_ENV_FILE")"
-  [[ -n "$tunnel_token" ]] || die "Cloudflare named-tunnel token is missing"
-  unset tunnel_token
-
   if cloudflare_validation_receipt_matches; then
     return
   fi
   if [[ ! -e "$CLOUDFLARE_ACCESS_ENV_FILE" && "$RESUME_GUIDED" -eq 1 ]]; then
     die "Cloudflare Service Auth credentials must be collected again before resumed verification"
   fi
-  validate_secret_file "$CLOUDFLARE_ACCESS_ENV_FILE"
+  validate_cloudflare_access_file
   access_client_id="$(read_env_value CF_ACCESS_CLIENT_ID "$CLOUDFLARE_ACCESS_ENV_FILE")"
   access_client_secret="$(read_env_value CF_ACCESS_CLIENT_SECRET "$CLOUDFLARE_ACCESS_ENV_FILE")"
   [[ -n "$access_client_id" && -n "$access_client_secret" ]] ||
@@ -844,8 +874,11 @@ if [[ ! -e "$CLOUDFLARE_ENV_FILE" ]]; then
 fi
 validate_secret_file "$SECRETS_ENV_FILE"
 validate_secret_file "$CLOUDFLARE_ENV_FILE"
-if [[ "$GUIDED" -eq 1 && "$START_STACK" -eq 1 ]]; then
-  load_cloudflare_gate_settings
+if [[ "$START_STACK" -eq 1 ]]; then
+  validate_cloudflare_tunnel_env
+  if [[ "$GUIDED" -eq 1 ]]; then
+    load_cloudflare_gate_settings
+  fi
 fi
 
 EXISTING_POSTGRES_PASSWORD="$(read_env_value POSTGRES_PASSWORD "$SECRETS_ENV_FILE")"

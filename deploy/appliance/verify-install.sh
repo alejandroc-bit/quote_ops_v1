@@ -54,6 +54,31 @@ file_owner_id() {
   fi
 }
 
+cloudflare_access_owner_is_valid() {
+  local expected_owner=0
+  local physical_home
+  local physical_tmp
+  case "${QUOTEOPS_VERIFY_TEST_MODE:-}" in
+    "")
+      ;;
+    smoke)
+      [[ -d "$QUOTEOPS_HOME" && ! -L "$QUOTEOPS_HOME" ]] || return 1
+      physical_home="$(cd "$QUOTEOPS_HOME" && pwd -P)" || return 1
+      physical_tmp="$(cd "${TMPDIR:-/tmp}" && pwd -P)" || return 1
+      case "$physical_home" in
+        "$physical_tmp"/quoteops-cloudflare-gate.*/home)
+          expected_owner="$(id -u)"
+          ;;
+        *) return 1 ;;
+      esac
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+  [[ "$(file_owner_id "$ACCESS_ENV_FILE")" == "$expected_owner" ]]
+}
+
 json_result() {
   local status="$1"
   printf '{\n'
@@ -265,16 +290,23 @@ receipt_matches() {
       "$VALIDATION_RECEIPT_FILE" >/dev/null 2>&1
 }
 
+if [[ -e "$ACCESS_ENV_FILE" || -L "$ACCESS_ENV_FILE" ]]; then
+  if [[ ! -f "$ACCESS_ENV_FILE" ||
+        -L "$ACCESS_ENV_FILE" ||
+        "$(file_mode "$ACCESS_ENV_FILE")" != "600" ]] ||
+     ! cloudflare_access_owner_is_valid; then
+    KEEP_ACCESS_ENV=0
+    finish 18 failed
+  fi
+fi
+
 if receipt_matches; then
   ORIGIN_CHECK="ok"
   KEEP_ACCESS_ENV=0
   finish 0 ready
 fi
 
-if [[ ! -f "$ACCESS_ENV_FILE" ||
-      -L "$ACCESS_ENV_FILE" ||
-      "$(file_mode "$ACCESS_ENV_FILE")" != "600" ||
-      "$(file_owner_id "$ACCESS_ENV_FILE")" != "$(id -u)" ]]; then
+if [[ ! -f "$ACCESS_ENV_FILE" ]]; then
   finish 18 failed
 fi
 ACCESS_CLIENT_ID="$(read_env_value CF_ACCESS_CLIENT_ID "$ACCESS_ENV_FILE")"
