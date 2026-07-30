@@ -19,6 +19,7 @@ import {
 } from "node:path";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 import {
+  isMailboxEnabled,
   OnboardingError,
   type OnboardingAnswers,
   type OnboardingContext,
@@ -55,6 +56,12 @@ const APPLIANCE_ENV_KEYS = [
   "MAILBOX_PASSWORD",
   "INEGI_SAKBE_KEY",
   "QUOTEOPS_EMBEDDING_API_KEY"
+] as const;
+const MAILBOX_ENV_KEYS = [
+  "RESEND_API_KEY",
+  "MAILBOX_USER",
+  "MAILBOX_FROM",
+  "MAILBOX_PASSWORD"
 ] as const;
 
 export async function configureApplianceSecrets(
@@ -247,7 +254,11 @@ export const applianceSecretsPhase: OnboardingPhase = {
   },
   async run(context) {
     if (context.answers) {
-      if (!context.answers.mailbox || !context.answers.embeddings) {
+      const mailboxEnabled = await isMailboxEnabled(context);
+      if (
+        !context.answers.embeddings ||
+        (mailboxEnabled && !context.answers.mailbox)
+      ) {
         throw new OnboardingError("onboarding_pending", {
           phase: "appliance_secrets"
         });
@@ -329,11 +340,28 @@ export async function isApplianceSecretsComplete(
     return false;
   }
   const env = await readEnvFileValues(context.paths.clientSecretsFile);
+  const mailboxDeclared =
+    Object.prototype.hasOwnProperty.call(config, "mailbox") &&
+    config.mailbox !== null &&
+    config.mailbox !== undefined;
   const mailbox =
     config.mailbox && typeof config.mailbox === "object"
       ? (config.mailbox as Record<string, unknown>)
       : null;
-  if (!mailbox || !isCompleteMailboxConfig(mailbox, env)) return false;
+  if (mailboxDeclared && !mailbox) return false;
+  const embeddings =
+    config.embeddings && typeof config.embeddings === "object"
+      ? (config.embeddings as Record<string, unknown>)
+      : null;
+  if (!embeddings || !isCompleteEmbeddingsConfig(embeddings)) return false;
+  if (!hasNonEmptyEnv(env, "QUOTEOPS_EMBEDDING_API_KEY")) return false;
+  if (env.has("INEGI_SAKBE_KEY") && !hasNonEmptyEnv(env, "INEGI_SAKBE_KEY")) {
+    return false;
+  }
+  if (!mailbox) {
+    return MAILBOX_ENV_KEYS.every((key) => !env.has(key));
+  }
+  if (!isCompleteMailboxConfig(mailbox, env)) return false;
   const provider = mailbox.provider as "resend" | "imap";
   const receipt = await readMailboxReceipt(
     context.paths.mailboxProbeReceiptFile
@@ -353,15 +381,6 @@ export async function isApplianceSecretsComplete(
     receipt.agent_config_sha256 !==
       (await sha256File(context.paths.agentConfigFile))
   ) {
-    return false;
-  }
-  const embeddings =
-    config.embeddings && typeof config.embeddings === "object"
-      ? (config.embeddings as Record<string, unknown>)
-      : null;
-  if (!embeddings || !isCompleteEmbeddingsConfig(embeddings)) return false;
-  if (!hasNonEmptyEnv(env, "QUOTEOPS_EMBEDDING_API_KEY")) return false;
-  if (env.has("INEGI_SAKBE_KEY") && !hasNonEmptyEnv(env, "INEGI_SAKBE_KEY")) {
     return false;
   }
   return true;

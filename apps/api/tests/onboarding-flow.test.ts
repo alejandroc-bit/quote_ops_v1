@@ -260,59 +260,210 @@ describe("resumable onboarding flow", () => {
     }
   );
 
-  it.each([
-    {
-      missing: "mailbox",
-      answers: {
-        schema_version: 1 as const,
-        embeddings: {
-          provider: "gemini" as const,
-          model: "text-embedding-004",
-          api_key: { file: "/unused" }
-        }
+  it("keeps an enabled mailbox pending when unattended answers omit it", async () => {
+    const context = await testContext({ guided: false });
+    const embeddingKey = await secretRef(
+      context,
+      "enabled-omission-embedding.key",
+      "embedding-secret"
+    );
+    context.answers = {
+      schema_version: 1,
+      embeddings: {
+        provider: "gemini",
+        model: "text-embedding-004",
+        api_key: embeddingKey
       }
-    },
-    {
-      missing: "embeddings",
+    };
+    const enabledConfig = [
+      "unrelated:",
+      "  keep: true",
+      "mailbox:",
+      "  provider: resend",
+      "  auth: password",
+      "  processed_mailbox: null",
+      "  poll_interval_ms: 60000",
+      "  imap_host: null",
+      "  imap_port: null",
+      ""
+    ].join("\n");
+    await writeFile(
+      context.paths.clientSecretsFile,
+      'UNRELATED_SETTING="keep"\nRESEND_API_KEY="old-key"\nMAILBOX_USER="intake@example.com"\nMAILBOX_FROM="quotes@example.com"\n',
+      { mode: 0o600 }
+    );
+    await writeFile(context.paths.agentConfigFile, enabledConfig, {
+      mode: 0o600
+    });
+
+    await expect(applianceSecretsPhase.run(context)).rejects.toMatchObject({
+      code: "onboarding_pending",
+      phase: "appliance_secrets"
+    });
+    expect(await readFile(context.paths.clientSecretsFile, "utf8")).toContain(
+      'RESEND_API_KEY="old-key"'
+    );
+    expect(await readFile(context.paths.agentConfigFile, "utf8")).toBe(
+      enabledConfig
+    );
+    expect(context.io.ask).not.toHaveBeenCalled();
+    expect(context.io.askMasked).not.toHaveBeenCalled();
+  });
+
+  it("keeps appliance setup pending when unattended answers omit embeddings", async () => {
+    const context = await testContext({
+      guided: false,
       answers: {
-        schema_version: 1 as const,
+        schema_version: 1,
         mailbox: {
-          provider: "resend" as const,
+          provider: "resend",
           api_key: { file: "/unused" },
           intake_address: "intake@example.com",
           from_address: "quotes@example.com"
         }
       }
-    }
-  ])(
-    "does not mutate appliance state when noninteractive answers omit $missing",
-    async ({ answers }) => {
-      const context = await testContext({ guided: false, answers });
-      await writeFile(
-        context.paths.clientSecretsFile,
-        'UNRELATED_SETTING="keep"\n',
-        { mode: 0o600 }
-      );
-      await writeFile(
-        context.paths.agentConfigFile,
-        "unrelated:\n  keep: true\n",
-        { mode: 0o600 }
-      );
+    });
+    await writeFile(
+      context.paths.clientSecretsFile,
+      'UNRELATED_SETTING="keep"\n',
+      { mode: 0o600 }
+    );
+    await writeFile(
+      context.paths.agentConfigFile,
+      "unrelated:\n  keep: true\n",
+      { mode: 0o600 }
+    );
 
-      await expect(applianceSecretsPhase.run(context)).rejects.toMatchObject({
-        code: "onboarding_pending",
-        phase: "appliance_secrets"
-      });
-      expect(await readFile(context.paths.clientSecretsFile, "utf8")).toBe(
-        'UNRELATED_SETTING="keep"\n'
-      );
-      expect(await readFile(context.paths.agentConfigFile, "utf8")).toBe(
-        "unrelated:\n  keep: true\n"
-      );
-      expect(context.io.ask).not.toHaveBeenCalled();
-      expect(context.io.askMasked).not.toHaveBeenCalled();
-    }
-  );
+    await expect(applianceSecretsPhase.run(context)).rejects.toMatchObject({
+      code: "onboarding_pending",
+      phase: "appliance_secrets"
+    });
+    expect(await readFile(context.paths.clientSecretsFile, "utf8")).toBe(
+      'UNRELATED_SETTING="keep"\n'
+    );
+    expect(await readFile(context.paths.agentConfigFile, "utf8")).toBe(
+      "unrelated:\n  keep: true\n"
+    );
+  });
+
+  it("completes the generated default with embeddings and mailbox disabled", async () => {
+    const context = await testContext({ guided: false });
+    const embeddingKey = await secretRef(
+      context,
+      "disabled-mailbox-embedding.key",
+      "embedding-secret"
+    );
+    context.answers = {
+      schema_version: 1,
+      embeddings: {
+        provider: "gemini",
+        model: "text-embedding-004",
+        api_key: embeddingKey
+      }
+    };
+    await writeFile(
+      context.paths.agentConfigFile,
+      "unrelated:\n  keep: true\n",
+      { mode: 0o600 }
+    );
+    const phases: OnboardingPhase[] = [
+      {
+        id: "ai_provider",
+        async isComplete() {
+          return true;
+        },
+        async run() {
+          throw new Error("unexpected");
+        }
+      },
+      {
+        id: "cloudflare",
+        async isComplete() {
+          return true;
+        },
+        async run() {
+          throw new Error("unexpected");
+        }
+      },
+      applianceSecretsPhase
+    ];
+
+    await runOnboarding({
+      phases,
+      context,
+      selection: { mode: "only", phase: "appliance_secrets" }
+    });
+
+    const config = parseYaml(
+      await readFile(context.paths.agentConfigFile, "utf8")
+    );
+    const env = await readFile(context.paths.clientSecretsFile, "utf8");
+    expect(config.mailbox).toBeUndefined();
+    expect(config.embeddings).toMatchObject({
+      provider: "gemini",
+      api_key_env: "QUOTEOPS_EMBEDDING_API_KEY"
+    });
+    expect(env).toContain("QUOTEOPS_EMBEDDING_API_KEY=");
+    expect(env).not.toMatch(
+      /RESEND_API_KEY|MAILBOX_USER|MAILBOX_FROM|MAILBOX_PASSWORD/
+    );
+    expect(
+      await readFile(context.paths.mailboxProbeReceiptFile, "utf8").catch(
+        () => ""
+      )
+    ).toBe("");
+    expect(await isApplianceSecretsComplete(context)).toBe(true);
+  });
+
+  it("keeps a disabled mailbox incomplete while stale managed keys remain", async () => {
+    const context = await testContext();
+    await writeFile(
+      context.paths.agentConfigFile,
+      [
+        "embeddings:",
+        "  provider: gemini",
+        "  model: text-embedding-004",
+        "  api_key_env: QUOTEOPS_EMBEDDING_API_KEY",
+        "  base_url: null",
+        ""
+      ].join("\n"),
+      { mode: 0o600 }
+    );
+    await updateAllowedEnv(
+      context.paths.clientSecretsFile,
+      {
+        QUOTEOPS_EMBEDDING_API_KEY: "embedding-secret",
+        RESEND_API_KEY: "stale-mailbox-key"
+      },
+      ["QUOTEOPS_EMBEDDING_API_KEY", "RESEND_API_KEY"]
+    );
+
+    expect(await isApplianceSecretsComplete(context)).toBe(false);
+  });
+
+  it("does not interpret a malformed declared mailbox as disabled", async () => {
+    const context = await testContext();
+    await writeFile(
+      context.paths.agentConfigFile,
+      [
+        "mailbox: malformed",
+        "embeddings:",
+        "  provider: gemini",
+        "  model: text-embedding-004",
+        "  api_key_env: QUOTEOPS_EMBEDDING_API_KEY",
+        "  base_url: null",
+        ""
+      ].join("\n"),
+      { mode: 0o600 }
+    );
+    await updateAllowedEnv(
+      context.paths.clientSecretsFile,
+      { QUOTEOPS_EMBEDDING_API_KEY: "embedding-secret" },
+      ["QUOTEOPS_EMBEDDING_API_KEY"]
+    );
+
+    expect(await isApplianceSecretsComplete(context)).toBe(false);
+  });
 
   it("rejects an oversized answers file before parsing it", async () => {
     const module = (await import(

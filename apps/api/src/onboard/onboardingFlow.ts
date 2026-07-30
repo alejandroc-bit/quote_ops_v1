@@ -10,6 +10,7 @@ import {
 import { dirname, join, resolve } from "node:path";
 import type { HistoricalSearchQuery } from "@quoteops/connectors";
 import { z } from "zod";
+import { parse as parseYaml } from "yaml";
 import type { Copilot } from "./onboardConfig.js";
 
 export type OnboardingPhaseId =
@@ -435,7 +436,7 @@ export async function runOnboarding(
   for (const current of selected) {
     const alreadyComplete = await current.isComplete(input.context);
     if (!alreadyComplete) {
-      assertUnattendedPhaseAnswers(current.id, input.context);
+      await assertUnattendedPhaseAnswers(current.id, input.context);
       await current.run(input.context);
     }
     completed.push(current.id);
@@ -453,12 +454,16 @@ export async function runOnboarding(
   };
 }
 
-function assertUnattendedPhaseAnswers(
+async function assertUnattendedPhaseAnswers(
   phase: OnboardingPhaseId,
   context: OnboardingContext
-): void {
+): Promise<void> {
   if (context.guided) return;
   const answers = context.answers;
+  const mailboxEnabled =
+    phase === "appliance_secrets"
+      ? await isMailboxEnabled(context)
+      : false;
   const complete =
     phase === "ai_provider"
       ? Boolean(answers?.ai_provider)
@@ -467,7 +472,10 @@ function assertUnattendedPhaseAnswers(
         : phase === "cloudflare"
           ? Boolean(answers?.cloudflare)
           : phase === "appliance_secrets"
-            ? Boolean(answers?.mailbox && answers.embeddings)
+            ? Boolean(
+                answers?.embeddings &&
+                  (!mailboxEnabled || answers.mailbox)
+              )
             : phase === "tms"
               ? Boolean(answers?.tms)
               : phase === "units"
@@ -481,6 +489,34 @@ function assertUnattendedPhaseAnswers(
                       : true;
   if (!complete) {
     throw new OnboardingError("onboarding_pending", { phase });
+  }
+}
+
+export async function isMailboxEnabled(
+  context: Pick<OnboardingContext, "paths">
+): Promise<boolean> {
+  let body: string;
+  try {
+    body = await readFile(context.paths.agentConfigFile, "utf8");
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== "ENOENT";
+  }
+  if (!body.trim()) return false;
+  try {
+    const parsed = parseYaml(body) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return true;
+    }
+    const config = parsed as Record<string, unknown>;
+    return (
+      Object.prototype.hasOwnProperty.call(config, "mailbox") &&
+      config.mailbox !== null &&
+      config.mailbox !== undefined
+    );
+  } catch {
+    // Malformed configuration is treated conservatively as enabled so an
+    // omitted answer can never erase an existing mailbox declaration.
+    return true;
   }
 }
 
