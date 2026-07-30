@@ -1,9 +1,12 @@
+import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { type IncomingMessage, ServerResponse } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Duplex, Readable } from "node:stream";
+import { gzipSync } from "node:zlib";
 import { afterEach, describe, expect, it } from "vitest";
+import tar from "tar-stream";
 import {
   createApplianceWorkflowTools,
   createInMemoryQuoteOpsStore,
@@ -14,7 +17,8 @@ import {
 import { createControlPlaneApi } from "../../control-plane-api/src/index";
 import {
   createInMemoryControlPlaneData,
-  type ControlPlaneData
+  type ControlPlaneData,
+  type ReleaseRecord
 } from "../../control-plane-api/src/data/index";
 import { quoteLane } from "../../agent/src/graph/nodes/quote";
 import { loadPdfTemplate } from "../../agent/src/pdf/quotePdf";
@@ -613,9 +617,8 @@ describe("QuoteOps API", () => {
   });
 
   it("syncs only minimal heartbeat and aggregate counters to the control plane", async () => {
-    const data = createInMemoryControlPlaneData({
-      releases: [{ version: "v1.1.0", notes: "Stable" }]
-    });
+    const data = createInMemoryControlPlaneData();
+    await data.upsertRelease(await createApiTestRelease("v1.1.0", "Stable"));
     const cloudBaseUrl = await startCloudTestServer("unused-token", data);
     await fetch(`${cloudBaseUrl}/api/admin/clients`, {
       method: "POST",
@@ -1392,13 +1395,119 @@ async function startCloudTestServer(
   registrationToken: string,
   data: ControlPlaneData = createInMemoryControlPlaneData()
 ): Promise<string> {
+  if (!(await data.latestRelease())) {
+    await data.upsertRelease(
+      await createApiTestRelease("v1.0.0", "API integration test release")
+    );
+  }
+  installFetchRouter();
+  const baseUrl = `https://quoteops-cloud-${++nextTestAppId}.test`;
   const app = createControlPlaneApi({
     verifyAdminToken: async (token) => (token === TEST_ADMIN_TOKEN ? "ops@e2e.example" : null),
     tokenGenerator: () => registrationToken,
     now: () => new Date("2026-06-25T12:00:00.000Z"),
-    data
+    data,
+    controlPlaneUrl: baseUrl
   });
-  return registerTestApp("cloud", app);
+  testApps.set(baseUrl, app);
+  cloudOrigins.add(baseUrl);
+  return baseUrl;
+}
+
+async function createApiTestRelease(
+  version: string,
+  notes: string
+): Promise<ReleaseRecord> {
+  const digest = (digit: string) => digit.repeat(64);
+  const images = {
+    agent: `quoteops-agent:${version}@sha256:${digest("1")}`,
+    api: `quoteops-api:${version}@sha256:${digest("2")}`,
+    web: `quoteops-web:${version}@sha256:${digest("3")}`,
+    postgres: `postgres:16@sha256:${digest("4")}`,
+    redis: `redis:7@sha256:${digest("5")}`,
+    caddy: `caddy:2@sha256:${digest("6")}`,
+    cloudflared: `cloudflare/cloudflared:2025.7.0@sha256:${digest("7")}`
+  };
+  const releaseEnv = [
+    `QUOTEOPS_VERSION=${version}`,
+    "QUOTEOPS_PLATFORM=linux/amd64",
+    `QUOTEOPS_AGENT_IMAGE=${images.agent}`,
+    `QUOTEOPS_API_IMAGE=${images.api}`,
+    `QUOTEOPS_WEB_IMAGE=${images.web}`,
+    `QUOTEOPS_POSTGRES_IMAGE=${images.postgres}`,
+    `QUOTEOPS_REDIS_IMAGE=${images.redis}`,
+    `QUOTEOPS_CADDY_IMAGE=${images.caddy}`,
+    `QUOTEOPS_CLOUDFLARED_IMAGE=${images.cloudflared}`,
+    ""
+  ].join("\n");
+  const files = {
+    "install.sh": "#!/usr/bin/env bash\nset -euo pipefail\n",
+    "release.env": releaseEnv
+  };
+  const manifest = {
+    schema_version: 1 as const,
+    version,
+    git_sha: "b".repeat(40),
+    platform: "linux/amd64" as const,
+    images,
+    files_sha256: Object.fromEntries(
+      Object.entries(files).map(([name, bytes]) => [name, sha256(bytes)])
+    ),
+    created_at: "2026-06-25T12:00:00.000Z"
+  };
+  const manifestBytes = Buffer.from(
+    `${JSON.stringify(manifest, null, 2)}\n`,
+    "utf8"
+  );
+  const payload = {
+    ...files,
+    "release.json": manifestBytes
+  };
+  const payloadSums =
+    Object.entries(payload)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([name, bytes]) => `${sha256(bytes)}  ${name}`)
+      .join("\n") + "\n";
+  const pack = tar.pack();
+  const archivePromise = collectReadable(pack);
+  for (const [name, bytes] of Object.entries({
+    ...payload,
+    PAYLOAD_SHA256SUMS: payloadSums
+  }).sort(([left], [right]) => left.localeCompare(right))) {
+    await new Promise<void>((resolve, reject) => {
+      pack.entry(
+        {
+          name,
+          mode: name.endsWith(".sh") ? 0o755 : 0o644,
+          uid: 0,
+          gid: 0
+        },
+        bytes,
+        (error) => (error ? reject(error) : resolve())
+      );
+    });
+  }
+  pack.finalize();
+  const archiveBytes = gzipSync(await archivePromise);
+  return {
+    version,
+    notes,
+    bundle_sha256: sha256(archiveBytes),
+    manifest,
+    manifest_bytes: manifestBytes,
+    archive_bytes: archiveBytes,
+    published_at: "2026-06-25T12:00:00.000Z"
+  };
+}
+
+async function collectReadable(stream: Readable): Promise<Buffer> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of stream) chunks.push(Buffer.from(chunk));
+  return Buffer.concat(chunks);
+}
+
+function sha256(value: string | Uint8Array): string {
+  return createHash("sha256").update(value).digest("hex");
 }
 
 function registerTestApp(kind: "appliance" | "cloud", app: TestExpressApp): string {

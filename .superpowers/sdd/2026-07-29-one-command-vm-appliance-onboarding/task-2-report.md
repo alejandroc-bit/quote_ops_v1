@@ -88,3 +88,30 @@ Result: **FAILED** — 45 files passed, 1 failed; 395 tests passed, 5 failed. Al
 
 - The repository-wide suite is not green because five application integration tests still construct legacy pre-migration records. Production behavior is intentionally fail-closed; those fixtures require reissue-style migration.
 - Task 3 is still responsible for the adjacent `bootstrap.sh` and remaining appliance lifecycle assets noted by Task 1. The Task 2 command and self-extractor interfaces are pinned for that handoff.
+
+## Concern resolution before review
+
+Migrated only the five legacy fixtures in `apps/api/tests/api.test.ts`. The shared cloud-test helper now seeds a valid bounded release through `upsertRelease`, configures the canonical test origin, and lets the normal install-pack endpoint persist the hashed token, exact safe snapshot, release pin, and canonical pack hash. The `v1.1.0` settings-sync fixture also seeds its explicit release through the same data interface. Production fail-closed behavior was not changed.
+
+Files changed:
+
+- `apps/api/tests/api.test.ts`
+- `.superpowers/sdd/2026-07-29-one-command-vm-appliance-onboarding/task-2-report.md`
+
+Focused command:
+
+```bash
+npx vitest run apps/api/tests/api.test.ts
+```
+
+Exact result: `FOCUSED_PASS`; 1 test file passed; 27 tests passed; duration 1.07 s.
+
+Full-suite command:
+
+```bash
+npm test -- --run
+```
+
+Exact result: `FULL_SUITE_PASS`; 46 test files passed; 400 tests passed; duration 3.19 s.
+
+The prior full-suite concern is resolved; Task 2 is review-ready.
