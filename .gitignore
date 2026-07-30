@@ -12,3 +12,4 @@ quoteops-data/
 playwright-report/
 test-results/
 .vercel
+.worktrees/
