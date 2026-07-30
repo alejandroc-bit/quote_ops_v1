@@ -30,6 +30,7 @@ GEMINI_API_KEY="${GEMINI_API_KEY:-}"
 OPENROUTER_API_KEY="${OPENROUTER_API_KEY:-}"
 POSTGRES_DB="${POSTGRES_DB:-quoteops}"
 POSTGRES_USER="${POSTGRES_USER:-quoteops}"
+POSTGRES_PASSWORD_INHERITED="${POSTGRES_PASSWORD+x}"
 POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-}"
 FORCE=0
 START_STACK=1
@@ -39,6 +40,7 @@ SECRETS_ENV_FILE_SET=0
 VERSION_SET=0
 GUIDED=0
 EXISTING_INSTALL=0
+POSTGRES_PASSWORD_FLAG_SET=0
 
 usage() {
   cat <<USAGE
@@ -61,7 +63,7 @@ Options:
   --https-port PORT        Host HTTPS port (default: 443)
   --postgres-db NAME       Postgres database name (default: quoteops)
   --postgres-user NAME     Postgres user (default: quoteops)
-  --postgres-password PW   Postgres password (generated if omitted)
+  --postgres-password PW   Legacy direct-install password (forbidden with --guided)
   --sakbe-live BOOL        Allow live SAKBE calls after cache miss (default: true)
   --sakbe-cache-mode MODE  SAKBE cache mode: cache_first or live_only (default: cache_first)
   --control-plane-url URL  Inducta control-plane base URL for activation and aggregate sync
@@ -131,8 +133,9 @@ generate_secret() {
     printf "%s\n" "$POSTGRES_PASSWORD"
     return
   fi
-  need_command openssl
-  openssl rand -hex 32
+  [[ -r /dev/urandom ]] || die "cryptographic random source is unavailable"
+  LC_ALL=C od -An -N32 -tx1 /dev/urandom | tr -d ' \n'
+  printf '\n'
 }
 
 file_owner_id() {
@@ -343,6 +346,25 @@ require_compose_224() {
   : "$patch"
 }
 
+postgres_volume_state() {
+  local volume_name="${COMPOSE_PROJECT_NAME}_postgres_data"
+  local volumes
+  command -v docker >/dev/null 2>&1 ||
+    die "PostgreSQL data volume state cannot be determined safely: Docker is unavailable"
+  if docker volume inspect "$volume_name" >/dev/null 2>&1; then
+    printf '%s\n' "exists"
+    return
+  fi
+  if ! volumes="$(docker volume ls --format '{{.Name}}' 2>/dev/null)"; then
+    die "PostgreSQL data volume state cannot be determined safely"
+  fi
+  if printf '%s\n' "$volumes" | grep -Fxq "$volume_name"; then
+    printf '%s\n' "exists"
+  else
+    printf '%s\n' "absent"
+  fi
+}
+
 validate_identifier() {
   local label="$1"
   local value="$2"
@@ -386,6 +408,23 @@ guard_connector_pack_overwrite() {
     fi
   done < <(find "$source_dir" -mindepth 1 -print0)
 }
+
+GUIDED_REQUESTED=0
+POSTGRES_PASSWORD_FLAG_REQUESTED=0
+for argument in "$@"; do
+  case "$argument" in
+    --guided) GUIDED_REQUESTED=1 ;;
+    --postgres-password) POSTGRES_PASSWORD_FLAG_REQUESTED=1 ;;
+  esac
+done
+if [[ "$GUIDED_REQUESTED" -eq 1 && "$POSTGRES_PASSWORD_FLAG_REQUESTED" -eq 1 ]]; then
+  unset POSTGRES_PASSWORD
+  die "--postgres-password is forbidden with --guided"
+fi
+if [[ "$GUIDED_REQUESTED" -eq 1 && -n "$POSTGRES_PASSWORD_INHERITED" ]]; then
+  unset POSTGRES_PASSWORD
+  die "inherited POSTGRES_PASSWORD is forbidden with --guided"
+fi
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -492,6 +531,7 @@ while [[ $# -gt 0 ]]; do
     --postgres-password)
       require_value "$1" "${2:-}"
       POSTGRES_PASSWORD="$2"
+      POSTGRES_PASSWORD_FLAG_SET=1
       shift 2
       ;;
     --sakbe-live)
@@ -554,6 +594,11 @@ done
 [[ -n "$MANIFEST_PATH" ]] || die "--manifest is required"
 if [[ "$GUIDED" -eq 1 ]]; then
   [[ "$VERSION_SET" -eq 1 ]] || die "--version is required with --guided"
+  [[ "$POSTGRES_PASSWORD_FLAG_SET" -eq 0 ]] ||
+    die "--postgres-password is forbidden with --guided"
+  [[ -z "$POSTGRES_PASSWORD_INHERITED" ]] ||
+    die "inherited POSTGRES_PASSWORD is forbidden with --guided"
+  POSTGRES_PASSWORD=""
   [[ -z "$QUOTEOPS_REGISTRATION_TOKEN" ]] ||
     die "--registration-token is forbidden with --guided; use --registration-token-file"
   [[ -n "$QUOTEOPS_REGISTRATION_TOKEN_FILE" ]] ||
@@ -709,6 +754,8 @@ fi
 PROJECT_CLIENT="$(printf "%s" "$CLIENT_ID" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/-/g; s/^-*//; s/-*$//')"
 [[ -n "$PROJECT_CLIENT" ]] || die "client id did not produce a valid compose project suffix"
 COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-quoteops_v1}"
+[[ "$COMPOSE_PROJECT_NAME" =~ ^[a-z0-9][a-z0-9_-]*$ ]] ||
+  die "COMPOSE_PROJECT_NAME must use lowercase letters, numbers, underscores, or dashes"
 QUOTEOPS_INSTALLATION_ID="${QUOTEOPS_INSTALLATION_ID:-$PROJECT_CLIENT-local-001}"
 RELEASE_DIR="$(stage_release "$INSTALL_MODE")"
 
@@ -735,11 +782,12 @@ EXISTING_POSTGRES_PASSWORD="$(read_env_value POSTGRES_PASSWORD "$SECRETS_ENV_FIL
 if [[ -n "$EXISTING_POSTGRES_PASSWORD" ]]; then
   POSTGRES_PASSWORD="$EXISTING_POSTGRES_PASSWORD"
 else
-  if command -v docker >/dev/null 2>&1 &&
-     docker volume inspect "${COMPOSE_PROJECT_NAME}_quoteops_postgres" >/dev/null 2>&1; then
-    die "existing PostgreSQL data volume has no recorded password; recovery is required"
+  if [[ -z "$POSTGRES_PASSWORD" ]]; then
+    POSTGRES_VOLUME_STATE="$(postgres_volume_state)"
+    [[ "$POSTGRES_VOLUME_STATE" == "absent" ]] ||
+      die "PostgreSQL data volume state is existing but client.env has no password; recovery is required"
+    POSTGRES_PASSWORD="$(generate_secret)"
   fi
-  POSTGRES_PASSWORD="$(generate_secret)"
   POSTGRES_PASSWORD="$(ensure_secret_key "$SECRETS_ENV_FILE" POSTGRES_PASSWORD "$POSTGRES_PASSWORD")"
 fi
 ensure_secret_key "$SECRETS_ENV_FILE" DATABASE_URL \

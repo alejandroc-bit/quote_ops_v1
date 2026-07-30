@@ -351,8 +351,55 @@ fi
 install_guard_run "$INSTALL_GUARD_DIR/home-three" --force >/dev/null
 grep -q '^RFQ-2,LANE-2$' "$INSTALL_CONNECTORS_TARGET/tms/rfqs.csv" || fail "install.sh --force did not replace connector pack file"
 
+GUIDED_TOKEN_FILE="$INSTALL_GUARD_DIR/guided-token"
+printf '%s' "guided-token-0123456789abcdefghijklmnop" > "$GUIDED_TOKEN_FILE"
+chmod 600 "$GUIDED_TOKEN_FILE"
+GUIDED_PASSWORD_LOG="$INSTALL_GUARD_DIR/guided-password.log"
+if bash "$APPLIANCE_DIR/install.sh" \
+  --client smoke \
+  --manifest "$INSTALL_MANIFEST" \
+  --connectors "$INSTALL_CONNECTORS_SRC" \
+  --home "$INSTALL_GUARD_DIR/guided-password-home" \
+  --skip-start \
+  --version v0.2.0 \
+  --registration-token-file "$GUIDED_TOKEN_FILE" \
+  --postgres-password guided-password-must-not-enter \
+  --guided >"$GUIDED_PASSWORD_LOG" 2>&1; then
+  fail "guided install accepted --postgres-password"
+fi
+grep -q -- '--postgres-password is forbidden with --guided' "$GUIDED_PASSWORD_LOG" ||
+  fail "guided install did not identify forbidden password ingress"
+if grep -q 'guided-password-must-not-enter' "$GUIDED_PASSWORD_LOG"; then
+  fail "guided password value reached log output"
+fi
+
+GUIDED_INHERITED_LOG="$INSTALL_GUARD_DIR/guided-inherited-password.log"
+if POSTGRES_PASSWORD=inherited-password-must-not-enter \
+  bash "$APPLIANCE_DIR/install.sh" \
+    --client smoke \
+    --manifest "$INSTALL_MANIFEST" \
+    --connectors "$INSTALL_CONNECTORS_SRC" \
+    --home "$INSTALL_GUARD_DIR/guided-inherited-home" \
+    --skip-start \
+    --version v0.2.0 \
+    --registration-token-file "$GUIDED_TOKEN_FILE" \
+    --guided >"$GUIDED_INHERITED_LOG" 2>&1; then
+  fail "guided install accepted inherited POSTGRES_PASSWORD"
+fi
+grep -q 'inherited POSTGRES_PASSWORD is forbidden with --guided' "$GUIDED_INHERITED_LOG" ||
+  fail "guided install did not identify inherited password ingress"
+if grep -q 'inherited-password-must-not-enter' "$GUIDED_INHERITED_LOG"; then
+  fail "inherited guided password value reached log output"
+fi
+
 if [[ "$(uname -s)" == "Darwin" ]]; then
-  E2E_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/quoteops-mac-e2e.XXXXXX")"
+  LOGICAL_TMPDIR="${TMPDIR:-/tmp}"
+  PHYSICAL_TMPDIR="$(cd "$LOGICAL_TMPDIR" && pwd -P)"
+  case "$PHYSICAL_TMPDIR" in
+    /private/var/*) LOGICAL_TMPDIR="${PHYSICAL_TMPDIR#/private}" ;;
+  esac
+  E2E_ROOT="$(mktemp -d "$LOGICAL_TMPDIR/quoteops-mac-e2e.XXXXXX")"
+  LOGICAL_E2E_ROOT="$E2E_ROOT"
   E2E_ROOT="$(cd "$E2E_ROOT" && pwd -P)"
   TEMP_DIRS+=("$E2E_ROOT")
   TEST_HOME="$E2E_ROOT/quoteops-v1"
@@ -361,6 +408,87 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
   TEST_REGISTRATION_TOKEN="registration-token-test-0123456789abcdef"
   printf '%s' "$TEST_REGISTRATION_TOKEN" > "$TEST_TOKEN_FILE"
   chmod 600 "$TEST_TOKEN_FILE"
+
+  BOOTSTRAP_MOCK_DIR="$E2E_ROOT/bootstrap-mocks"
+  mkdir -p "$BOOTSTRAP_MOCK_DIR"
+  cat > "$BOOTSTRAP_MOCK_DIR/docker" <<'SH'
+#!/usr/bin/env bash
+exit 0
+SH
+  cat > "$BOOTSTRAP_MOCK_DIR/curl" <<'SH'
+#!/usr/bin/env bash
+output=""
+while [[ $# -gt 0 ]]; do
+  if [[ "$1" == "--output" ]]; then
+    output="$2"
+    shift 2
+  else
+    shift
+  fi
+done
+[[ -n "$output" ]] || exit 1
+printf '#!/usr/bin/env bash\nexit 0\n' > "$output"
+SH
+  chmod +x "$BOOTSTRAP_MOCK_DIR/docker" "$BOOTSTRAP_MOCK_DIR/curl"
+
+  BOOTSTRAP_PASS_LOG="$E2E_ROOT/bootstrap-alias-pass.log"
+  TMPDIR="$LOGICAL_TMPDIR" PATH="$BOOTSTRAP_MOCK_DIR:$PATH" \
+    QUOTEOPS_BOOTSTRAP_TEST_MODE=macbook \
+    QUOTEOPS_AUTOMATION_MODE=1 \
+    QUOTEOPS_HOME="$LOGICAL_E2E_ROOT/quoteops-v1" \
+    QUOTEOPS_REGISTRATION_TOKEN_FILE="$TEST_TOKEN_FILE" \
+    QUOTEOPS_CONTROL_PLANE_URL="https://control.quoteops.example" \
+    bash "$APPLIANCE_DIR/bootstrap.sh" >"$BOOTSTRAP_PASS_LOG" 2>&1 ||
+    fail "bootstrap rejected the /var to /private/var physical alias"
+  case "$LOGICAL_E2E_ROOT:$E2E_ROOT" in
+    /var/*:/private/var/*) ;;
+    *) fail "bootstrap alias fixture did not exercise /var to /private/var" ;;
+  esac
+
+  WRONG_PREFIX_ROOT="$LOGICAL_TMPDIR/not-quoteops-mac-e2e.$$"
+  mkdir -p "$WRONG_PREFIX_ROOT"
+  TEMP_DIRS+=("$WRONG_PREFIX_ROOT")
+  WRONG_PREFIX_LOG="$E2E_ROOT/bootstrap-wrong-prefix.log"
+  if TMPDIR="$LOGICAL_TMPDIR" PATH="$BOOTSTRAP_MOCK_DIR:$PATH" \
+    QUOTEOPS_BOOTSTRAP_TEST_MODE=macbook \
+    QUOTEOPS_AUTOMATION_MODE=1 \
+    QUOTEOPS_HOME="$WRONG_PREFIX_ROOT/quoteops-v1" \
+    QUOTEOPS_REGISTRATION_TOKEN_FILE="$TEST_TOKEN_FILE" \
+    QUOTEOPS_CONTROL_PLANE_URL="https://control.quoteops.example" \
+    bash "$APPLIANCE_DIR/bootstrap.sh" >"$WRONG_PREFIX_LOG" 2>&1; then
+    fail "bootstrap accepted a wrong-prefix Mac test root"
+  fi
+  grep -q 'bounded temporary QUOTEOPS_HOME' "$WRONG_PREFIX_LOG" ||
+    fail "bootstrap wrong-prefix rejection was not deterministic"
+
+  HOME_DIRECTORY_LOG="$E2E_ROOT/bootstrap-home-directory.log"
+  if TMPDIR="$LOGICAL_TMPDIR" PATH="$BOOTSTRAP_MOCK_DIR:$PATH" \
+    QUOTEOPS_BOOTSTRAP_TEST_MODE=macbook \
+    QUOTEOPS_AUTOMATION_MODE=1 \
+    QUOTEOPS_HOME="$HOME" \
+    QUOTEOPS_REGISTRATION_TOKEN_FILE="$TEST_TOKEN_FILE" \
+    QUOTEOPS_CONTROL_PLANE_URL="https://control.quoteops.example" \
+    bash "$APPLIANCE_DIR/bootstrap.sh" >"$HOME_DIRECTORY_LOG" 2>&1; then
+    fail "bootstrap accepted a home directory as Mac test root"
+  fi
+  grep -q 'bounded temporary QUOTEOPS_HOME' "$HOME_DIRECTORY_LOG" ||
+    fail "bootstrap home-directory rejection was not deterministic"
+
+  SYMLINK_ROOT="$LOGICAL_TMPDIR/quoteops-mac-e2e.symlink.$$"
+  ln -s "$E2E_ROOT" "$SYMLINK_ROOT"
+  TEMP_DIRS+=("$SYMLINK_ROOT")
+  SYMLINK_LOG="$E2E_ROOT/bootstrap-symlink.log"
+  if TMPDIR="$LOGICAL_TMPDIR" PATH="$BOOTSTRAP_MOCK_DIR:$PATH" \
+    QUOTEOPS_BOOTSTRAP_TEST_MODE=macbook \
+    QUOTEOPS_AUTOMATION_MODE=1 \
+    QUOTEOPS_HOME="$SYMLINK_ROOT/quoteops-v1" \
+    QUOTEOPS_REGISTRATION_TOKEN_FILE="$TEST_TOKEN_FILE" \
+    QUOTEOPS_CONTROL_PLANE_URL="https://control.quoteops.example" \
+    bash "$APPLIANCE_DIR/bootstrap.sh" >"$SYMLINK_LOG" 2>&1; then
+    fail "bootstrap accepted a below-root symlink escape"
+  fi
+  grep -q 'rejects symlinks below the temporary root' "$SYMLINK_LOG" ||
+    fail "bootstrap symlink rejection was not deterministic"
 
   QUOTEOPS_BOOTSTRAP_TEST_MODE=macbook QUOTEOPS_BIN_DIR="$TEST_BIN_DIR" \
     bash "$APPLIANCE_DIR/install.sh" \
@@ -433,10 +561,74 @@ printf '%s\n' "$*" >> "$MOCK_DOCKER_LOG"
 if [[ "$*" == "compose version --short" ]]; then
   printf '%s\n' "2.24.0"
 elif [[ "$1" == "volume" && "${2:-}" == "inspect" ]]; then
+  if [[ "${MOCK_POSTGRES_VOLUME_STATE:-absent}" == "exists" &&
+        "${3:-}" == "${COMPOSE_PROJECT_NAME:-quoteops_v1}_postgres_data" ]]; then
+    exit 0
+  fi
   exit 1
+elif [[ "$1" == "volume" && "${2:-}" == "ls" ]]; then
+  if [[ "${MOCK_POSTGRES_VOLUME_STATE:-absent}" == "unknown" ]]; then
+    exit 1
+  fi
+  if [[ "${MOCK_POSTGRES_VOLUME_STATE:-absent}" == "exists" ]]; then
+    printf '%s\n' "${COMPOSE_PROJECT_NAME:-quoteops_v1}_postgres_data"
+  fi
 fi
 SH
 chmod +x "$MOCK_DOCKER_DIR/docker"
+
+for volume_state in exists unknown; do
+  VOLUME_GUARD_HOME="$INSTALL_GUARD_DIR/volume-$volume_state-home"
+  VOLUME_GUARD_LOG="$INSTALL_GUARD_DIR/volume-$volume_state.log"
+  : > "$MOCK_DOCKER_LOG"
+  if PATH="$MOCK_DOCKER_DIR:$PATH" MOCK_DOCKER_LOG="$MOCK_DOCKER_LOG" \
+    MOCK_POSTGRES_VOLUME_STATE="$volume_state" \
+    bash "$APPLIANCE_DIR/install.sh" \
+      --client smoke \
+      --manifest "$INSTALL_MANIFEST" \
+      --connectors "$INSTALL_CONNECTORS_SRC" \
+      --home "$VOLUME_GUARD_HOME" \
+      --skip-start \
+      --version v0.2.0 >"$VOLUME_GUARD_LOG" 2>&1; then
+    fail "install generated a PostgreSQL password with volume state $volume_state"
+  fi
+  grep -q 'PostgreSQL data volume state' "$VOLUME_GUARD_LOG" ||
+    fail "install did not fail closed for PostgreSQL volume state $volume_state"
+  grep -q 'volume inspect quoteops_v1_postgres_data' "$MOCK_DOCKER_LOG" ||
+    fail "install inspected the wrong Compose PostgreSQL volume name"
+  if [[ -f "$VOLUME_GUARD_HOME/secrets/client.env" ]] &&
+     grep -q '^POSTGRES_PASSWORD=' "$VOLUME_GUARD_HOME/secrets/client.env"; then
+    fail "install generated a PostgreSQL password after unsafe volume state $volume_state"
+  fi
+done
+
+VOLUME_ABSENT_HOME="$INSTALL_GUARD_DIR/volume-absent-home"
+VOLUME_ABSENT_LOG="$INSTALL_GUARD_DIR/volume-absent.log"
+: > "$MOCK_DOCKER_LOG"
+PATH="$MOCK_DOCKER_DIR:$PATH" MOCK_DOCKER_LOG="$MOCK_DOCKER_LOG" \
+  MOCK_POSTGRES_VOLUME_STATE=absent \
+  bash "$APPLIANCE_DIR/install.sh" \
+    --client smoke \
+    --manifest "$INSTALL_MANIFEST" \
+    --connectors "$INSTALL_CONNECTORS_SRC" \
+    --home "$VOLUME_ABSENT_HOME" \
+    --skip-start \
+    --version v0.2.0 >"$VOLUME_ABSENT_LOG" 2>&1
+grep -Eq '^POSTGRES_PASSWORD="[a-f0-9]{64}"$' "$VOLUME_ABSENT_HOME/secrets/client.env" ||
+  fail "known-absent PostgreSQL volume did not generate a cryptographic password"
+ABSENT_CLIENT_ENV_BEFORE="$(cat "$VOLUME_ABSENT_HOME/secrets/client.env")"
+PATH="$MOCK_DOCKER_DIR:$PATH" MOCK_DOCKER_LOG="$MOCK_DOCKER_LOG" \
+  MOCK_POSTGRES_VOLUME_STATE=exists \
+  bash "$APPLIANCE_DIR/install.sh" \
+    --client smoke \
+    --manifest "$INSTALL_MANIFEST" \
+    --connectors "$INSTALL_CONNECTORS_SRC" \
+    --home "$VOLUME_ABSENT_HOME" \
+    --skip-start \
+    --version v0.2.0 >/dev/null
+test "$(cat "$VOLUME_ABSENT_HOME/secrets/client.env")" = "$ABSENT_CLIENT_ENV_BEFORE" ||
+  fail "reinstall changed the generated PostgreSQL password"
+
 PATH="$MOCK_DOCKER_DIR:$PATH" MOCK_DOCKER_LOG="$MOCK_DOCKER_LOG" \
   bash "$APPLIANCE_DIR/install.sh" \
     --client smoke \

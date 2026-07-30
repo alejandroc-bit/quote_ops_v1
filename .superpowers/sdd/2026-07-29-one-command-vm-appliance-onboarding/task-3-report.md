@@ -136,3 +136,56 @@ below_root_symlink_rejected=true
 
 - The local Docker daemon was unavailable, so the smoke used static Compose assertions and the existing mock-Docker lifecycle test; the Docker-backed PostgreSQL schema smoke and real `docker compose config` branch reported their normal skip.
 - Ubuntu apt/Docker repository installation cannot be executed on this Mac. The bootstrap production branch is syntax-checked and constrained to Ubuntu 24.04 x86_64; a real Ubuntu VM remains the appropriate final infrastructure acceptance environment.
+
+## Fix Round 1
+
+Human scope ruling preserved: version-safe update, rollback, backup, and restore remain Task 9. This round changed only Task 3 password/volume safety and automated Mac bootstrap boundaries.
+
+### Findings Fixed
+
+- PostgreSQL state detection now inspects the exact Compose-managed volume name, `${COMPOSE_PROJECT_NAME}_postgres_data` (`quoteops_v1_postgres_data` by default). A failed inspect is followed by a daemon-backed volume listing; failure to list is indeterminate and aborts. Password generation occurs only after a known-absent result.
+- Guided mode preflights and rejects both `--postgres-password` and any inherited `POSTGRES_PASSWORD`, unsets the rejected value before exiting, and never prints it. Caller-provided passwords remain available only to `legacy_direct`.
+- `smoke.sh` now runs all four Mac bootstrap boundary cases automatically: logical `/var` to physical `/private/var` acceptance, wrong-prefix rejection, home-directory rejection, and below-root symlink rejection.
+- Smoke coverage also proves an existing or indeterminate PostgreSQL volume state cannot produce a new `POSTGRES_PASSWORD`, and verifies the exact volume name sent to Docker.
+- A known-absent volume generates one 256-bit password from `/dev/urandom`; a reinstall with an existing volume preserves the exact durable client env without consulting caller input.
+
+### RED
+
+Command:
+
+```bash
+bash deploy/appliance/tests/smoke.sh
+```
+
+Observed before the fix:
+
+```text
+exit=1
+smoke.sh: guided install did not identify forbidden password ingress
+```
+
+### GREEN
+
+Commands:
+
+```bash
+bash -n deploy/appliance/bootstrap.sh
+bash -n deploy/appliance/install.sh
+bash -n deploy/appliance/quoteops.sh
+bash -n deploy/appliance/verify-install.sh
+bash -n deploy/appliance/tests/smoke.sh
+bash deploy/appliance/tests/smoke.sh
+npx vitest run apps/control-plane-api/tests/control-plane-api.test.ts
+git diff --check
+```
+
+Observed:
+
+```text
+All five shell syntax checks: exit=0
+Appliance smoke: exit=0, smoke.sh: ok
+Focused control-plane API: 1 file passed, 42 tests passed
+git diff --check: clean
+```
+
+The local Docker daemon remained unavailable, so real Docker-backed schema/config checks retained their documented skip. The new PostgreSQL state tests use a deterministic Docker CLI fixture for existing, absent, and indeterminate volume responses.
