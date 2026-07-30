@@ -68,84 +68,102 @@ export async function validateAiProviderCredential(
   const apiKey = validateSingleLineSecret(rawApiKey);
   const config = aiConfig(input.provider);
   const timeoutMs = context.aiValidationTimeoutMs ?? 10_000;
-  const signal = AbortSignal.timeout(timeoutMs);
-
-  let response: Response;
+  const controller = new AbortController();
   let deadline: ReturnType<typeof setTimeout> | undefined;
   try {
-    const request =
-      config.input_provider === "openrouter"
-        ? context.fetch("https://openrouter.ai/api/v1/chat/completions", {
-            method: "POST",
-            headers: {
-              "content-type": "application/json",
-              authorization: `Bearer ${apiKey}`
-            },
-            body: JSON.stringify({
-              model: config.model_name,
-              messages: [{ role: "user", content: "Reply with ok." }],
-              max_tokens: 2,
-              temperature: 0
-            }),
-            signal
-          })
-        : context.fetch(
-            `https://generativelanguage.googleapis.com/v1beta/models/${config.model_name}:generateContent`,
-            {
-              method: "POST",
-              headers: {
-                "content-type": "application/json",
-                "x-goog-api-key": apiKey
-              },
-              body: JSON.stringify({
-                contents: [
-                  { role: "user", parts: [{ text: "Reply with ok." }] }
-                ],
-                generationConfig: {
-                  maxOutputTokens: 2,
-                  temperature: 0
+    const request = (async () => {
+      let response: Response;
+      try {
+        response =
+          config.input_provider === "openrouter"
+            ? await context.fetch(
+                "https://openrouter.ai/api/v1/chat/completions",
+                {
+                  method: "POST",
+                  headers: {
+                    "content-type": "application/json",
+                    authorization: `Bearer ${apiKey}`
+                  },
+                  body: JSON.stringify({
+                    model: config.model_name,
+                    messages: [{ role: "user", content: "Reply with ok." }],
+                    max_tokens: 2,
+                    temperature: 0
+                  }),
+                  signal: controller.signal
                 }
-              }),
-              signal
-            }
-          );
+              )
+            : await context.fetch(
+                `https://generativelanguage.googleapis.com/v1beta/models/${config.model_name}:generateContent`,
+                {
+                  method: "POST",
+                  headers: {
+                    "content-type": "application/json",
+                    "x-goog-api-key": apiKey
+                  },
+                  body: JSON.stringify({
+                    contents: [
+                      { role: "user", parts: [{ text: "Reply with ok." }] }
+                    ],
+                    generationConfig: {
+                      maxOutputTokens: 2,
+                      temperature: 0
+                    }
+                  }),
+                  signal: controller.signal
+                }
+              );
+      } catch {
+        throw new OnboardingError("ai_provider_unreachable");
+      }
+
+      if (response.status === 401 || response.status === 403) {
+        throw new OnboardingError("ai_key_rejected");
+      }
+      if (response.status === 404) {
+        throw new OnboardingError("model_not_available");
+      }
+      if (
+        response.status === 408 ||
+        response.status === 429 ||
+        response.status >= 500
+      ) {
+        throw new OnboardingError("ai_provider_unreachable");
+      }
+      if (!response.ok) {
+        throw new OnboardingError("ai_provider_invalid_response");
+      }
+
+      let body: unknown;
+      try {
+        body = await response.json();
+      } catch {
+        if (controller.signal.aborted) {
+          throw new OnboardingError("ai_provider_unreachable");
+        }
+        throw new OnboardingError("ai_provider_invalid_response");
+      }
+      if (!isValidProviderResponse(config.input_provider, body)) {
+        throw new OnboardingError("ai_provider_invalid_response");
+      }
+      return config;
+    })();
     const deadlinePromise = new Promise<never>((_resolve, reject) => {
       deadline = setTimeout(
-        () => reject(new OnboardingError("ai_provider_unreachable")),
+        () => {
+          controller.abort();
+          reject(new OnboardingError("ai_provider_unreachable"));
+        },
         timeoutMs
       );
     });
-    response = await Promise.race([request, deadlinePromise]);
+    return await Promise.race([request, deadlinePromise]);
   } catch (error) {
     if (error instanceof OnboardingError) throw error;
     throw new OnboardingError("ai_provider_unreachable");
   } finally {
     if (deadline) clearTimeout(deadline);
   }
-
-  if (response.status === 401 || response.status === 403) {
-    throw new OnboardingError("ai_key_rejected");
-  }
-  if (response.status === 404) {
-    throw new OnboardingError("model_not_available");
-  }
-  if (response.status === 408 || response.status === 429 || response.status >= 500) {
-    throw new OnboardingError("ai_provider_unreachable");
-  }
-  if (!response.ok) {
-    throw new OnboardingError("ai_provider_invalid_response");
-  }
-
-  let body: unknown;
-  try {
-    body = await response.json();
-  } catch {
-    throw new OnboardingError("ai_provider_invalid_response");
-  }
-  if (!isValidProviderResponse(config.input_provider, body)) {
-    throw new OnboardingError("ai_provider_invalid_response");
-  }
-  return config;
 }
 
 export async function configureAiProvider(
@@ -234,6 +252,18 @@ export async function isAiProviderComplete(
 ): Promise<boolean> {
   const existing = await readExistingAiProvider(context);
   if (!existing) return false;
+  if (context.answers?.ai_provider) {
+    const desiredKey = await readSingleLineSecret(
+      context.answers.ai_provider.api_key,
+      context
+    );
+    if (
+      context.answers.ai_provider.provider !== existing.config.input_provider ||
+      desiredKey !== existing.apiKey
+    ) {
+      return false;
+    }
+  }
   const receipt = await readAiReceipt(context.paths.aiValidationReceiptFile);
   const revision = await readCredentialRevision(
     aiCredentialRevisionFile(context)
@@ -279,6 +309,10 @@ export const aiProviderPhase: OnboardingPhase = {
     }
   },
   async run(context) {
+    if (context.answers?.ai_provider) {
+      await configureAiProvider(context.answers.ai_provider, context);
+      return;
+    }
     const existing = await readExistingAiProvider(context);
     if (existing) {
       try {
@@ -301,10 +335,6 @@ export const aiProviderPhase: OnboardingPhase = {
       }
     }
 
-    if (context.answers?.ai_provider) {
-      await configureAiProvider(context.answers.ai_provider, context);
-      return;
-    }
     if (!context.guided) {
       throw new OnboardingError("onboarding_pending", {
         phase: "ai_provider"
@@ -385,49 +415,14 @@ async function readExistingAiProvider(
   const env = await readEnvFileValues(context.paths.clientSecretsFile);
   const presentKeys = AI_ENV_KEYS.filter((key) => Boolean(env.get(key)));
   if (presentKeys.length !== 1) return null;
-  let parsed: Record<string, unknown> = {};
-  try {
-    parsed = parseAgentConfig(
-      await readFile(context.paths.agentConfigFile, "utf8")
-    );
-  } catch {
-    parsed = {};
-  }
-  const model =
-    parsed.model && typeof parsed.model === "object"
-      ? (parsed.model as Record<string, unknown>)
-      : null;
-  let configured: OnboardingAiConfig | null = null;
-  if (
-    model?.provider === "openrouter" &&
-    model.model_name === "openai/gpt-4o-mini" &&
-    model.api_key_env === "OPENROUTER_API_KEY"
-  ) {
-    configured = aiConfig("openrouter");
-  } else if (
-    model?.provider === "gemini_sdk" &&
-    model.model_name === "gemini-2.5-flash" &&
-    model.api_key_env === "GEMINI_API_KEY"
-  ) {
-    configured = aiConfig("gemini");
-  }
-  const inferred =
+  // The sole committed provider key is the recovery authority after the first
+  // atomic rename. Agent config may still describe the previous provider.
+  const config =
     presentKeys[0] === "OPENROUTER_API_KEY"
       ? aiConfig("openrouter")
       : aiConfig("gemini");
-  const config = configured ?? inferred;
-  const otherKey =
-    config.api_key_env === "OPENROUTER_API_KEY"
-      ? "GEMINI_API_KEY"
-      : "OPENROUTER_API_KEY";
   const apiKey = env.get(config.api_key_env);
-  if (
-    !apiKey ||
-    env.has(otherKey) ||
-    (configured && configured.api_key_env !== presentKeys[0])
-  ) {
-    return null;
-  }
+  if (!apiKey) return null;
   return { config, apiKey };
 }
 

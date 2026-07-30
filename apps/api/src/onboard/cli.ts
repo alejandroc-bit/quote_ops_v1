@@ -45,8 +45,8 @@ import {
 } from "./wizardSteps.js";
 import {
   createFileOnboardingStateStore,
-  parseOnboardingAnswers,
   parseOnboardingSelection,
+  readOnboardingAnswersFile,
   runOnboarding,
   OnboardingError,
   type OnboardPaths as FlowOnboardPaths,
@@ -128,6 +128,7 @@ async function main(argv: string[]): Promise<void> {
   const flag = argv.find((arg) =>
     ["--sync-units", "--map-tms"].includes(arg)
   );
+  const selection = parseOnboardingSelection(argv);
 
   // subcommands re-run a single step (unit alta / re-mapping / re-ingest anytime)
   if (flag === "--sync-units") return void (await stepSyncUnits(paths, null));
@@ -143,23 +144,12 @@ async function main(argv: string[]): Promise<void> {
   }
 
   const answersFile = argumentValue(argv, "--answers-file");
+  if (argv.includes("--answers-file") && !answersFile) {
+    throw new OnboardingError("onboarding_answers_invalid", { exitCode: 2 });
+  }
   let answers: OnboardingAnswers | null = null;
   if (answersFile) {
-    try {
-      answers = parseOnboardingAnswers(
-        JSON.parse(await readFile(resolve(answersFile), "utf8"))
-      );
-    } catch (error) {
-      if (
-        error instanceof OnboardingError &&
-        error.code === "onboarding_answers_invalid"
-      ) {
-        throw error;
-      }
-      throw new OnboardingError("onboarding_answers_invalid", {
-        exitCode: 2
-      });
-    }
+    answers = await readOnboardingAnswersFile(resolve(answersFile));
   }
   const context: OnboardingContext = {
     io: {
@@ -188,7 +178,6 @@ async function main(argv: string[]): Promise<void> {
     return;
   }
 
-  const selection = parseOnboardingSelection(argv);
   const result = await runOnboarding({
     phases: onboardingPhases(paths),
     context,
@@ -228,6 +217,9 @@ function onboardingPhases(paths: OnboardPaths): OnboardingPhase[] {
       );
     },
     async run(context) {
+      if (!context.guided) {
+        throw new OnboardingError("onboarding_pending", { phase: "tms" });
+      }
       await stepTms(paths, context.copilot ?? null);
     }
   };
@@ -242,6 +234,9 @@ function onboardingPhases(paths: OnboardPaths): OnboardingPhase[] {
       );
     },
     async run(context) {
+      if (!context.guided) {
+        throw new OnboardingError("onboarding_pending", { phase: "units" });
+      }
       await stepSyncUnits(paths, context.copilot ?? null);
     }
   };
@@ -266,6 +261,11 @@ function onboardingPhases(paths: OnboardPaths): OnboardingPhase[] {
       }
     },
     async run(context) {
+      if (!context.guided) {
+        throw new OnboardingError("onboarding_pending", {
+          phase: "authorization"
+        });
+      }
       await stepAuthorization(paths, context.copilot ?? null);
     }
   };
@@ -283,6 +283,9 @@ function onboardingPhases(paths: OnboardPaths): OnboardingPhase[] {
       );
     },
     async run(context) {
+      if (!context.guided) {
+        throw new OnboardingError("onboarding_pending", { phase: "pricing" });
+      }
       await stepValidatePricing(
         paths,
         context.copilot ?? null,

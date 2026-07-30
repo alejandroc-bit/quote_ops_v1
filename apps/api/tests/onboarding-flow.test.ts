@@ -3,6 +3,7 @@ import {
   mkdir,
   mkdtemp,
   readFile,
+  rename,
   stat,
   symlink,
   writeFile
@@ -31,11 +32,14 @@ import {
   validatePublicHostname
 } from "../src/onboard/cloudflareStep.js";
 import {
+  applianceSecretsPhase,
   configureApplianceSecrets,
+  isApplianceSecretsComplete,
   runKnowledgeIngestion
 } from "../src/onboard/applianceSecretsStep.js";
 import {
   readSingleLineSecret,
+  sha256File,
   updateAllowedEnv
 } from "../src/onboard/onboardConfig.js";
 
@@ -175,6 +179,157 @@ describe("resumable onboarding flow", () => {
         exitCode: 2
       })
     );
+    expect(() =>
+      parseOnboardingSelection([
+        "--allow-static-guidance",
+        "--answers-file",
+        "answers.json"
+      ])
+    ).toThrow(
+      expect.objectContaining({
+        code: "onboarding_selection_conflict",
+        exitCode: 2
+      })
+    );
+    expect(() =>
+      parseOnboardingSelection([
+        "--answers-file",
+        "answers.json",
+        "--sync-units"
+      ])
+    ).toThrow(
+      expect.objectContaining({
+        code: "onboarding_selection_conflict",
+        exitCode: 2
+      })
+    );
+  });
+
+  it.each([
+    "ai_provider",
+    "cloudflare",
+    "appliance_secrets",
+    "tms",
+    "units",
+    "authorization",
+    "pricing",
+    "knowledge"
+  ] as const)(
+    "returns onboarding_pending for missing noninteractive %s answers before running the phase",
+    async (target) => {
+      const context = await testContext({
+        guided: false,
+        answers: { schema_version: 1 }
+      });
+      const calls: string[] = [];
+      const ordered: OnboardingPhaseId[] = [
+        "ai_provider",
+        "cloudflare",
+        "appliance_secrets",
+        "tms",
+        "units",
+        "authorization",
+        "pricing",
+        "knowledge"
+      ];
+      const phases = ordered.slice(0, ordered.indexOf(target) + 1).map((id) => ({
+        id,
+        async isComplete() {
+          return id !== target;
+        },
+        async run() {
+          calls.push(id);
+        }
+      }));
+
+      await expect(
+        runOnboarding({
+          phases,
+          context,
+          selection: { mode: "only", phase: target }
+        })
+      ).rejects.toMatchObject({
+        code: "onboarding_pending",
+        phase: target
+      });
+      expect(calls).toEqual([]);
+      expect(context.io.ask).not.toHaveBeenCalled();
+      expect(context.io.askMasked).not.toHaveBeenCalled();
+      expect(context.io.confirm).not.toHaveBeenCalled();
+      expect(context.io.select).not.toHaveBeenCalled();
+    }
+  );
+
+  it.each([
+    {
+      missing: "mailbox",
+      answers: {
+        schema_version: 1 as const,
+        embeddings: {
+          provider: "gemini" as const,
+          model: "text-embedding-004",
+          api_key: { file: "/unused" }
+        }
+      }
+    },
+    {
+      missing: "embeddings",
+      answers: {
+        schema_version: 1 as const,
+        mailbox: {
+          provider: "resend" as const,
+          api_key: { file: "/unused" },
+          intake_address: "intake@example.com",
+          from_address: "quotes@example.com"
+        }
+      }
+    }
+  ])(
+    "does not mutate appliance state when noninteractive answers omit $missing",
+    async ({ answers }) => {
+      const context = await testContext({ guided: false, answers });
+      await writeFile(
+        context.paths.clientSecretsFile,
+        'UNRELATED_SETTING="keep"\n',
+        { mode: 0o600 }
+      );
+      await writeFile(
+        context.paths.agentConfigFile,
+        "unrelated:\n  keep: true\n",
+        { mode: 0o600 }
+      );
+
+      await expect(applianceSecretsPhase.run(context)).rejects.toMatchObject({
+        code: "onboarding_pending",
+        phase: "appliance_secrets"
+      });
+      expect(await readFile(context.paths.clientSecretsFile, "utf8")).toBe(
+        'UNRELATED_SETTING="keep"\n'
+      );
+      expect(await readFile(context.paths.agentConfigFile, "utf8")).toBe(
+        "unrelated:\n  keep: true\n"
+      );
+      expect(context.io.ask).not.toHaveBeenCalled();
+      expect(context.io.askMasked).not.toHaveBeenCalled();
+    }
+  );
+
+  it("rejects an oversized answers file before parsing it", async () => {
+    const module = (await import(
+      "../src/onboard/onboardingFlow.js"
+    )) as typeof import("../src/onboard/onboardingFlow.js") & {
+      readOnboardingAnswersFile?: (file: string) => Promise<unknown>;
+    };
+    expect(module.readOnboardingAnswersFile).toBeTypeOf("function");
+    if (!module.readOnboardingAnswersFile) return;
+    const context = await testContext();
+    const file = join(context.answersRoot!, "oversized-answers.json");
+    await writeFile(file, " ".repeat(65 * 1024), { mode: 0o600 });
+
+    await expect(module.readOnboardingAnswersFile(file)).rejects.toMatchObject({
+      code: "onboarding_answers_invalid",
+      exitCode: 2
+    });
   });
 });
 
@@ -280,6 +435,38 @@ describe("AI provider configuration", () => {
     ).toBe("");
   });
 
+  it("applies one AI deadline across fetch and body parsing", async () => {
+    const bodySentinel = "provider-body-must-not-leak";
+    const secret = "ai-secret-must-not-leak";
+    const context = await testContext({
+      fetch: vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        json: async () =>
+          await new Promise<unknown>(() => {
+            void bodySentinel;
+          })
+      }) as unknown as typeof fetch,
+      aiValidationTimeoutMs: 10
+    });
+
+    let caught: unknown;
+    try {
+      await configureAiProvider(
+        { provider: "openrouter", api_key: secret },
+        context
+      );
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toMatchObject({ code: "ai_provider_unreachable" });
+    expect(String(caught)).not.toContain(secret);
+    expect(String(caught)).not.toContain(bodySentinel);
+    expect(
+      await readFile(context.paths.clientSecretsFile, "utf8").catch(() => "")
+    ).toBe("");
+  });
+
   it("revalidates live on resume and does not trust a matching audit entry", async () => {
     const fetchMock = vi
       .fn()
@@ -331,6 +518,56 @@ describe("AI provider configuration", () => {
     expect(await aiProviderPhase.isComplete(context)).toBe(true);
   });
 
+  it.each([
+    ["openrouter", "gemini"],
+    ["gemini", "openrouter"]
+  ] as const)(
+    "recovers a %s to %s switch after every atomic rename",
+    async (fromProvider, toProvider) => {
+      const responseFor = (url: string | URL | Request) =>
+        String(url).includes("generativelanguage")
+          ? geminiResponse()
+          : openRouterResponse();
+      for (const crashLabel of [
+        "ai_client_env",
+        "ai_agent_config",
+        "ai_credential_revision",
+        "ai_validation_receipt"
+      ]) {
+        const context = await testContext({
+          fetch: vi.fn(async (url) => responseFor(url)) as unknown as typeof fetch
+        });
+        await configureAiProvider(
+          { provider: fromProvider, api_key: `${fromProvider}-old-key` },
+          context
+        );
+        let crashed = false;
+        context.afterAtomicRename = async (label) => {
+          if (!crashed && label === crashLabel) {
+            crashed = true;
+            throw new Error(`switch-crash-${crashLabel}`);
+          }
+        };
+        await expect(
+          configureAiProvider(
+            { provider: toProvider, api_key: `${toProvider}-new-key` },
+            context
+          )
+        ).rejects.toThrow(`switch-crash-${crashLabel}`);
+
+        context.afterAtomicRename = undefined;
+        context.answers = null;
+        if (!(await aiProviderPhase.isComplete(context))) {
+          await aiProviderPhase.run(context);
+        }
+        expect(await aiProviderPhase.isComplete(context)).toBe(true);
+        const stored = await readFile(context.paths.clientSecretsFile, "utf8");
+        expect(stored).toContain(`${toProvider}-new-key`);
+        expect(stored).not.toContain(`${fromProvider}-old-key`);
+      }
+    }
+  );
+
   it("requests a replacement for a revoked key without deleting unrelated settings", async () => {
     const fetchMock = vi
       .fn()
@@ -359,6 +596,45 @@ describe("AI provider configuration", () => {
     expect(stored).toContain('UNRELATED_SETTING="keep"');
     expect(stored).not.toContain("revoked-key");
     expect(stored).toContain("replacement-key");
+  });
+
+  it("honors an explicit noninteractive provider switch over a complete old provider", async () => {
+    const context = await testContext({
+      guided: false,
+      fetch: vi.fn(async (url) =>
+        String(url).includes("generativelanguage")
+          ? geminiResponse()
+          : openRouterResponse()
+      ) as unknown as typeof fetch
+    });
+    await configureAiProvider(
+      { provider: "openrouter", api_key: "old-openrouter-key" },
+      context
+    );
+    const newKey = await secretRef(
+      context,
+      "explicit-gemini.key",
+      "new-gemini-key"
+    );
+    context.answers = {
+      schema_version: 1,
+      ai_provider: { provider: "gemini", api_key: newKey }
+    };
+
+    await runOnboarding({
+      phases: [aiProviderPhase],
+      context,
+      selection: { mode: "all" }
+    });
+
+    const env = await readFile(context.paths.clientSecretsFile, "utf8");
+    expect(env).toContain("GEMINI_API_KEY=");
+    expect(env).toContain("new-gemini-key");
+    expect(env).not.toContain("OPENROUTER_API_KEY=");
+    expect(env).not.toContain("old-openrouter-key");
+    expect(context.io.ask).not.toHaveBeenCalled();
+    expect(context.io.askMasked).not.toHaveBeenCalled();
+    expect(context.io.select).not.toHaveBeenCalled();
   });
 
   it("maps a missing model separately from a rejected key", async () => {
@@ -453,6 +729,29 @@ describe("secret ingestion", () => {
 
     await expect(
       readSingleLineSecret({ file: join(linkedDir, "key") }, context)
+    ).rejects.toMatchObject({ code: "secret_file_unsafe" });
+  });
+
+  it("rejects a pathname swapped after the secret handle is opened", async () => {
+    const context = await testContext();
+    const external = await mkdtemp(join(tmpdir(), "quoteops-secret-swap-"));
+    tempDirs.push(external);
+    const requested = join(context.answersRoot!, "swap.key");
+    const original = join(context.answersRoot!, "swap-original.key");
+    const outside = join(external, "outside.key");
+    await writeFile(requested, "inside-secret", { mode: 0o600 });
+    await writeFile(outside, "outside-secret", { mode: 0o600 });
+    (
+      context as OnboardingContext & {
+        afterSecretOpen?: () => void | Promise<void>;
+      }
+    ).afterSecretOpen = async () => {
+      await rename(requested, original);
+      await symlink(outside, requested);
+    };
+
+    await expect(
+      readSingleLineSecret({ file: requested }, context)
     ).rejects.toMatchObject({ code: "secret_file_unsafe" });
   });
 });
@@ -570,6 +869,314 @@ describe("appliance provider secrets", () => {
     });
   });
 
+  it("rejects a bad Resend key without leaking the key or provider body", async () => {
+    const secret = "resend-secret-must-not-leak";
+    const body = "provider-body-must-not-leak";
+    const context = await testContext({
+      fetch: vi.fn().mockResolvedValue(
+        new Response(body, { status: 401 })
+      ) as unknown as typeof fetch
+    });
+    const resendKey = await secretRef(context, "bad-resend.key", secret);
+
+    let caught: unknown;
+    try {
+      await configureApplianceSecrets(
+        {
+          mailbox: {
+            provider: "resend",
+            api_key: resendKey,
+            intake_address: "intake@example.com",
+            from_address: "quotes@example.com"
+          }
+        },
+        context
+      );
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toMatchObject({ code: "mailbox_auth_rejected" });
+    expect(String(caught)).not.toContain(secret);
+    expect(String(caught)).not.toContain(body);
+    expect(
+      await readFile(context.paths.clientSecretsFile, "utf8").catch(() => "")
+    ).toBe("");
+    expect(
+      await readFile(context.paths.mailboxProbeReceiptFile, "utf8").catch(
+        () => ""
+      )
+    ).toBe("");
+  });
+
+  it("applies one Resend deadline across fetch and response parsing", async () => {
+    const context = await testContext({
+      fetch: vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        json: async () => await new Promise<unknown>(() => undefined)
+      }) as unknown as typeof fetch
+    });
+    (
+      context as OnboardingContext & { mailboxProbeTimeoutMs?: number }
+    ).mailboxProbeTimeoutMs = 10;
+    const resendKey = await secretRef(
+      context,
+      "timeout-resend.key",
+      "timeout-resend-secret"
+    );
+
+    await expect(
+      configureApplianceSecrets(
+        {
+          mailbox: {
+            provider: "resend",
+            api_key: resendKey,
+            intake_address: "intake@example.com",
+            from_address: "quotes@example.com"
+          }
+        },
+        context
+      )
+    ).rejects.toMatchObject({ code: "mailbox_probe_unreachable" });
+    expect(
+      await readFile(context.paths.clientSecretsFile, "utf8").catch(() => "")
+    ).toBe("");
+  });
+
+  it("reuses the Resend idempotency key after response loss", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("response lost"))
+      .mockResolvedValueOnce(
+        Response.json({ id: "accepted-retry" }, { status: 200 })
+      );
+    const context = await testContext({
+      fetch: fetchMock as unknown as typeof fetch
+    });
+    const resendKey = await secretRef(
+      context,
+      "retry-resend.key",
+      "retry-resend-secret"
+    );
+    const input = {
+      mailbox: {
+        provider: "resend" as const,
+        api_key: resendKey,
+        intake_address: "intake@example.com",
+        from_address: "quotes@example.com"
+      }
+    };
+
+    await expect(
+      configureApplianceSecrets(input, context)
+    ).rejects.toMatchObject({ code: "mailbox_probe_unreachable" });
+    await configureApplianceSecrets(input, context);
+
+    const firstHeaders = fetchMock.mock.calls[0]?.[1]?.headers as Record<
+      string,
+      string
+    >;
+    const secondHeaders = fetchMock.mock.calls[1]?.[1]?.headers as Record<
+      string,
+      string
+    >;
+    expect(firstHeaders["Idempotency-Key"]).toBe(
+      secondHeaders["Idempotency-Key"]
+    );
+    const receipt = await readFile(
+      context.paths.mailboxProbeReceiptFile,
+      "utf8"
+    );
+    expect(receipt).not.toMatch(
+      /retry-resend-secret|accepted-retry|QuoteOps onboarding validation/
+    );
+  });
+
+  it("fails closed on IMAP authentication without persisting credentials", async () => {
+    const passwordValue = "imap-password-must-not-leak";
+    const context = await testContext({
+      probeImap: vi.fn(async () => {
+        throw new Error(`auth failed for ${passwordValue}`);
+      })
+    });
+    const password = await secretRef(
+      context,
+      "bad-imap.key",
+      passwordValue
+    );
+
+    let caught: unknown;
+    try {
+      await configureApplianceSecrets(
+        {
+          mailbox: {
+            provider: "imap",
+            user: "quotes@example.com",
+            password,
+            host: "imap.example.com",
+            port: 993
+          }
+        },
+        context
+      );
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toMatchObject({ code: "mailbox_auth_rejected" });
+    expect(String(caught)).not.toContain(passwordValue);
+    expect(
+      await readFile(context.paths.clientSecretsFile, "utf8").catch(() => "")
+    ).toBe("");
+    expect(
+      await readFile(context.paths.mailboxProbeReceiptFile, "utf8").catch(
+        () => ""
+      )
+    ).toBe("");
+  });
+
+  it("requires non-empty active secrets and complete provider-specific config", async () => {
+    const context = await testContext({
+      fetch: vi.fn().mockResolvedValue(
+        Response.json({ id: "readiness-id" }, { status: 200 })
+      ) as unknown as typeof fetch
+    });
+    const resendKey = await secretRef(
+      context,
+      "ready-resend.key",
+      "ready-resend-secret"
+    );
+    const embeddingKey = await secretRef(
+      context,
+      "ready-embedding.key",
+      "ready-embedding-secret"
+    );
+    await configureApplianceSecrets(
+      {
+        mailbox: {
+          provider: "resend",
+          api_key: resendKey,
+          intake_address: "intake@example.com",
+          from_address: "quotes@example.com"
+        },
+        embeddings: {
+          provider: "gemini",
+          model: "text-embedding-004",
+          api_key: embeddingKey
+        }
+      },
+      context
+    );
+    expect(await isApplianceSecretsComplete(context)).toBe(true);
+
+    await writeFile(
+      context.paths.clientSecretsFile,
+      (
+        await readFile(context.paths.clientSecretsFile, "utf8")
+      ).replace(/^RESEND_API_KEY=.*$/m, 'RESEND_API_KEY=""'),
+      { mode: 0o600 }
+    );
+    expect(await isApplianceSecretsComplete(context)).toBe(false);
+  });
+
+  it("rejects incomplete mailbox and embeddings shapes even with matching receipts", async () => {
+    const context = await testContext({
+      fetch: vi.fn().mockResolvedValue(
+        Response.json({ id: "shape-id" }, { status: 200 })
+      ) as unknown as typeof fetch
+    });
+    const resendKey = await secretRef(
+      context,
+      "shape-resend.key",
+      "shape-resend-secret"
+    );
+    const embeddingKey = await secretRef(
+      context,
+      "shape-embedding.key",
+      "shape-embedding-secret"
+    );
+    await configureApplianceSecrets(
+      {
+        mailbox: {
+          provider: "resend",
+          api_key: resendKey,
+          intake_address: "intake@example.com",
+          from_address: "quotes@example.com"
+        },
+        embeddings: {
+          provider: "gemini",
+          model: "text-embedding-004",
+          api_key: embeddingKey
+        }
+      },
+      context
+    );
+    const config = parseYaml(
+      await readFile(context.paths.agentConfigFile, "utf8")
+    );
+    config.mailbox.poll_interval_ms = 0;
+    config.embeddings.provider = "unsupported";
+    await writeFile(
+      context.paths.agentConfigFile,
+      `${JSON.stringify(config)}\n`,
+      { mode: 0o600 }
+    );
+    const receipt = JSON.parse(
+      await readFile(context.paths.mailboxProbeReceiptFile, "utf8")
+    );
+    receipt.agent_config_sha256 = await sha256File(
+      context.paths.agentConfigFile
+    );
+    await writeFile(
+      context.paths.mailboxProbeReceiptFile,
+      `${JSON.stringify(receipt)}\n`,
+      { mode: 0o600 }
+    );
+
+    expect(await isApplianceSecretsComplete(context)).toBe(false);
+  });
+
+  it("invalidates mailbox readiness when provider config rotates", async () => {
+    const context = await testContext({
+      fetch: vi.fn().mockResolvedValue(
+        Response.json({ id: "rotation-id" }, { status: 200 })
+      ) as unknown as typeof fetch
+    });
+    const resendKey = await secretRef(
+      context,
+      "rotation-resend.key",
+      "rotation-resend-secret"
+    );
+    const embeddingKey = await secretRef(
+      context,
+      "rotation-embedding.key",
+      "rotation-embedding-secret"
+    );
+    await configureApplianceSecrets(
+      {
+        mailbox: {
+          provider: "resend",
+          api_key: resendKey,
+          intake_address: "intake@example.com",
+          from_address: "quotes@example.com"
+        },
+        embeddings: {
+          provider: "gemini",
+          model: "text-embedding-004",
+          api_key: embeddingKey
+        }
+      },
+      context
+    );
+    const config = await readFile(context.paths.agentConfigFile, "utf8");
+    await writeFile(
+      context.paths.agentConfigFile,
+      config.replace("poll_interval_ms: 60000", "poll_interval_ms: 120000"),
+      { mode: 0o600 }
+    );
+
+    expect(await isApplianceSecretsComplete(context)).toBe(false);
+  });
+
   it("stages bounded knowledge sources and commits only safe ingestion evidence", async () => {
     const context = await testContext({
       fetch: vi.fn().mockResolvedValue(
@@ -624,6 +1231,60 @@ describe("appliance provider secrets", () => {
     });
     expect(receipt.source_hashes).toHaveLength(1);
     expect(JSON.stringify(receipt)).not.toContain("confidential body");
+  });
+
+  it("applies one knowledge-ingest deadline across fetch and response parsing", async () => {
+    const context = await testContext({
+      fetch: vi.fn().mockResolvedValue({
+        ok: true,
+        status: 202,
+        json: async () => await new Promise<unknown>(() => undefined)
+      }) as unknown as typeof fetch
+    });
+    (
+      context as OnboardingContext & { httpProbeTimeoutMs?: number }
+    ).httpProbeTimeoutMs = 10;
+    const source = join(context.answersRoot!, "timeout-source.md");
+    await writeFile(source, "private source", { mode: 0o600 });
+    context.answers = {
+      schema_version: 1,
+      knowledge: {
+        sources: [{ file: source }],
+        consent_external_embedding_transfer: true
+      }
+    };
+    await writeFile(
+      context.paths.agentConfigFile,
+      [
+        "embeddings:",
+        "  provider: gemini",
+        "  model: text-embedding-004",
+        "  api_key_env: QUOTEOPS_EMBEDDING_API_KEY",
+        "  base_url: null",
+        ""
+      ].join("\n"),
+      { mode: 0o600 }
+    );
+    await updateAllowedEnv(
+      context.paths.clientSecretsFile,
+      { QUOTEOPS_EMBEDDING_API_KEY: "embedding-secret" },
+      ["QUOTEOPS_EMBEDDING_API_KEY"]
+    );
+
+    const outcome = await Promise.race([
+      runKnowledgeIngestion(context).then(
+        () => "resolved",
+        (error: unknown) =>
+          error instanceof OnboardingError ? error.code : "unknown"
+      ),
+      new Promise<string>((resolvePromise) =>
+        setTimeout(() => resolvePromise("hung"), 50)
+      )
+    ]);
+    expect(outcome).toBe("knowledge_ingest_unreachable");
+    expect(
+      await readFile(context.paths.knowledgeReceiptFile, "utf8").catch(() => "")
+    ).toBe("");
   });
 });
 

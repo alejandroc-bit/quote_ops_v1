@@ -260,8 +260,9 @@ function renderKnowledgeReadme(): string {
   return [
     "# Documentos de conocimiento de QuoteOps",
     "",
-    "Coloca aquí hasta 20 archivos `.md`, `.txt` o `.json`, de máximo 5 MiB",
-    "cada uno. El onboarding los copiará con permisos `0600` y nombres seguros.",
+    "Coloca aquí tus documentos de conocimiento: hasta 20 archivos `.md`, `.txt`",
+    "o `.json`, de máximo 5 MiB cada uno. El onboarding los copiará con permisos",
+    "`0600` y nombres seguros.",
     "",
     "Antes de crear embeddings se solicitará consentimiento explícito: el texto",
     "de los documentos se envía al proveedor de embeddings configurado. Los",

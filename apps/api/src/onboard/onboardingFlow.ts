@@ -1,6 +1,7 @@
 import {
   chmod,
   mkdir,
+  open,
   readFile,
   rename,
   stat,
@@ -270,6 +271,53 @@ export function parseOnboardingAnswers(value: unknown): OnboardingAnswers {
   return result.data;
 }
 
+const MAX_ANSWERS_FILE_BYTES = 64 * 1024;
+
+export async function readOnboardingAnswersFile(
+  file: string
+): Promise<OnboardingAnswers> {
+  let handle;
+  try {
+    handle = await open(resolve(file), "r");
+    const metadata = await handle.stat();
+    if (
+      !metadata.isFile() ||
+      metadata.size < 1 ||
+      metadata.size > MAX_ANSWERS_FILE_BYTES
+    ) {
+      throw new OnboardingError("onboarding_answers_invalid", { exitCode: 2 });
+    }
+    const bytes = Buffer.alloc(MAX_ANSWERS_FILE_BYTES + 1);
+    let offset = 0;
+    while (offset < bytes.length) {
+      const { bytesRead } = await handle.read(
+        bytes,
+        offset,
+        bytes.length - offset,
+        offset
+      );
+      if (bytesRead === 0) break;
+      offset += bytesRead;
+    }
+    if (offset === 0 || offset > MAX_ANSWERS_FILE_BYTES) {
+      throw new OnboardingError("onboarding_answers_invalid", { exitCode: 2 });
+    }
+    return parseOnboardingAnswers(JSON.parse(bytes.subarray(0, offset).toString("utf8")));
+  } catch (error) {
+    if (
+      error instanceof OnboardingError &&
+      error.code === "onboarding_answers_invalid"
+    ) {
+      throw error;
+    }
+    throw new OnboardingError("onboarding_answers_invalid", {
+      exitCode: 2
+    });
+  } finally {
+    await handle?.close().catch(() => undefined);
+  }
+}
+
 export type OnboardingContext = {
   io: OnboardingIo;
   env: NodeJS.ProcessEnv;
@@ -284,12 +332,16 @@ export type OnboardingContext = {
   resolveHostname?: (hostname: string) => Promise<string[]>;
   /** Production remains fixed at 10 seconds; tests may use a shorter deadline. */
   aiValidationTimeoutMs?: number;
+  mailboxProbeTimeoutMs?: number;
+  httpProbeTimeoutMs?: number;
   now?: () => Date;
   /**
    * Test-only durability seam. It runs after a committed rename and before the
    * next staged write, allowing crash recovery to be exercised deterministically.
    */
   afterAtomicRename?: (label: string) => void | Promise<void>;
+  /** Test-only seam for verifying pathname replacement after O_NOFOLLOW open. */
+  afterSecretOpen?: () => void | Promise<void>;
   probeImap?: (input: {
     host: string;
     port: number;
@@ -383,6 +435,7 @@ export async function runOnboarding(
   for (const current of selected) {
     const alreadyComplete = await current.isComplete(input.context);
     if (!alreadyComplete) {
+      assertUnattendedPhaseAnswers(current.id, input.context);
       await current.run(input.context);
     }
     completed.push(current.id);
@@ -400,9 +453,50 @@ export async function runOnboarding(
   };
 }
 
+function assertUnattendedPhaseAnswers(
+  phase: OnboardingPhaseId,
+  context: OnboardingContext
+): void {
+  if (context.guided) return;
+  const answers = context.answers;
+  const complete =
+    phase === "ai_provider"
+      ? Boolean(answers?.ai_provider)
+      : phase === "license_activation"
+        ? Boolean(answers?.activation)
+        : phase === "cloudflare"
+          ? Boolean(answers?.cloudflare)
+          : phase === "appliance_secrets"
+            ? Boolean(answers?.mailbox && answers.embeddings)
+            : phase === "tms"
+              ? Boolean(answers?.tms)
+              : phase === "units"
+                ? answers?.accept_generated_profiles === true
+                : phase === "authorization"
+                  ? answers?.accept_default_authorization === true
+                  : phase === "pricing"
+                    ? answers?.accept_sample_prices === true
+                    : phase === "knowledge"
+                      ? Boolean(answers?.knowledge)
+                      : true;
+  if (!complete) {
+    throw new OnboardingError("onboarding_pending", { phase });
+  }
+}
+
 export function parseOnboardingSelection(
   argv: string[]
 ): OnboardingPhaseSelection {
+  if (
+    argv.includes("--answers-file") &&
+    (argv.includes("--allow-static-guidance") ||
+      argv.includes("--sync-units") ||
+      argv.includes("--map-tms"))
+  ) {
+    throw new OnboardingError("onboarding_selection_conflict", {
+      exitCode: 2
+    });
+  }
   let through: OnboardingPhaseId | undefined;
   let only: OnboardingPhaseId | undefined;
   for (let index = 0; index < argv.length; index += 1) {

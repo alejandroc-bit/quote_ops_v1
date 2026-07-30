@@ -2,14 +2,23 @@ import {
   chmod,
   lstat,
   mkdir,
+  open,
   readFile,
   realpath,
   rename,
   stat,
   writeFile
 } from "node:fs/promises";
+import { constants } from "node:fs";
 import { createHash } from "node:crypto";
-import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
+import {
+  basename,
+  dirname,
+  isAbsolute,
+  relative,
+  resolve,
+  sep
+} from "node:path";
 import { TextDecoder } from "node:util";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 import type {
@@ -63,57 +72,115 @@ const SECRET_CONTROL_CHARACTERS = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f
  */
 export async function readSingleLineSecret(
   input: string | SecretFileRef,
-  context?: Pick<OnboardingContext, "answersRoot">
+  context?: Pick<OnboardingContext, "answersRoot" | "afterSecretOpen">
 ): Promise<string> {
   if (typeof input === "string") return validateSingleLineSecret(input);
   const requested = resolve(input.file);
+  let canonicalRoot: string | undefined;
+  let canonicalParentBefore: string | undefined;
   if (context?.answersRoot) {
-    let root: string;
-    let canonicalRequested: string;
     try {
-      [root, canonicalRequested] = await Promise.all([
+      [canonicalRoot, canonicalParentBefore] = await Promise.all([
         realpath(resolve(context.answersRoot)),
-        realpath(requested)
+        realpath(dirname(requested))
       ]);
     } catch {
       throw new OnboardingError("secret_file_unsafe");
     }
-    const pathFromRoot = relative(root, canonicalRequested);
-    if (
-      pathFromRoot === ".." ||
-      pathFromRoot.startsWith(`..${sep}`) ||
-      isAbsolute(pathFromRoot)
-    ) {
+    if (!isPathInside(canonicalRoot, canonicalParentBefore)) {
       throw new OnboardingError("secret_file_unsafe");
     }
   }
 
-  let metadata;
+  let handle;
   try {
-    metadata = await lstat(requested);
+    handle = await open(
+      requested,
+      constants.O_RDONLY | constants.O_NOFOLLOW
+    );
   } catch {
     throw new OnboardingError("secret_file_unsafe");
   }
-  const invokingUid = typeof process.getuid === "function" ? process.getuid() : metadata.uid;
-  if (
-    metadata.isSymbolicLink() ||
-    !metadata.isFile() ||
-    (metadata.mode & 0o777) !== 0o600 ||
-    (metadata.uid !== 0 && metadata.uid !== invokingUid)
-  ) {
-    throw new OnboardingError("secret_file_unsafe");
-  }
-  if (metadata.size > MAX_SECRET_BYTES) {
-    throw new OnboardingError("secret_invalid");
-  }
-  const bytes = await readFile(requested);
-  let decoded: string;
   try {
-    decoded = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
-  } catch {
-    throw new OnboardingError("secret_invalid");
+    await context?.afterSecretOpen?.();
+    const metadata = await handle.stat();
+    const invokingUid =
+      typeof process.getuid === "function" ? process.getuid() : metadata.uid;
+    if (
+      !metadata.isFile() ||
+      (metadata.mode & 0o777) !== 0o600 ||
+      (metadata.uid !== 0 && metadata.uid !== invokingUid)
+    ) {
+      throw new OnboardingError("secret_file_unsafe");
+    }
+    if (metadata.size > MAX_SECRET_BYTES) {
+      throw new OnboardingError("secret_invalid");
+    }
+
+    let pathMetadata;
+    let canonicalRequested: string;
+    let canonicalParentAfter: string;
+    try {
+      [pathMetadata, canonicalRequested, canonicalParentAfter] =
+        await Promise.all([
+          lstat(requested),
+          realpath(requested),
+          realpath(dirname(requested))
+        ]);
+    } catch {
+      throw new OnboardingError("secret_file_unsafe");
+    }
+    if (
+      pathMetadata.isSymbolicLink() ||
+      !pathMetadata.isFile() ||
+      pathMetadata.dev !== metadata.dev ||
+      pathMetadata.ino !== metadata.ino ||
+      canonicalRequested !== resolve(canonicalParentAfter, basename(requested)) ||
+      (canonicalParentBefore !== undefined &&
+        canonicalParentAfter !== canonicalParentBefore) ||
+      (canonicalRoot !== undefined &&
+        (!isPathInside(canonicalRoot, canonicalParentAfter) ||
+          !isPathInside(canonicalRoot, canonicalRequested)))
+    ) {
+      throw new OnboardingError("secret_file_unsafe");
+    }
+
+    const bytes = Buffer.alloc(MAX_SECRET_BYTES + 1);
+    let offset = 0;
+    while (offset < bytes.length) {
+      const { bytesRead } = await handle.read(
+        bytes,
+        offset,
+        bytes.length - offset,
+        offset
+      );
+      if (bytesRead === 0) break;
+      offset += bytesRead;
+    }
+    if (offset > MAX_SECRET_BYTES) {
+      throw new OnboardingError("secret_invalid");
+    }
+    let decoded: string;
+    try {
+      decoded = new TextDecoder("utf-8", { fatal: true }).decode(
+        bytes.subarray(0, offset)
+      );
+    } catch {
+      throw new OnboardingError("secret_invalid");
+    }
+    return validateSingleLineSecret(decoded);
+  } finally {
+    await handle.close().catch(() => undefined);
   }
-  return validateSingleLineSecret(decoded);
+}
+
+function isPathInside(root: string, candidate: string): boolean {
+  const pathFromRoot = relative(root, candidate);
+  return !(
+    pathFromRoot === ".." ||
+    pathFromRoot.startsWith(`..${sep}`) ||
+    isAbsolute(pathFromRoot)
+  );
 }
 
 export function validateSingleLineSecret(value: string): string {

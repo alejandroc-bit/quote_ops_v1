@@ -58,6 +58,7 @@ export {
   onboardingAnswersSchema,
   parseOnboardingAnswers,
   parseOnboardingSelection,
+  readOnboardingAnswersFile,
   runOnboarding,
   OnboardingError
 } from "./onboard/onboardingFlow.js";

@@ -247,6 +247,11 @@ export const applianceSecretsPhase: OnboardingPhase = {
   },
   async run(context) {
     if (context.answers) {
+      if (!context.answers.mailbox || !context.answers.embeddings) {
+        throw new OnboardingError("onboarding_pending", {
+          phase: "appliance_secrets"
+        });
+      }
       await configureApplianceSecrets(context.answers, context);
       return;
     }
@@ -328,49 +333,114 @@ export async function isApplianceSecretsComplete(
     config.mailbox && typeof config.mailbox === "object"
       ? (config.mailbox as Record<string, unknown>)
       : null;
-  if (mailbox) {
-    const provider = mailbox.provider;
-    const exactMailboxKeys =
-      provider === "resend"
-        ? env.has("RESEND_API_KEY") &&
-          env.has("MAILBOX_USER") &&
-          env.has("MAILBOX_FROM") &&
-          !env.has("MAILBOX_PASSWORD")
-        : provider === "imap"
-          ? env.has("MAILBOX_USER") &&
-            env.has("MAILBOX_PASSWORD") &&
-            !env.has("RESEND_API_KEY") &&
-            !env.has("MAILBOX_FROM")
-          : false;
-    if (!exactMailboxKeys) return false;
-    const receipt = await readMailboxReceipt(
-      context.paths.mailboxProbeReceiptFile
-    );
-    const revision = await readRevision(
-      join(context.paths.settingsDir, "appliance-secrets-credential.json")
-    );
-    if (
-      !receipt ||
-      receipt.provider !== provider ||
-      receipt.credential_revision !== revision ||
-      receipt.agent_config_sha256 !==
-        (await sha256File(context.paths.agentConfigFile))
-    ) {
-      return false;
-    }
+  if (!mailbox || !isCompleteMailboxConfig(mailbox, env)) return false;
+  const provider = mailbox.provider as "resend" | "imap";
+  const receipt = await readMailboxReceipt(
+    context.paths.mailboxProbeReceiptFile
+  );
+  const revision = await readRevision(
+    join(context.paths.settingsDir, "appliance-secrets-credential.json")
+  );
+  if (
+    !receipt ||
+    revision < 1 ||
+    receipt.provider !== provider ||
+    receipt.code !==
+      (provider === "resend"
+        ? "message_accepted"
+        : "authenticated_read_only") ||
+    receipt.credential_revision !== revision ||
+    receipt.agent_config_sha256 !==
+      (await sha256File(context.paths.agentConfigFile))
+  ) {
+    return false;
   }
   const embeddings =
     config.embeddings && typeof config.embeddings === "object"
       ? (config.embeddings as Record<string, unknown>)
       : null;
-  if (
-    embeddings &&
-    (embeddings.api_key_env !== "QUOTEOPS_EMBEDDING_API_KEY" ||
-      !env.has("QUOTEOPS_EMBEDDING_API_KEY"))
-  ) {
+  if (!embeddings || !isCompleteEmbeddingsConfig(embeddings)) return false;
+  if (!hasNonEmptyEnv(env, "QUOTEOPS_EMBEDDING_API_KEY")) return false;
+  if (env.has("INEGI_SAKBE_KEY") && !hasNonEmptyEnv(env, "INEGI_SAKBE_KEY")) {
     return false;
   }
   return true;
+}
+
+function isCompleteMailboxConfig(
+  mailbox: Record<string, unknown>,
+  env: Map<string, string>
+): boolean {
+  if (
+    mailbox.auth !== "password" ||
+    mailbox.processed_mailbox !== null ||
+    mailbox.poll_interval_ms !== 60_000
+  ) {
+    return false;
+  }
+  if (mailbox.provider === "resend") {
+    return (
+      mailbox.imap_host === null &&
+      mailbox.imap_port === null &&
+      hasNonEmptyEnv(env, "RESEND_API_KEY") &&
+      hasNonEmptyEnv(env, "MAILBOX_USER") &&
+      hasNonEmptyEnv(env, "MAILBOX_FROM") &&
+      !env.has("MAILBOX_PASSWORD")
+    );
+  }
+  if (mailbox.provider !== "imap") return false;
+  if (
+    typeof mailbox.imap_host !== "string" ||
+    !Number.isInteger(mailbox.imap_port) ||
+    Number(mailbox.imap_port) < 1 ||
+    Number(mailbox.imap_port) > 65_535
+  ) {
+    return false;
+  }
+  try {
+    validateMailboxHost(mailbox.imap_host);
+  } catch {
+    return false;
+  }
+  return (
+    hasNonEmptyEnv(env, "MAILBOX_USER") &&
+    hasNonEmptyEnv(env, "MAILBOX_PASSWORD") &&
+    !env.has("RESEND_API_KEY") &&
+    !env.has("MAILBOX_FROM")
+  );
+}
+
+function isCompleteEmbeddingsConfig(
+  embeddings: Record<string, unknown>
+): boolean {
+  if (
+    embeddings.api_key_env !== "QUOTEOPS_EMBEDDING_API_KEY" ||
+    typeof embeddings.model !== "string" ||
+    embeddings.model.length === 0 ||
+    embeddings.model.trim() !== embeddings.model
+  ) {
+    return false;
+  }
+  if (embeddings.provider === "gemini") {
+    return embeddings.base_url === null;
+  }
+  if (
+    embeddings.provider !== "openai_compatible" ||
+    typeof embeddings.base_url !== "string"
+  ) {
+    return false;
+  }
+  try {
+    validateHttpsUrl(embeddings.base_url);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function hasNonEmptyEnv(env: Map<string, string>, key: string): boolean {
+  const value = env.get(key);
+  return typeof value === "string" && value.length > 0;
 }
 
 export async function runKnowledgeIngestion(
@@ -422,30 +492,35 @@ export async function runKnowledgeIngestion(
     throw new OnboardingError("knowledge_sources_required");
   }
 
-  let response: Response;
-  try {
-    response = await context.fetch(
-      `${context.paths.apiBaseUrl}/api/knowledge/ingest`,
-      {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: "{}",
-        signal: AbortSignal.timeout(10_000)
+  const body = await withHttpDeadline(
+    context.httpProbeTimeoutMs ?? 10_000,
+    "knowledge_ingest_unreachable",
+    async (signal) => {
+      const response = await context.fetch(
+        `${context.paths.apiBaseUrl}/api/knowledge/ingest`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: "{}",
+          signal
+        }
+      );
+      if (!response.ok) {
+        throw new OnboardingError("knowledge_ingest_failed");
       }
-    );
-  } catch {
-    throw new OnboardingError("knowledge_ingest_unreachable");
-  }
-  if (!response.ok) throw new OnboardingError("knowledge_ingest_failed");
-  let body: {
-    document_count?: unknown;
-    ingested?: unknown;
-  };
-  try {
-    body = (await response.json()) as typeof body;
-  } catch {
-    throw new OnboardingError("knowledge_ingest_invalid_response");
-  }
+      try {
+        return (await response.json()) as {
+          document_count?: unknown;
+          ingested?: unknown;
+        };
+      } catch {
+        if (signal.aborted) {
+          throw new OnboardingError("knowledge_ingest_unreachable");
+        }
+        throw new OnboardingError("knowledge_ingest_invalid_response");
+      }
+    }
+  );
   const documentCount =
     typeof body.document_count === "number" ? body.document_count : 0;
   const chunkCount = Array.isArray(body.ingested)
@@ -506,14 +581,29 @@ export const knowledgePhase: OnboardingPhase = {
       ) {
         return false;
       }
-      const response = await context.fetch(
-        `${context.paths.apiBaseUrl}/api/knowledge/status`,
-        { signal: AbortSignal.timeout(10_000) }
+      const status = await withHttpDeadline(
+        context.httpProbeTimeoutMs ?? 10_000,
+        "knowledge_status_unreachable",
+        async (signal) => {
+          const response = await context.fetch(
+            `${context.paths.apiBaseUrl}/api/knowledge/status`,
+            { signal }
+          );
+          if (!response.ok) {
+            throw new OnboardingError("knowledge_status_failed");
+          }
+          try {
+            return (await response.json()) as {
+              knowledge_chunks_count?: unknown;
+            };
+          } catch {
+            if (signal.aborted) {
+              throw new OnboardingError("knowledge_status_unreachable");
+            }
+            throw new OnboardingError("knowledge_status_invalid_response");
+          }
+        }
       );
-      if (!response.ok) return false;
-      const status = (await response.json()) as {
-        knowledge_chunks_count?: unknown;
-      };
       return Number(status.knowledge_chunks_count) > 0;
     } catch {
       return false;
@@ -607,38 +697,68 @@ async function probeResend(
   },
   context: OnboardingContext
 ): Promise<void> {
-  let response: Response;
-  try {
-    response = await context.fetch("https://api.resend.com/emails", {
-      method: "POST",
-      headers: {
-        authorization: `Bearer ${input.apiKey}`,
-        "content-type": "application/json",
-        "Idempotency-Key": input.idempotencyKey
-      },
-      body: JSON.stringify({
-        from: input.fromAddress,
-        to: [input.intakeAddress],
-        subject: "QuoteOps onboarding validation",
-        text: "QuoteOps onboarding validation"
-      }),
-      signal: AbortSignal.timeout(10_000)
-    });
-  } catch {
-    throw new OnboardingError("mailbox_probe_unreachable");
-  }
-  if (response.status === 401 || response.status === 403) {
-    throw new OnboardingError("mailbox_auth_rejected");
-  }
-  if (!response.ok) throw new OnboardingError("mailbox_probe_failed");
-  try {
-    const body = (await response.json()) as { id?: unknown };
-    if (typeof body.id !== "string" || !body.id) {
-      throw new OnboardingError("mailbox_probe_invalid_response");
+  await withHttpDeadline(
+    context.mailboxProbeTimeoutMs ?? 10_000,
+    "mailbox_probe_unreachable",
+    async (signal) => {
+      const response = await context.fetch("https://api.resend.com/emails", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${input.apiKey}`,
+          "content-type": "application/json",
+          "Idempotency-Key": input.idempotencyKey
+        },
+        body: JSON.stringify({
+          from: input.fromAddress,
+          to: [input.intakeAddress],
+          subject: "QuoteOps onboarding validation",
+          text: "QuoteOps onboarding validation"
+        }),
+        signal
+      });
+      if (response.status === 401 || response.status === 403) {
+        throw new OnboardingError("mailbox_auth_rejected");
+      }
+      if (!response.ok) {
+        throw new OnboardingError("mailbox_probe_failed");
+      }
+      let body: { id?: unknown };
+      try {
+        body = (await response.json()) as { id?: unknown };
+      } catch {
+        if (signal.aborted) {
+          throw new OnboardingError("mailbox_probe_unreachable");
+        }
+        throw new OnboardingError("mailbox_probe_invalid_response");
+      }
+      if (typeof body.id !== "string" || !body.id) {
+        throw new OnboardingError("mailbox_probe_invalid_response");
+      }
     }
+  );
+}
+
+async function withHttpDeadline<T>(
+  timeoutMs: number,
+  unreachableCode: string,
+  operation: (signal: AbortSignal) => Promise<T>
+): Promise<T> {
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const task = operation(controller.signal);
+  const deadline = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      controller.abort();
+      reject(new OnboardingError(unreachableCode));
+    }, timeoutMs);
+  });
+  try {
+    return await Promise.race([task, deadline]);
   } catch (error) {
     if (error instanceof OnboardingError) throw error;
-    throw new OnboardingError("mailbox_probe_invalid_response");
+    throw new OnboardingError(unreachableCode);
+  } finally {
+    if (timer) clearTimeout(timer);
   }
 }
 
