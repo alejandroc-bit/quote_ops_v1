@@ -5,33 +5,57 @@ import {
   normalizeEmail,
   type MinimalClientRecord
 } from "@quoteops/control-plane";
-import type {
-  ControlPlaneData,
-  PortalProfile,
-  PortalProfileClaimInput,
-  RegistrationTokenRecord,
-  SentinelReportInput,
-  UsageEventInput
+import {
+  validateRegistrationTokenRecord,
+  validateReleaseRecord,
+  type ControlPlaneData,
+  type PortalProfile,
+  type PortalProfileClaimInput,
+  type RegistrationTokenRecord,
+  type ReleaseRecord,
+  type SentinelReportInput,
+  type UsageEventInput
 } from "./index.js";
 
-type LegacyFileState = {
+type FileState = {
   clients: MinimalClientRecord[];
   registration_tokens: RegistrationTokenRecord[];
+  releases: ReleaseRecord[];
 };
 
-const emptyState: LegacyFileState = { clients: [], registration_tokens: [] };
+type PersistedFileState = {
+  clients: MinimalClientRecord[];
+  registration_tokens: RegistrationTokenRecord[];
+  releases: Array<
+    Omit<ReleaseRecord, "manifest_bytes" | "archive_bytes"> & {
+      manifest_bytes: string;
+      archive_bytes: string;
+    }
+  >;
+};
+
+const emptyState: FileState = { clients: [], registration_tokens: [], releases: [] };
 
 /** Reads and continues writing the pre-unification JSON shape. */
 export function createFileControlPlaneData(path: string): ControlPlaneData {
   const profiles = new Map<string, PortalProfile>();
 
-  async function readState(): Promise<LegacyFileState> {
+  async function readState(): Promise<FileState> {
     try {
-      const parsed = JSON.parse(await readFile(path, "utf8")) as Partial<LegacyFileState>;
+      const parsed = JSON.parse(await readFile(path, "utf8")) as Partial<PersistedFileState>;
       return {
         clients: Array.isArray(parsed.clients) ? parsed.clients : [],
         registration_tokens: Array.isArray(parsed.registration_tokens)
           ? parsed.registration_tokens
+          : [],
+        releases: Array.isArray(parsed.releases)
+          ? parsed.releases.map((release) =>
+              validateReleaseRecord({
+                ...release,
+                manifest_bytes: Buffer.from(release.manifest_bytes, "base64"),
+                archive_bytes: Buffer.from(release.archive_bytes, "base64")
+              })
+            )
           : []
       };
     } catch (error) {
@@ -40,10 +64,24 @@ export function createFileControlPlaneData(path: string): ControlPlaneData {
     }
   }
 
-  async function writeState(state: LegacyFileState): Promise<void> {
+  async function writeState(state: FileState): Promise<void> {
     await mkdir(dirname(path), { recursive: true });
     const tempPath = `${path}.tmp.${process.pid}`;
-    await writeFile(tempPath, JSON.stringify(state, null, 2), { mode: 0o600 });
+    const persisted: PersistedFileState = {
+      clients: state.clients,
+      registration_tokens: state.registration_tokens
+        .filter(hasCompleteReleasePin)
+        .map((token) => validateRegistrationTokenRecord(token)),
+      releases: state.releases.map((release) => {
+        const valid = validateReleaseRecord(release);
+        return {
+          ...valid,
+          manifest_bytes: Buffer.from(valid.manifest_bytes).toString("base64"),
+          archive_bytes: Buffer.from(valid.archive_bytes).toString("base64")
+        };
+      })
+    };
+    await writeFile(tempPath, JSON.stringify(persisted, null, 2), { mode: 0o600 });
     await rename(tempPath, path);
   }
 
@@ -84,22 +122,28 @@ export function createFileControlPlaneData(path: string): ControlPlaneData {
       if (!client || client.installation.installation_id !== token.installation_id) {
         throw new Error("installation_not_provisioned");
       }
+      const valid = validateRegistrationTokenRecord(token);
       await writeState({
         ...state,
         registration_tokens: [
-          token,
-          ...state.registration_tokens.filter((current) => current.token !== token.token)
+          valid,
+          ...state.registration_tokens.filter((current) => current.token !== valid.token)
         ]
       });
-      return token;
+      return valid;
     },
     async getRegistrationToken(token) {
-      return (await readState()).registration_tokens.find((current) => current.token === token) ?? null;
+      const current =
+        (await readState()).registration_tokens.find(
+          (candidate) => candidate.token === token
+        ) ?? null;
+      return current ? validateRegistrationTokenRecord(current) : null;
     },
     async markRegistrationTokenUsed(token, usedAt) {
       const state = await readState();
       const current = state.registration_tokens.find((candidate) => candidate.token === token);
       if (!current) throw new Error("registration_token_not_found");
+      validateRegistrationTokenRecord(current);
       await writeState({
         ...state,
         registration_tokens: [
@@ -112,6 +156,7 @@ export function createFileControlPlaneData(path: string): ControlPlaneData {
       const state = await readState();
       const record = state.registration_tokens.find((candidate) => candidate.token === token);
       if (!record || (!record.used_at && Date.parse(record.expires_at) <= Date.now())) return null;
+      validateRegistrationTokenRecord(record);
       const client = state.clients.find((candidate) => candidate.client_id === record.client_id);
       if (!client || client.installation.installation_id !== record.installation_id) return null;
       return { tenant_id: record.client_id, installation_id: record.installation_id };
@@ -146,7 +191,34 @@ export function createFileControlPlaneData(path: string): ControlPlaneData {
       // Dev file mode intentionally persists only the legacy client/token shape.
     },
     async latestRelease() {
-      return null;
+      const state = await readState();
+      const releases = state.releases
+        .filter((release) => /^v\d+\.\d+\.\d+$/.test(release.version))
+        .sort((a, b) =>
+          a.version.localeCompare(b.version, undefined, { numeric: true })
+        );
+      return releases.at(-1) ?? null;
+    },
+    async getRelease(version) {
+      return (await readState()).releases.find((release) => release.version === version) ?? null;
+    },
+    async upsertRelease(release) {
+      const state = await readState();
+      const valid = validateReleaseRecord(release);
+      const current = state.releases.find((candidate) => candidate.version === valid.version);
+      if (current && current.bundle_sha256 !== valid.bundle_sha256) {
+        throw new Error("release_version_immutable");
+      }
+      const existingByHash = state.releases.find(
+        (candidate) => candidate.bundle_sha256 === valid.bundle_sha256
+      );
+      if (existingByHash && existingByHash.version !== valid.version) {
+        throw new Error("release_bundle_immutable");
+      }
+      if (!current) {
+        await writeState({ ...state, releases: [...state.releases, valid] });
+      }
+      return current ?? valid;
     },
     async getInstallationSettings(_installationId) {
       return {};
@@ -155,4 +227,16 @@ export function createFileControlPlaneData(path: string): ControlPlaneData {
       if (client) await this.upsertClient(client);
     }
   };
+}
+
+function hasCompleteReleasePin(
+  token: RegistrationTokenRecord
+): token is RegistrationTokenRecord {
+  return Boolean(
+    token &&
+      typeof token.release_version === "string" &&
+      typeof token.bundle_sha256 === "string" &&
+      token.install_pack_snapshot &&
+      typeof token.pack_sha256 === "string"
+  );
 }

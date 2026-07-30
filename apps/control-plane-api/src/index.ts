@@ -8,6 +8,7 @@ import {
   authorizeUserForClient,
   createInstallPack,
   createMinimalClientRecord,
+  normalizeControlPlaneOrigin,
   parseMinimalCounters,
   parseMinimalHeartbeat,
   type InstallPack,
@@ -16,14 +17,17 @@ import {
 import {
   createInstallationLicense,
   generateLicenseKeyPair,
+  parsePublishedApplianceRelease,
+  type PublishedApplianceRelease,
   type InstallationLicense,
   type LicenseKeyPair
 } from "@quoteops/shared";
 import {
-  loadApplianceDeployFiles,
-  renderInstallerScript
+  renderInstallerScript,
+  validateReleaseArchive
 } from "./installerScript.js";
 import {
+  canonicalizeInstallPack,
   createDefaultControlPlaneData,
   type ControlPlaneData,
   type RegistrationTokenRecord
@@ -180,6 +184,53 @@ export function createControlPlaneApi(
       ? dependencies.isVendorAdminEmail
       : createDefaultVendorAdminEmailVerifier();
 
+  async function requireInstallableRelease(): Promise<PublishedApplianceRelease> {
+    const published = await data.latestRelease();
+    if (
+      !published ||
+      !/^[a-f0-9]{64}$/.test(published.bundle_sha256) ||
+      sha256(published.archive_bytes) !== published.bundle_sha256
+    ) {
+      throw new ApiError(
+        503,
+        "release_unavailable",
+        "no verified appliance release is available"
+      );
+    }
+    return parsePublishedApplianceRelease({
+      manifest: published.manifest,
+      bundle_sha256: published.bundle_sha256
+    });
+  }
+
+  async function loadRegistrationToken(
+    tokenHash: string
+  ): Promise<RegistrationTokenRecord | null> {
+    try {
+      return await data.getRegistrationToken(tokenHash);
+    } catch (error) {
+      const message = (error as Error).message;
+      if (message === "registration_token_reissue_required") {
+        throw new ApiError(
+          403,
+          "registration_token_reissue_required",
+          "registration token must be reissued after the release-pin migration"
+        );
+      }
+      if (
+        message.startsWith("install_pack_") ||
+        message.startsWith("registration_token_release_pin_")
+      ) {
+        throw new ApiError(
+          403,
+          "registration_token_invalid",
+          "registration token payload failed integrity validation"
+        );
+      }
+      throw error;
+    }
+  }
+
   app.use(cors());
   app.use(express.json({ limit: "256kb" }));
 
@@ -259,27 +310,50 @@ export function createControlPlaneApi(
   app.post("/api/admin/clients/:clientId/install-pack", asyncRoute(async (req, res) => {
     const client = await requireClient(data, req.params.clientId);
     ensureClientCanReceiveLicense(client);
-
+    const controlPlaneUrl = requireControlPlaneOrigin(configuredControlPlaneUrl);
+    const release = await requireInstallableRelease();
+    const registrationToken = tokenGenerator();
+    const expiresAt = addMinutes(now(), tokenTtlMinutes).toISOString();
+    const issuedPack = createInstallPack({
+      client,
+      control_plane_url: controlPlaneUrl,
+      registration_token: registrationToken,
+      expires_at: expiresAt,
+      release
+    });
+    const {
+      registration_token: _registrationToken,
+      ...installPackSnapshot
+    } = issuedPack;
     const token: RegistrationTokenRecord = {
-      token: tokenGenerator(),
+      token: sha256(registrationToken),
       client_id: client.client_id,
       installation_id: client.installation.installation_id,
-      expires_at: addMinutes(now(), tokenTtlMinutes).toISOString(),
-      used_at: null
+      expires_at: expiresAt,
+      used_at: null,
+      release_version: release.manifest.version,
+      bundle_sha256: release.bundle_sha256,
+      install_pack_snapshot: installPackSnapshot,
+      pack_sha256: sha256(canonicalizeInstallPack(installPackSnapshot))
     };
     await data.saveRegistrationToken(token);
-
-    const pack = createInstallPack({
-      client,
-      control_plane_url: resolveControlPlaneUrl(req, configuredControlPlaneUrl),
-      registration_token: token.token,
-      expires_at: token.expires_at
+    res.status(201).json({
+      install_pack: {
+        ...token.install_pack_snapshot,
+        registration_token: registrationToken
+      }
     });
-    res.status(201).json({ install_pack: pack });
   }));
 
-  app.get("/api/install/:registrationToken", asyncRoute(async (req, res) => {
-    const token = await data.getRegistrationToken(req.params.registrationToken ?? "");
+  app.get("/api/install", asyncRoute(async (req, res) => {
+    const controlPlaneUrl = requireControlPlaneOrigin(configuredControlPlaneUrl);
+    const authorization = String(req.headers.authorization ?? "").trim();
+    const registrationToken =
+      /^Bearer\s+([^\s]+)$/i.exec(authorization)?.[1] ?? null;
+    if (!registrationToken) {
+      throw new ApiError(401, "unauthorized_install", "Bearer registration token required");
+    }
+    const token = await loadRegistrationToken(sha256(registrationToken));
     if (!token) {
       throw new ApiError(404, "not_found", "registration token not found");
     }
@@ -290,22 +364,55 @@ export function createControlPlaneApi(
       throw new ApiError(403, "registration_token_expired", "registration token expired");
     }
 
-    const client = await requireClient(data, token.client_id);
-    ensureClientCanReceiveLicense(client);
-
-    const deployFiles = await loadApplianceDeployFiles();
-    if (!deployFiles) {
-      throw new ApiError(503, "installer_unavailable", "appliance deploy files are not bundled");
+    const pack = token.install_pack_snapshot;
+    if (pack.control_plane_url !== controlPlaneUrl) {
+      throw new ApiError(
+        409,
+        "install_pack_origin_mismatch",
+        "registration token is pinned to another control-plane origin"
+      );
     }
-
-    const pack = createInstallPack({
-      client,
-      control_plane_url: resolveControlPlaneUrl(req, configuredControlPlaneUrl),
-      registration_token: token.token,
-      expires_at: token.expires_at
-    });
+    const release = await data.getRelease(token.release_version);
+    if (!release || release.bundle_sha256 !== token.bundle_sha256) {
+      throw new ApiError(
+        503,
+        "release_unavailable",
+        "pinned appliance release is unavailable"
+      );
+    }
+    try {
+      validateReleaseArchive({
+        archiveBytes: Buffer.from(release.archive_bytes),
+        bundleSha256: release.bundle_sha256,
+        manifest: release.manifest,
+        manifestBytes: release.manifest_bytes
+      });
+    } catch {
+      throw new ApiError(
+        503,
+        "release_verification_failed",
+        "pinned appliance release failed verification"
+      );
+    }
+    let script: string;
+    try {
+      script = renderInstallerScript({
+        pack,
+        archiveBytes: Buffer.from(release.archive_bytes),
+        bundleSha256: release.bundle_sha256,
+        manifest: release.manifest
+      });
+    } catch {
+      throw new ApiError(
+        503,
+        "installer_unavailable",
+        "pinned installer payload is invalid"
+      );
+    }
     res.setHeader("content-type", "text/x-shellscript; charset=utf-8");
-    res.send(renderInstallerScript({ pack, deployFiles }));
+    res.setHeader("cache-control", "no-store");
+    res.setHeader("referrer-policy", "no-referrer");
+    res.send(script);
   }));
 
   app.post("/api/admin/clients/:clientId/suspend", asyncRoute(async (req, res) => {
@@ -395,7 +502,7 @@ export function createControlPlaneApi(
       return;
     }
 
-    const token = await data.getRegistrationToken(registrationToken);
+    const token = await loadRegistrationToken(sha256(registrationToken));
     if (!token || token.client_id !== client.client_id || token.installation_id !== installationId) {
       res.status(403).json({ error: "registration_token_invalid" });
       return;
@@ -500,7 +607,19 @@ export function createControlPlaneApi(
     if (!token) {
       throw new ApiError(401, "unauthorized_installation", "invalid installation token");
     }
-    const resolved = await data.resolveTenantByToken(token);
+    let resolved;
+    try {
+      resolved = await data.resolveTenantByToken(sha256(token));
+    } catch (error) {
+      if ((error as Error).message === "registration_token_reissue_required") {
+        throw new ApiError(
+          403,
+          "registration_token_reissue_required",
+          "registration token must be reissued after the release-pin migration"
+        );
+      }
+      throw error;
+    }
     if (!resolved) {
       throw new ApiError(401, "unauthorized_installation", "invalid installation token");
     }
@@ -678,18 +797,27 @@ function decodeBase64Env(value: string | undefined): string | undefined {
   return Buffer.from(value.trim(), "base64").toString("utf8").trim();
 }
 
-function resolveControlPlaneUrl(req: Request, configuredUrl: string | null): string {
-  if (configuredUrl?.trim()) {
-    return configuredUrl.trim().replace(/\/+$/, "");
+function requireControlPlaneOrigin(configuredUrl: string | null): string {
+  if (!configuredUrl?.trim()) {
+    throw new ApiError(
+      503,
+      "control_plane_origin_missing",
+      "QUOTEOPS_CONTROL_PLANE_URL must be a normalized HTTPS origin"
+    );
   }
+  try {
+    return normalizeControlPlaneOrigin(configuredUrl.trim());
+  } catch {
+    throw new ApiError(
+      503,
+      "control_plane_origin_missing",
+      "QUOTEOPS_CONTROL_PLANE_URL must be a normalized HTTPS origin"
+    );
+  }
+}
 
-  const forwardedProto = String(req.headers["x-forwarded-proto"] ?? "").split(",")[0]?.trim();
-  const proto = forwardedProto || req.protocol || "https";
-  const host = req.headers.host;
-  if (!host) {
-    return "http://localhost:19083";
-  }
-  return `${proto}://${host}`.replace(/\/+$/, "");
+function sha256(value: string | Uint8Array): string {
+  return crypto.createHash("sha256").update(value).digest("hex");
 }
 
 function asyncRoute(

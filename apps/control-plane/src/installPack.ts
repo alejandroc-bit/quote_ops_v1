@@ -1,22 +1,62 @@
+import type { PublishedApplianceRelease } from "@quoteops/shared";
+import { z } from "zod";
 import type { MinimalClientRecord } from "./minimalRegistry.js";
 
 export type InstallPack = {
   client_id: string;
   installation_id: string;
-  registration_token: string;
   expires_at: string;
   control_plane_url: string;
   install_command: string;
+  release: {
+    version: string;
+    bundle_sha256: string;
+  };
   files: Record<string, string>;
 };
+
+export type IssuedInstallPack = InstallPack & {
+  registration_token: string;
+};
+
+export const installPackSchema = z
+  .object({
+    client_id: z.string().min(1),
+    installation_id: z.string().min(1),
+    expires_at: z.string().datetime({ offset: true }),
+    control_plane_url: z
+      .string()
+      .url()
+      .refine((value) => {
+        try {
+          return normalizeControlPlaneOrigin(value) === value;
+        } catch {
+          return false;
+        }
+      }, "normalized HTTPS origin required"),
+    install_command: z.string().min(1),
+    release: z
+      .object({
+        version: z.string().regex(/^v\d+\.\d+\.\d+$/),
+        bundle_sha256: z.string().regex(/^[a-f0-9]{64}$/)
+      })
+      .strict(),
+    files: z.record(z.string().min(1), z.string())
+  })
+  .strict();
+
+export function parseInstallPack(value: unknown): InstallPack {
+  return installPackSchema.parse(value);
+}
 
 export function createInstallPack(input: {
   client: MinimalClientRecord;
   control_plane_url: string;
   registration_token: string;
   expires_at: string;
-}): InstallPack {
-  const controlPlaneUrl = input.control_plane_url.replace(/\/+$/, "");
+  release: PublishedApplianceRelease;
+}): IssuedInstallPack {
+  const controlPlaneUrl = normalizeControlPlaneOrigin(input.control_plane_url);
   const { client } = input;
   const installationId = client.installation.installation_id;
 
@@ -26,12 +66,11 @@ export function createInstallPack(input: {
     registration_token: input.registration_token,
     expires_at: input.expires_at,
     control_plane_url: controlPlaneUrl,
-    // single physical line on purpose: a backslash-newline continuation is
-    // fragile to copy/paste (web renderers and chat UIs can swap the space
-    // after it for a non-breaking/zero-width char, which then makes the
-    // shell fail to find "bash"). No angle brackets in the placeholder
-    // either, since those look like they should stay in the string.
-    install_command: `QUOTEOPS_REGISTRATION_TOKEN="PASTE_YOUR_TOKEN_HERE" bash -c 'curl -fsSL ${controlPlaneUrl}/api/install/$QUOTEOPS_REGISTRATION_TOKEN | bash'`,
+    install_command: `bash -c 'set -Eeuo pipefail; bootstrap="$(mktemp "\${TMPDIR:-/tmp}/quoteops-bootstrap.XXXXXX")"; trap '\\''rm -f "$bootstrap"'\\'' EXIT INT TERM; curl --proto "=https" --proto-redir "=https" --tlsv1.2 -fsSL "${controlPlaneUrl}/install/quoteops" -o "$bootstrap"; sudo bash "$bootstrap"'`,
+    release: {
+      version: input.release.manifest.version,
+      bundle_sha256: input.release.bundle_sha256
+    },
     files: {
       "client-manifest.yaml": renderClientManifest(client),
       "criteria-template.yaml": renderCriteriaTemplate(client),
@@ -52,6 +91,21 @@ export function createInstallPack(input: {
       "connectors/tms-sql-contract.md": renderSqlContract()
     }
   };
+}
+
+export function normalizeControlPlaneOrigin(value: string): string {
+  const url = new URL(value);
+  if (
+    url.protocol !== "https:" ||
+    url.username ||
+    url.password ||
+    url.pathname !== "/" ||
+    url.search ||
+    url.hash
+  ) {
+    throw new Error("control_plane_origin_invalid");
+  }
+  return url.origin;
 }
 
 function renderClientManifest(client: MinimalClientRecord): string {

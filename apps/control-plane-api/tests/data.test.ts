@@ -4,9 +4,12 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { createMinimalClientRecord } from "@quoteops/control-plane";
 import {
+  canonicalizeInstallPack,
   createDefaultControlPlaneData,
   createFileControlPlaneData,
-  createInMemoryControlPlaneData
+  createInMemoryControlPlaneData,
+  type RegistrationTokenRecord,
+  type ReleaseRecord
 } from "../src/data/index";
 import { projectMinimalClientRecord } from "../src/data/postgres";
 import { runAdminCli } from "../src/adminCli";
@@ -56,13 +59,17 @@ describe("unified control-plane data", () => {
       created_at: "2026-07-13T12:00:00.000Z"
     });
     const data = createInMemoryControlPlaneData({ clients: [client] });
-    await data.saveRegistrationToken({
-      token: "unified-token",
-      client_id: "TOKEN",
-      installation_id: "token-prod-001",
-      expires_at: "2000-01-01T00:00:00.000Z",
-      used_at: null
-    });
+    const release = createTestRelease();
+    await data.upsertRelease(release);
+    await data.saveRegistrationToken(
+      createTestToken(
+        "unified-token",
+        "TOKEN",
+        "token-prod-001",
+        "2000-01-01T00:00:00.000Z",
+        release
+      )
+    );
 
     expect(await data.resolveTenantByToken("unified-token")).toBeNull();
     await data.markRegistrationTokenUsed("unified-token", "2026-07-13T12:01:00.000Z");
@@ -121,15 +128,17 @@ describe("unified control-plane data", () => {
 
     const data = createFileControlPlaneData(path);
     expect(await data.getClient("FILE")).toEqual(client);
-    await data.saveRegistrationToken({
-      token: "file-token",
-      client_id: "FILE",
-      installation_id: "file-prod-001",
-      expires_at: "2026-07-13T13:00:00.000Z",
-      used_at: null
-    });
+    await data.saveRegistrationToken(
+      createTestToken(
+        "file-token",
+        "FILE",
+        "file-prod-001",
+        "2026-07-13T13:00:00.000Z",
+        createTestRelease()
+      )
+    );
 
-    expect(JSON.parse(await readFile(path, "utf8"))).toEqual({
+    expect(JSON.parse(await readFile(path, "utf8"))).toMatchObject({
       clients: [client],
       registration_tokens: [
         {
@@ -137,9 +146,11 @@ describe("unified control-plane data", () => {
           client_id: "FILE",
           installation_id: "file-prod-001",
           expires_at: "2026-07-13T13:00:00.000Z",
-          used_at: null
+          used_at: null,
+          release_version: "v0.2.0"
         }
-      ]
+      ],
+      releases: []
     });
     expect(await data.latestRelease()).toBeNull();
     expect(await data.getInstallationSettings("file-prod-001")).toEqual({});
@@ -157,6 +168,7 @@ describe("unified control-plane data", () => {
 
   it("runs the vendor create-client, list and install-pack workflow", async () => {
     const data = createInMemoryControlPlaneData();
+    await data.upsertRelease(createTestRelease());
     const output: string[] = [];
     const dependencies = {
       data,
@@ -183,12 +195,81 @@ describe("unified control-plane data", () => {
     expect(output).toContain("Registration token: admin-cli-token");
     expect(output).toContain("Expires at: 2026-07-13T13:30:00.000Z");
     expect(output.at(-1)).toContain(
-      "curl -fsSL https://control.quoteops.example/api/install/$QUOTEOPS_REGISTRATION_TOKEN | bash"
+      'curl --proto "=https" --proto-redir "=https" --tlsv1.2'
     );
-    expect(await data.getRegistrationToken("admin-cli-token")).toMatchObject({
+    expect(await data.getRegistrationToken(sha256("admin-cli-token"))).toMatchObject({
       client_id: "PILOTO",
       installation_id: "piloto-prod-001",
       used_at: null
     });
   });
 });
+
+function createTestRelease(): ReleaseRecord {
+  const archiveBytes = Buffer.from("test-release-archive");
+  const image = (name: string, digit: string) =>
+    `${name}@sha256:${digit.repeat(64)}`;
+  const manifest = {
+    schema_version: 1 as const,
+    version: "v0.2.0",
+    git_sha: "b".repeat(40),
+    platform: "linux/amd64" as const,
+    images: {
+      agent: `agent:v0.2.0@sha256:${"1".repeat(64)}`,
+      api: `api:v0.2.0@sha256:${"2".repeat(64)}`,
+      web: `web:v0.2.0@sha256:${"3".repeat(64)}`,
+      postgres: image("postgres:16", "4"),
+      redis: image("redis:7", "5"),
+      caddy: image("caddy:2", "6"),
+      cloudflared: image("cloudflared:2025.7.0", "7")
+    },
+    files_sha256: { "install.sh": "8".repeat(64) },
+    created_at: "2026-07-13T12:00:00.000Z"
+  };
+  return {
+    version: manifest.version,
+    notes: "test",
+    bundle_sha256: sha256(archiveBytes),
+    manifest,
+    manifest_bytes: Buffer.from(`${JSON.stringify(manifest)}\n`),
+    archive_bytes: archiveBytes,
+    published_at: "2026-07-13T12:00:00.000Z"
+  };
+}
+
+function createTestToken(
+  token: string,
+  clientId: string,
+  installationId: string,
+  expiresAt: string,
+  release: ReleaseRecord
+): RegistrationTokenRecord {
+  const snapshot = {
+    client_id: clientId,
+    installation_id: installationId,
+    expires_at: expiresAt,
+    control_plane_url: "https://control.quoteops.example",
+    install_command: "sudo bash quoteops-bootstrap.sh",
+    release: {
+      version: release.version,
+      bundle_sha256: release.bundle_sha256
+    },
+    files: {}
+  };
+  return {
+    token,
+    client_id: clientId,
+    installation_id: installationId,
+    expires_at: expiresAt,
+    used_at: null,
+    release_version: release.version,
+    bundle_sha256: release.bundle_sha256,
+    install_pack_snapshot: snapshot,
+    pack_sha256: sha256(canonicalizeInstallPack(snapshot))
+  };
+}
+
+function sha256(value: string | Uint8Array): string {
+  return createHash("sha256").update(value).digest("hex");
+}
+import { createHash } from "node:crypto";

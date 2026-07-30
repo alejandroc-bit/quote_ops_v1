@@ -5,7 +5,9 @@ import {
   createMinimalClientRecord,
   type MinimalClientRecord
 } from "@quoteops/control-plane";
+import { parsePublishedApplianceRelease } from "@quoteops/shared";
 import {
+  canonicalizeInstallPack,
   createDefaultControlPlaneData,
   type ControlPlaneData,
   type RegistrationTokenRecord
@@ -69,24 +71,44 @@ export async function runAdminCli(
     const client = await data.getClient(parsed.positionals[0]!);
     if (!client) throw new Error(`Client not found: ${parsed.positionals[0]}`);
     ensureClientCanReceiveInstallPack(client);
+    const release = await data.latestRelease();
+    if (!release) throw new Error("No verified appliance release is available");
+    const publishedRelease = parsePublishedApplianceRelease({
+      manifest: release.manifest,
+      bundle_sha256: release.bundle_sha256
+    });
 
     const issuedAt = now();
-    const token: RegistrationTokenRecord = {
-      token: tokenGenerator(),
-      client_id: client.client_id,
-      installation_id: client.installation.installation_id,
-      expires_at: new Date(
-        issuedAt.getTime() + parsed.ttlMinutes * 60 * 1000
-      ).toISOString(),
-      used_at: null
-    };
-    await data.saveRegistrationToken(token);
+    const registrationToken = tokenGenerator();
+    const expiresAt = new Date(
+      issuedAt.getTime() + parsed.ttlMinutes * 60 * 1000
+    ).toISOString();
     const pack = createInstallPack({
       client,
       control_plane_url: controlPlaneUrl,
-      registration_token: token.token,
-      expires_at: token.expires_at
+      registration_token: registrationToken,
+      expires_at: expiresAt,
+      release: publishedRelease
     });
+    const {
+      registration_token: _registrationToken,
+      ...installPackSnapshot
+    } = pack;
+    const token: RegistrationTokenRecord = {
+      token: crypto.createHash("sha256").update(registrationToken).digest("hex"),
+      client_id: client.client_id,
+      installation_id: client.installation.installation_id,
+      expires_at: expiresAt,
+      used_at: null,
+      release_version: publishedRelease.manifest.version,
+      bundle_sha256: publishedRelease.bundle_sha256,
+      install_pack_snapshot: installPackSnapshot,
+      pack_sha256: crypto
+        .createHash("sha256")
+        .update(canonicalizeInstallPack(installPackSnapshot))
+        .digest("hex")
+    };
+    await data.saveRegistrationToken(token);
 
     writeLine(`Registration token: ${pack.registration_token}`);
     writeLine(`Expires at: ${pack.expires_at}`);

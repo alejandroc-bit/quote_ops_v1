@@ -5,6 +5,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import { parse as parseYaml } from "yaml";
+import type { PublishedApplianceRelease } from "@quoteops/shared";
 import {
   createInstallPack,
   createMinimalClientRecord
@@ -12,6 +13,28 @@ import {
 
 const tempDirs: string[] = [];
 const repoDir = fileURLToPath(new URL("../../../", import.meta.url));
+const release: PublishedApplianceRelease = {
+  manifest: {
+    schema_version: 1,
+    version: "v0.2.0",
+    git_sha: "b".repeat(40),
+    platform: "linux/amd64",
+    images: {
+      agent: `quoteops-agent:v0.2.0@sha256:${"1".repeat(64)}`,
+      api: `quoteops-api:v0.2.0@sha256:${"2".repeat(64)}`,
+      web: `quoteops-web:v0.2.0@sha256:${"3".repeat(64)}`,
+      postgres: `postgres:16@sha256:${"4".repeat(64)}`,
+      redis: `redis:7@sha256:${"5".repeat(64)}`,
+      caddy: `caddy:2@sha256:${"6".repeat(64)}`,
+      cloudflared: `cloudflare/cloudflared:2025.7.0@sha256:${"7".repeat(64)}`
+    },
+    files_sha256: {
+      "install.sh": "8".repeat(64)
+    },
+    created_at: "2026-06-25T12:00:00.000Z"
+  },
+  bundle_sha256: "a".repeat(64)
+};
 
 afterEach(async () => {
   await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
@@ -30,7 +53,8 @@ describe("generated install pack", () => {
       client,
       control_plane_url: "https://quoteops-control-plane.vercel.app/",
       registration_token: "registration-token-install-test",
-      expires_at: "2026-06-25T13:00:00.000Z"
+      expires_at: "2026-06-25T13:00:00.000Z",
+      release
     });
     const workDir = await mkdtemp(join(tmpdir(), "quoteops-generated-pack-"));
     tempDirs.push(workDir);
@@ -85,6 +109,19 @@ describe("generated install pack", () => {
     expect(installedAgentConfig).toContain("api_key_env: OPENROUTER_API_KEY");
     expect(installedTmsAdapter).toContain("provider: file_import");
     expect(installedRfqs).toContain("rfq_id,lane_id");
+    expect(pack.release).toEqual({
+      version: "v0.2.0",
+      bundle_sha256: "a".repeat(64)
+    });
+    expect(pack.install_command).toContain(
+      'curl --proto "=https" --proto-redir "=https" --tlsv1.2'
+    );
+    expect(pack.install_command).toContain(
+      `${pack.control_plane_url}/install/quoteops`
+    );
+    expect(pack.install_command).toContain("sudo bash");
+    expect(pack.install_command).not.toContain("|");
+    expect(pack.install_command).not.toContain(pack.registration_token);
 
     // 10-jul E2E regression: the pack shipped without the unit CSVs and
     // sync-units died with "env var is missing: QUOTEOPS_TMS_UNITS_PATH".

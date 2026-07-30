@@ -8,6 +8,8 @@ import {
 } from "@quoteops/control-plane";
 import {
   maxSemver,
+  validateRegistrationTokenRecord,
+  validateReleaseRecord,
   type ControlPlaneData,
   type PortalProfile,
   type RegistrationTokenRecord,
@@ -80,6 +82,26 @@ export function createPostgresControlPlaneData(
     ssl: sslConfigFor(options.connectionString),
     allowExitOnIdle: true
   });
+  let task2SchemaReady: Promise<void> | null = null;
+
+  function ensureTask2Schema(): Promise<void> {
+    task2SchemaReady ??= pool
+      .query(`
+        alter table registration_tokens add column if not exists release_version text;
+        alter table registration_tokens add column if not exists bundle_sha256 text;
+        alter table registration_tokens add column if not exists install_pack jsonb;
+        alter table registration_tokens add column if not exists pack_sha256 text;
+        alter table releases add column if not exists bundle_sha256 text;
+        alter table releases add column if not exists manifest jsonb;
+        alter table releases add column if not exists manifest_bytes bytea;
+        alter table releases add column if not exists archive bytea;
+        alter table releases add column if not exists published_at timestamptz default now();
+        create unique index if not exists releases_bundle_sha256_unique
+          on releases (bundle_sha256) where bundle_sha256 is not null;
+      `)
+      .then(() => undefined);
+    return task2SchemaReady;
+  }
 
   async function queryClients(
     where = "",
@@ -190,37 +212,61 @@ export function createPostgresControlPlaneData(
       }
     },
     async saveRegistrationToken(token) {
+      await ensureTask2Schema();
+      const valid = validateRegistrationTokenRecord(token);
       const result = await pool.query<RegistrationTokenRecord>(
         `insert into registration_tokens (
-           token, tenant_id, installation_id, expires_at, used_at
+           token, tenant_id, installation_id, expires_at, used_at,
+           release_version, bundle_sha256, install_pack, pack_sha256
          )
-         select $1, t.id, i.installation_id, $4, $5
+         select $1, t.id, i.installation_id, $4, $5, $6, $7, $8::jsonb, $9
          from tenants t
          inner join installations i on i.tenant_id = t.id
          where t.client_id = $2 and i.installation_id = $3
          on conflict (token) do update set
            tenant_id = excluded.tenant_id,
-           installation_id = excluded.installation_id,
-           expires_at = excluded.expires_at,
-           used_at = excluded.used_at
-         returning token, $2::text as client_id, installation_id,
-                   expires_at::text, used_at::text`,
-        [token.token, normalizeClientId(token.client_id), token.installation_id, token.expires_at, token.used_at]
+            installation_id = excluded.installation_id,
+            expires_at = excluded.expires_at,
+            used_at = excluded.used_at,
+            release_version = excluded.release_version,
+            bundle_sha256 = excluded.bundle_sha256,
+            install_pack = excluded.install_pack,
+            pack_sha256 = excluded.pack_sha256
+          returning token, $2::text as client_id, installation_id,
+                    expires_at::text, used_at::text, release_version,
+                    bundle_sha256, install_pack as install_pack_snapshot,
+                    pack_sha256`,
+        [
+          valid.token,
+          normalizeClientId(valid.client_id),
+          valid.installation_id,
+          valid.expires_at,
+          valid.used_at,
+          valid.release_version,
+          valid.bundle_sha256,
+          JSON.stringify(valid.install_pack_snapshot),
+          valid.pack_sha256
+        ]
       );
       const saved = result.rows[0];
       if (!saved) throw new Error("installation_not_provisioned");
-      return saved;
+      return validateRegistrationTokenRecord(saved);
     },
     async getRegistrationToken(token) {
+      await ensureTask2Schema();
       const result = await pool.query<RegistrationTokenRecord>(
         `select rt.token, t.client_id, rt.installation_id,
-                rt.expires_at::text, rt.used_at::text
+                 rt.expires_at::text, rt.used_at::text,
+                 rt.release_version, rt.bundle_sha256,
+                 rt.install_pack as install_pack_snapshot, rt.pack_sha256
          from registration_tokens rt
          inner join tenants t on t.id = rt.tenant_id
          where rt.token = $1`,
         [token]
       );
-      return result.rows[0] ?? null;
+      return result.rows[0]
+        ? validateRegistrationTokenRecord(result.rows[0])
+        : null;
     },
     async markRegistrationTokenUsed(token, usedAt) {
       const result = await pool.query(
@@ -230,16 +276,29 @@ export function createPostgresControlPlaneData(
       if (result.rowCount !== 1) throw new Error("registration_token_not_found");
     },
     async resolveTenantByToken(token) {
-      const result = await pool.query<TenantToken>(
-        `select rt.tenant_id::text, rt.installation_id
-         from registration_tokens rt
-         inner join installations i
-           on i.tenant_id = rt.tenant_id
+      await ensureTask2Schema();
+      const result = await pool.query<
+        RegistrationTokenRecord & TenantToken
+      >(
+        `select rt.token, rt.tenant_id::text, t.client_id,
+                rt.installation_id, rt.expires_at::text, rt.used_at::text,
+                rt.release_version, rt.bundle_sha256,
+                rt.install_pack as install_pack_snapshot, rt.pack_sha256
+          from registration_tokens rt
+          inner join tenants t on t.id = rt.tenant_id
+          inner join installations i
+            on i.tenant_id = rt.tenant_id
           and i.installation_id = rt.installation_id
          where rt.token = $1 and (rt.used_at is not null or rt.expires_at > now())`,
-        [token]
+         [token]
       );
-      return result.rows[0] ?? null;
+      const row = result.rows[0];
+      if (!row) return null;
+      validateRegistrationTokenRecord(row);
+      return {
+        tenant_id: row.tenant_id,
+        installation_id: row.installation_id
+      };
     },
     async claimPortalProfile(input) {
       const existing = await pool.query<PortalProfile>(
@@ -311,9 +370,59 @@ export function createPostgresControlPlaneData(
       );
     },
     async latestRelease() {
-      const result = await pool.query<ReleaseRecord>("select version, notes from releases");
+      await ensureTask2Schema();
+      const result = await pool.query<ReleaseRecord>(
+        `select version, notes, bundle_sha256, manifest, manifest_bytes,
+                archive as archive_bytes, published_at::text
+         from releases`
+      );
       const version = maxSemver(result.rows.map((release) => release.version));
-      return result.rows.find((release) => release.version === version) ?? null;
+      const release = result.rows.find((candidate) => candidate.version === version);
+      return release ? validateReleaseRecord(release) : null;
+    },
+    async getRelease(version) {
+      await ensureTask2Schema();
+      const result = await pool.query<ReleaseRecord>(
+        `select version, notes, bundle_sha256, manifest, manifest_bytes,
+                archive as archive_bytes, published_at::text
+         from releases where version = $1`,
+        [version]
+      );
+      return result.rows[0] ? validateReleaseRecord(result.rows[0]) : null;
+    },
+    async upsertRelease(release) {
+      await ensureTask2Schema();
+      const valid = validateReleaseRecord(release);
+      try {
+        const result = await pool.query<ReleaseRecord>(
+          `insert into releases (
+             version, notes, bundle_sha256, manifest, manifest_bytes, archive, published_at
+           ) values ($1, $2, $3, $4::jsonb, $5, $6, $7)
+           on conflict (version) do nothing
+           returning version, notes, bundle_sha256, manifest, manifest_bytes,
+                     archive as archive_bytes, published_at::text`,
+          [
+            valid.version,
+            valid.notes,
+            valid.bundle_sha256,
+            JSON.stringify(valid.manifest),
+            Buffer.from(valid.manifest_bytes),
+            Buffer.from(valid.archive_bytes),
+            valid.published_at
+          ]
+        );
+        if (result.rows[0]) return validateReleaseRecord(result.rows[0]);
+      } catch (error) {
+        if ((error as { code?: string }).code === "23505") {
+          throw new Error("release_bundle_immutable");
+        }
+        throw error;
+      }
+      const current = await this.getRelease(valid.version);
+      if (!current || current.bundle_sha256 !== valid.bundle_sha256) {
+        throw new Error("release_version_immutable");
+      }
+      return current;
     },
     async getInstallationSettings(installationId) {
       const result = await pool.query<{ settings: Record<string, unknown> }>(
