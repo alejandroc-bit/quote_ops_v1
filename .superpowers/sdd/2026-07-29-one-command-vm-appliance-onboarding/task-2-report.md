@@ -115,3 +115,20 @@ npm test -- --run
 Exact result: `FULL_SUITE_PASS`; 46 test files passed; 400 tests passed; duration 3.19 s.
 
 The prior full-suite concern is resolved; Task 2 is review-ready.
+
+## Fix Round 1
+
+### Changes
+
+- `apps/control-plane-api/src/installerScript.ts`: the renderer now intersects the verified archive inventory with the client overlay and rejects `install_pack_runtime_collision` before generating the self-extractor. Archive paths containing ASCII control characters, including newlines, are rejected before names can enter shell inventory syntax.
+- `apps/control-plane-api/src/data/file.ts`: file-store serialization now validates complete pinned token rows but preserves incomplete legacy rows byte-for-JSON-value instead of filtering them out. Accessing an incomplete row still fails closed with `registration_token_reissue_required`.
+- `apps/control-plane-api/tests/control-plane-api.test.ts`: added an archive-side `client-manifest.yaml` collision regression and a newline plus fixed-heredoc-delimiter injection regression that proves rendering throws before script generation.
+- `apps/control-plane-api/tests/data.test.ts`: added an unrelated client rewrite regression that proves the legacy token row remains persisted and migration-specific access fails with `registration_token_reissue_required`.
+
+### Covering command
+
+```bash
+npx vitest run apps/control-plane-api/tests/control-plane-api.test.ts apps/control-plane-api/tests/data.test.ts
+```
+
+Relevant output: `COVERING_PASS`; 2 test files passed; 47 tests passed; duration 492 ms.

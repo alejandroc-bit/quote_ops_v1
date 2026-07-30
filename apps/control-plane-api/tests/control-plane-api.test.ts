@@ -439,6 +439,33 @@ describe("minimal control-plane API", () => {
     }
   );
 
+  it("rejects a client overlay that collides with an archive runtime entry", async () => {
+    const data = createInMemoryControlPlaneData();
+    await data.upsertRelease(
+      await createTestRelease("v0.2.0", "runtime-collision", {
+        "client-manifest.yaml": "runtime-owned\n"
+      })
+    );
+    const api = await startApi({
+      data,
+      tokenGenerator: () => "runtime-collision-token",
+      now: () => new Date("2026-06-25T12:00:00.000Z")
+    });
+    await api.post("/api/admin/clients", {
+      client_id: "COLLISION",
+      legal_name: "Collision Client",
+      authorized_email: "ops@collision.example"
+    });
+    await api.post("/api/admin/clients/COLLISION/install-pack", {});
+
+    const response = await api.getText(
+      "/api/install",
+      "Bearer runtime-collision-token"
+    );
+    expect(response.status).toBe(503);
+    expect(response.text).not.toContain("#!/usr/bin/env bash");
+  });
+
   it("stops on a corrupted embedded archive before invoking install.sh", async () => {
     const data = createInMemoryControlPlaneData();
     await data.upsertRelease(await createTestRelease("v0.2.0", "must-not-run"));
@@ -1199,6 +1226,37 @@ describe("minimal control-plane API", () => {
     ).toThrow();
   });
 
+  it("rejects newline and heredoc-delimiter archive-name injection before rendering", async () => {
+    const release = await createTestRelease("v0.2.0", "heredoc-injection");
+    const archiveBytes = await createTarGzip([
+      {
+        name: "release.json\nQUOTEOPS_EXPECTED_NAMES",
+        contents: "{}\n"
+      }
+    ]);
+    const bundleSha256 = sha256(archiveBytes);
+    expect(() =>
+      renderInstallerScript({
+        pack: {
+          client_id: "INJECT",
+          installation_id: "inject-prod-001",
+          expires_at: "2026-06-25T13:00:00.000Z",
+          control_plane_url:
+            "https://quoteops-control-plane-staging.vercel.app",
+          install_command: "sudo bash quoteops-bootstrap.sh",
+          release: {
+            version: release.version,
+            bundle_sha256: bundleSha256
+          },
+          files: {}
+        },
+        archiveBytes,
+        bundleSha256,
+        manifest: release.manifest
+      })
+    ).toThrow("unsafe_archive_path");
+  });
+
   it("enforces the raw release and rendered installer size caps", async () => {
     const exactData = createInMemoryControlPlaneData();
     const exact = await createTestRelease("v0.2.0", "exact-cap");
@@ -1429,7 +1487,8 @@ async function startApi(options: {
 
 async function createTestRelease(
   version: string,
-  marker: string
+  marker: string,
+  runtimeFiles: Record<string, string> = {}
 ): Promise<ReleaseRecord> {
   const imageDigest = (digit: string) => digit.repeat(64);
   const releaseEnv = [
@@ -1448,7 +1507,8 @@ async function createTestRelease(
     "Caddyfile": `# ${marker}\n`,
     "docker-compose.yml": `# ${marker}\nservices: {}\n`,
     "install.sh": `#!/usr/bin/env bash\nset -euo pipefail\nprintf '%s\\n' '${marker}'\n`,
-    "release.env": releaseEnv
+    "release.env": releaseEnv,
+    ...runtimeFiles
   };
   const manifest = {
     schema_version: 1 as const,

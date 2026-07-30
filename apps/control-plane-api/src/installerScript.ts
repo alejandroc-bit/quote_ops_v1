@@ -143,12 +143,12 @@ export function renderInstallerScript({
   ) {
     throw new Error("install_pack_release_mismatch");
   }
-  validateOverlayFiles(pack.files);
   const archive = validateReleaseArchive({
     archiveBytes,
     bundleSha256,
     manifest
   });
+  validateOverlayFiles(pack.files, new Set(archive.keys()));
   const archiveNames = [...archive.keys()].sort();
   const overlayWrites = Object.entries(pack.files)
     .sort(([a], [b]) => a.localeCompare(b))
@@ -265,12 +265,18 @@ exit "$child_status"
   return script;
 }
 
-function validateOverlayFiles(files: Record<string, string>): void {
+function validateOverlayFiles(
+  files: Record<string, string>,
+  archiveNames: ReadonlySet<string>
+): void {
   const seen = new Set<string>();
   for (const [name, contents] of Object.entries(files)) {
     validateArchivePath(name);
     if (!CLIENT_OVERLAY_FILES.has(name)) {
       throw new Error(`install_pack_file_not_allowed:${name}`);
+    }
+    if (archiveNames.has(name)) {
+      throw new Error(`install_pack_runtime_collision:${name}`);
     }
     if (seen.has(name)) throw new Error(`install_pack_file_duplicate:${name}`);
     if (typeof contents !== "string") {
@@ -368,6 +374,7 @@ function readTarOctal(
 function validateArchivePath(name: string): void {
   if (
     !name ||
+    /[\x00-\x1f\x7f]/.test(name) ||
     name.startsWith("/") ||
     name.includes("\\") ||
     name.split("/").some((part) => !part || part === "." || part === "..")

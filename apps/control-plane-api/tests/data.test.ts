@@ -156,6 +156,49 @@ describe("unified control-plane data", () => {
     expect(await data.getInstallationSettings("file-prod-001")).toEqual({});
   });
 
+  it("preserves incomplete legacy token rows during unrelated file-store writes and requires reissue on access", async () => {
+    const directory = await mkdtemp(
+      join(tmpdir(), "quoteops-legacy-token-preservation-")
+    );
+    tempDirectories.push(directory);
+    const path = join(directory, "store.json");
+    const client = createMinimalClientRecord({
+      client_id: "LEGACY",
+      legal_name: "Legacy Client",
+      authorized_email: "owner@legacy.example",
+      created_at: "2026-07-13T12:00:00.000Z"
+    });
+    const legacyToken = {
+      token: "legacy-token-hash",
+      client_id: "LEGACY",
+      installation_id: "legacy-prod-001",
+      expires_at: "2026-07-13T13:00:00.000Z",
+      used_at: null
+    };
+    await writeFile(
+      path,
+      JSON.stringify({
+        clients: [client],
+        registration_tokens: [legacyToken],
+        releases: []
+      })
+    );
+
+    const data = createFileControlPlaneData(path);
+    await data.upsertClient({
+      ...client,
+      legal_name: "Legacy Client Updated"
+    });
+
+    const persisted = JSON.parse(await readFile(path, "utf8")) as {
+      registration_tokens: unknown[];
+    };
+    expect(persisted.registration_tokens).toEqual([legacyToken]);
+    await expect(
+      data.getRegistrationToken("legacy-token-hash")
+    ).rejects.toThrow("registration_token_reissue_required");
+  });
+
   it("selects the legacy-compatible file implementation from the default factory", async () => {
     const directory = await mkdtemp(join(tmpdir(), "quoteops-default-data-"));
     tempDirectories.push(directory);

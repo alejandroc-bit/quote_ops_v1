@@ -69,9 +69,11 @@ export function createFileControlPlaneData(path: string): ControlPlaneData {
     const tempPath = `${path}.tmp.${process.pid}`;
     const persisted: PersistedFileState = {
       clients: state.clients,
-      registration_tokens: state.registration_tokens
-        .filter(hasCompleteReleasePin)
-        .map((token) => validateRegistrationTokenRecord(token)),
+      registration_tokens: state.registration_tokens.map((token) =>
+        hasCompleteReleasePin(token)
+          ? validateRegistrationTokenRecord(token)
+          : token
+      ),
       releases: state.releases.map((release) => {
         const valid = validateReleaseRecord(release);
         return {
