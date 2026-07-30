@@ -189,3 +189,46 @@ git diff --check: clean
 ```
 
 The local Docker daemon remained unavailable, so real Docker-backed schema/config checks retained their documented skip. The new PostgreSQL state tests use a deterministic Docker CLI fixture for existing, absent, and indeterminate volume responses.
+
+## Fix Round 2
+
+### Finding Fixed
+
+When durable `POSTGRES_PASSWORD` is absent, `install.sh` now proves the exact `${COMPOSE_PROJECT_NAME}_postgres_data` volume is absent before accepting either a generated password or legacy `--postgres-password`. Existing and indeterminate volume states fail before writing the durable key. Legacy caller-supplied compatibility remains only for a known-fresh volume, and the value is never printed.
+
+Smoke fixtures now provide deterministic fresh-volume state for legacy direct-install compatibility. A dedicated regression supplies `--postgres-password` while the exact volume exists and proves the install fails, `client.env` receives no password key, and the supplied value is absent from captured output.
+
+### RED
+
+Command:
+
+```bash
+bash deploy/appliance/tests/smoke.sh
+```
+
+Observed before the fix:
+
+```text
+exit=1
+smoke.sh: legacy install accepted an explicit password for an existing PostgreSQL volume
+```
+
+### GREEN
+
+Commands:
+
+```bash
+bash -n deploy/appliance/install.sh
+bash -n deploy/appliance/tests/smoke.sh
+bash deploy/appliance/tests/smoke.sh
+```
+
+Observed:
+
+```text
+bash -n deploy/appliance/install.sh exit=0
+bash -n deploy/appliance/tests/smoke.sh exit=0
+bash deploy/appliance/tests/smoke.sh exit=0
+smoke.sh: docker daemon not available; checked schema constraints by grep
+smoke.sh: ok
+```

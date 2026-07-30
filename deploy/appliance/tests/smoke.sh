@@ -293,10 +293,24 @@ cat > "$INSTALL_TMS_MAPPING" <<'JSON'
 }
 JSON
 
+FRESH_VOLUME_MOCK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/quoteops-fresh-volume.XXXXXX")"
+TEMP_DIRS+=("$FRESH_VOLUME_MOCK_DIR")
+cat > "$FRESH_VOLUME_MOCK_DIR/docker" <<'SH'
+#!/usr/bin/env bash
+if [[ "$1" == "volume" && "${2:-}" == "inspect" ]]; then
+  exit 1
+fi
+if [[ "$1" == "volume" && "${2:-}" == "ls" ]]; then
+  exit 0
+fi
+exit 1
+SH
+chmod +x "$FRESH_VOLUME_MOCK_DIR/docker"
+
 install_guard_run() {
   local home_dir="$1"
   shift
-  bash "$APPLIANCE_DIR/install.sh" \
+  PATH="$FRESH_VOLUME_MOCK_DIR:$PATH" bash "$APPLIANCE_DIR/install.sh" \
     --client smoke \
     --manifest "$INSTALL_MANIFEST" \
     --connectors "$INSTALL_CONNECTORS_SRC" \
@@ -310,7 +324,7 @@ install_guard_run() {
 install_mapping_guard_run() {
   local home_dir="$1"
   shift
-  bash "$APPLIANCE_DIR/install.sh" \
+  PATH="$FRESH_VOLUME_MOCK_DIR:$PATH" bash "$APPLIANCE_DIR/install.sh" \
     --client smoke \
     --manifest "$INSTALL_MANIFEST" \
     --agent-config "$INSTALL_CONNECTORS_SRC/agent/agent-config.yaml" \
@@ -413,6 +427,12 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
   mkdir -p "$BOOTSTRAP_MOCK_DIR"
   cat > "$BOOTSTRAP_MOCK_DIR/docker" <<'SH'
 #!/usr/bin/env bash
+if [[ "$1" == "volume" && "${2:-}" == "inspect" ]]; then
+  exit 1
+fi
+if [[ "$1" == "volume" && "${2:-}" == "ls" ]]; then
+  exit 0
+fi
 exit 0
 SH
   cat > "$BOOTSTRAP_MOCK_DIR/curl" <<'SH'
@@ -490,7 +510,8 @@ SH
   grep -q 'rejects symlinks below the temporary root' "$SYMLINK_LOG" ||
     fail "bootstrap symlink rejection was not deterministic"
 
-  QUOTEOPS_BOOTSTRAP_TEST_MODE=macbook QUOTEOPS_BIN_DIR="$TEST_BIN_DIR" \
+  PATH="$BOOTSTRAP_MOCK_DIR:$PATH" \
+    QUOTEOPS_BOOTSTRAP_TEST_MODE=macbook QUOTEOPS_BIN_DIR="$TEST_BIN_DIR" \
     bash "$APPLIANCE_DIR/install.sh" \
       --client smoke \
       --manifest "$INSTALL_MANIFEST" \
@@ -517,7 +538,8 @@ SH
   SECOND_TOKEN_FILE="$E2E_ROOT/second-registration-token"
   printf '%s' "replacement-token-that-must-not-win-0123456789" > "$SECOND_TOKEN_FILE"
   chmod 600 "$SECOND_TOKEN_FILE"
-  QUOTEOPS_BOOTSTRAP_TEST_MODE=macbook QUOTEOPS_BIN_DIR="$TEST_BIN_DIR" \
+  PATH="$BOOTSTRAP_MOCK_DIR:$PATH" \
+    QUOTEOPS_BOOTSTRAP_TEST_MODE=macbook QUOTEOPS_BIN_DIR="$TEST_BIN_DIR" \
     bash "$APPLIANCE_DIR/install.sh" \
       --client smoke \
       --manifest "$INSTALL_MANIFEST" \
@@ -601,6 +623,32 @@ for volume_state in exists unknown; do
     fail "install generated a PostgreSQL password after unsafe volume state $volume_state"
   fi
 done
+
+EXPLICIT_VOLUME_HOME="$INSTALL_GUARD_DIR/volume-existing-explicit-home"
+EXPLICIT_VOLUME_LOG="$INSTALL_GUARD_DIR/volume-existing-explicit.log"
+: > "$MOCK_DOCKER_LOG"
+if PATH="$MOCK_DOCKER_DIR:$PATH" MOCK_DOCKER_LOG="$MOCK_DOCKER_LOG" \
+  MOCK_POSTGRES_VOLUME_STATE=exists \
+  bash "$APPLIANCE_DIR/install.sh" \
+    --client smoke \
+    --manifest "$INSTALL_MANIFEST" \
+    --connectors "$INSTALL_CONNECTORS_SRC" \
+    --home "$EXPLICIT_VOLUME_HOME" \
+    --skip-start \
+    --version v0.2.0 \
+    --postgres-password explicit-password-must-not-enter \
+    >"$EXPLICIT_VOLUME_LOG" 2>&1; then
+  fail "legacy install accepted an explicit password for an existing PostgreSQL volume"
+fi
+grep -q 'PostgreSQL data volume state is existing' "$EXPLICIT_VOLUME_LOG" ||
+  fail "legacy explicit-password install did not fail closed on existing PostgreSQL volume"
+if grep -q 'explicit-password-must-not-enter' "$EXPLICIT_VOLUME_LOG"; then
+  fail "legacy explicit PostgreSQL password reached log output"
+fi
+if [[ -f "$EXPLICIT_VOLUME_HOME/secrets/client.env" ]] &&
+   grep -q '^POSTGRES_PASSWORD=' "$EXPLICIT_VOLUME_HOME/secrets/client.env"; then
+  fail "legacy explicit password was written despite an existing PostgreSQL volume"
+fi
 
 VOLUME_ABSENT_HOME="$INSTALL_GUARD_DIR/volume-absent-home"
 VOLUME_ABSENT_LOG="$INSTALL_GUARD_DIR/volume-absent.log"

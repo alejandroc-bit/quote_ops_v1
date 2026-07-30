@@ -782,10 +782,10 @@ EXISTING_POSTGRES_PASSWORD="$(read_env_value POSTGRES_PASSWORD "$SECRETS_ENV_FIL
 if [[ -n "$EXISTING_POSTGRES_PASSWORD" ]]; then
   POSTGRES_PASSWORD="$EXISTING_POSTGRES_PASSWORD"
 else
+  POSTGRES_VOLUME_STATE="$(postgres_volume_state)"
+  [[ "$POSTGRES_VOLUME_STATE" == "absent" ]] ||
+    die "PostgreSQL data volume state is existing but client.env has no password; recovery is required"
   if [[ -z "$POSTGRES_PASSWORD" ]]; then
-    POSTGRES_VOLUME_STATE="$(postgres_volume_state)"
-    [[ "$POSTGRES_VOLUME_STATE" == "absent" ]] ||
-      die "PostgreSQL data volume state is existing but client.env has no password; recovery is required"
     POSTGRES_PASSWORD="$(generate_secret)"
   fi
   POSTGRES_PASSWORD="$(ensure_secret_key "$SECRETS_ENV_FILE" POSTGRES_PASSWORD "$POSTGRES_PASSWORD")"
