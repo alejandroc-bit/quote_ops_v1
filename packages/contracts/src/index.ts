@@ -5,3 +5,4 @@ export * from "./rfq.js";
 export * from "./runtimePolicy.js";
 export * from "./tms.js";
 export * from "./tmsCanonical.js";
+export * from "./tmsHttpV1.js";

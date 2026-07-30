@@ -23,7 +23,15 @@
  *  - Writebacks de cotización/estatus (en memoria, inspeccionables por GET).
  */
 import { createServer } from "node:http";
+import { lstat, readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
+import {
+  TMS_HTTP_V1_CONTRACT,
+  TMS_HTTP_V1_PATHS,
+  tmsHttpV1HealthSchema,
+  tmsHttpV1HistoricalSearchRequestSchema,
+  writeQuoteInputSchema
+} from "@quoteops/contracts";
 
 // ── Dataset ──────────────────────────────────────────────────────────────────
 
@@ -87,9 +95,6 @@ const LIQUIDATIONS = [
   liq("LIQ-0009", "Ciudad de Mexico", "Ciudad de Mexico", "Guadalajara", "Jalisco", "T3S2_53_DRYVAN", "autopartes", "automotriz", 15000, "cuota", "2026-05-02", 30800, 17900, 2100),
   liq("LIQ-0010", "Ciudad de Mexico", "Ciudad de Mexico", "Guadalajara", "Jalisco", "T3S2_53_DRYVAN", "autopartes", "automotriz", 15000, "cuota", "2026-06-11", 31650, 18300, 2130)
 ];
-
-const quoteWritebacks = [];
-const statusWritebacks = [];
 
 // ── Análisis histórico por capas (idéntico a historicalAnalysis.ts) ─────────
 
@@ -203,11 +208,129 @@ async function readBody(req) {
   return raw ? JSON.parse(raw) : {};
 }
 
-export function createMockTmsServer() {
+const V1_PREFIX = "/quoteops/v1";
+const V1_HEALTH = TMS_HTTP_V1_PATHS.health;
+const V1_HISTORICAL_QUOTES = TMS_HTTP_V1_PATHS.historical_quotes;
+const V1_UNITS = TMS_HTTP_V1_PATHS.units;
+const V1_UNIT_PERFORMANCE = TMS_HTTP_V1_PATHS.unit_performance;
+const V1_AVAILABILITY_ZONES = TMS_HTTP_V1_PATHS.availability_zones;
+const V1_QUOTES = TMS_HTTP_V1_PATHS.write_quote;
+
+const V1_HEALTH_BODY = tmsHttpV1HealthSchema.parse({
+  ok: true,
+  status: "ok",
+  contract_version: TMS_HTTP_V1_CONTRACT,
+  capabilities: {
+    historical_quotes: true,
+    units: true,
+    unit_performance: true,
+    availability_zones: true,
+    write_quote: true
+  }
+});
+
+const toV1HistoricalQuote = (row) => ({
+  quote_id: row.liquidation_id,
+  origin_city: row.origin_city,
+  origin_state: row.origin_state,
+  origin_country: row.origin_country,
+  destination_city: row.destination_city,
+  destination_state: row.destination_state,
+  destination_country: row.destination_country,
+  vehicle_profile_id: row.vehicle_profile_id,
+  equipment_request: row.equipment_request ?? null,
+  commodity: row.commodity ?? null,
+  commodity_category: row.commodity_category ?? null,
+  sector: row.sector ?? null,
+  weight_kg: row.weight_kg ?? null,
+  rate_mxn: row.rate_mxn,
+  direct_cost_mxn: row.direct_cost_mxn ?? null,
+  margin_pct: row.margin_pct ?? null,
+  quoted_at: `${row.quoted_at}T00:00:00.000Z`,
+  service_type: row.service_type ?? null,
+  status: row.status ?? null
+});
+
+export function createMockTmsServer({ token } = {}) {
+  const quoteWritebacks = [];
+  const statusWritebacks = [];
+  const canonicalQuotes = new Map();
+
   return createServer(async (req, res) => {
     const url = new URL(req.url ?? "/", "http://mock");
     const path = url.pathname.replace(/\/+$/, "") || "/";
     try {
+      if (isProtectedRoute(path) && !hasValidBearerToken(req, token)) {
+        return v1Error(res, 401, "unauthorized", "Bearer token is required");
+      }
+      if (req.method === "GET" && path === V1_HEALTH) {
+        return json(res, 200, V1_HEALTH_BODY);
+      }
+      if (req.method === "GET" && path === V1_UNITS) {
+        return json(res, 200, UNITS);
+      }
+      if (req.method === "GET" && path === V1_UNIT_PERFORMANCE) {
+        return json(res, 200, PERFORMANCE);
+      }
+      if (req.method === "GET" && path === V1_AVAILABILITY_ZONES) {
+        return json(res, 200, AVAILABILITY_ZONES);
+      }
+      if (req.method === "POST" && path === V1_HISTORICAL_QUOTES) {
+        const parsed = tmsHttpV1HistoricalSearchRequestSchema.safeParse(
+          await readBody(req)
+        );
+        if (!parsed.success) {
+          return v1Error(
+            res,
+            400,
+            "invalid_request",
+            "Request body failed schema validation"
+          );
+        }
+        const input = parsed.data;
+        const limit =
+          Number.isInteger(input.max_results) && input.max_results > 0
+            ? input.max_results
+            : LIQUIDATIONS.length;
+        return json(
+          res,
+          200,
+          LIQUIDATIONS.slice(0, limit).map(toV1HistoricalQuote)
+        );
+      }
+      if (req.method === "POST" && path === V1_QUOTES) {
+        const parsed = writeQuoteInputSchema.safeParse(await readBody(req));
+        if (!parsed.success) {
+          return v1Error(
+            res,
+            400,
+            "invalid_request",
+            "Request body failed schema validation"
+          );
+        }
+
+        const canonicalBody = JSON.stringify(canonicalize(parsed.data));
+        const existing = canonicalQuotes.get(parsed.data.quote_id);
+        if (existing) {
+          if (existing.canonicalBody === canonicalBody) {
+            return json(res, 200, existing.response);
+          }
+          return v1Error(
+            res,
+            409,
+            "quote_id_conflict",
+            "quote_id was already used with a different body"
+          );
+        }
+
+        const response = { quote_id: parsed.data.quote_id, status: "written" };
+        canonicalQuotes.set(parsed.data.quote_id, { canonicalBody, response });
+        quoteWritebacks.push({
+          ...parsed.data,
+          received_at: new Date().toISOString()
+        });
+        return json(res, 200, response);
+      }
       if (req.method === "GET" && path === "/health") {
         return json(res, 200, { ok: true, service: "mock-tms", liquidations: LIQUIDATIONS.length, units: UNITS.length });
       }
@@ -246,14 +369,108 @@ export function createMockTmsServer() {
       if (req.method === "GET" && path === "/status-writebacks") return json(res, 200, statusWritebacks);
       return json(res, 404, { error: "not_found", path });
     } catch (error) {
+      if (path.startsWith(`${V1_PREFIX}/`) || path === V1_PREFIX) {
+        if (error instanceof SyntaxError) {
+          return v1Error(res, 400, "invalid_request", "Request body is not valid JSON");
+        }
+        return v1Error(res, 500, "mock_tms_error", "Mock TMS request failed");
+      }
       return json(res, 500, { error: "mock_tms_error", message: error instanceof Error ? error.message : String(error) });
     }
   });
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
+  void startCli();
+}
+
+function isProtectedRoute(path) {
+  return (
+    path === V1_PREFIX ||
+    path.startsWith(`${V1_PREFIX}/`) ||
+    path === "/quote-writebacks" ||
+    path === "/status-writebacks"
+  );
+}
+
+function hasValidBearerToken(req, token) {
+  return (
+    typeof token === "string" &&
+    token.length > 0 &&
+    req.headers.authorization === `Bearer ${token}`
+  );
+}
+
+function v1Error(res, status, error, message) {
+  return json(res, status, { error, message });
+}
+
+function canonicalize(value) {
+  if (Array.isArray(value)) {
+    return value.map((item) => canonicalize(item));
+  }
+  if (value !== null && typeof value === "object") {
+    return Object.fromEntries(
+      Object.keys(value)
+        .sort()
+        .map((key) => [key, canonicalize(value[key])])
+    );
+  }
+  return value;
+}
+
+async function startCli() {
   const port = Number(process.env.PORT || 8099);
-  createMockTmsServer().listen(port, "0.0.0.0", () => {
-    console.log(`[mock-tms] listening on :${port} — ${LIQUIDATIONS.length} liquidaciones, ${UNITS.length} unidades NOM`);
-  });
+  const host = process.env.MOCK_TMS_HOST || "0.0.0.0";
+  try {
+    const token = await readCliToken(process.env.MOCK_TMS_TOKEN_FILE);
+    createMockTmsServer({ token }).listen(port, host, () => {
+      console.log(`[mock-tms] listening on ${host}:${port} — ${LIQUIDATIONS.length} liquidaciones, ${UNITS.length} unidades NOM`);
+    });
+  } catch (error) {
+    console.error(
+      `[mock-tms] startup failed: ${
+        error instanceof Error ? error.message : "invalid token configuration"
+      }`
+    );
+    process.exitCode = 1;
+  }
+}
+
+async function readCliToken(tokenFile) {
+  if (!tokenFile) {
+    throw new Error("MOCK_TMS_TOKEN_FILE is required");
+  }
+
+  let stat;
+  try {
+    stat = await lstat(tokenFile);
+  } catch {
+    throw new Error("MOCK_TMS_TOKEN_FILE is not readable");
+  }
+
+  const processUid =
+    typeof process.getuid === "function" ? process.getuid() : undefined;
+  if (
+    stat.isSymbolicLink() ||
+    !stat.isFile() ||
+    (stat.mode & 0o777) !== 0o600 ||
+    processUid === undefined ||
+    stat.uid !== processUid
+  ) {
+    throw new Error(
+      "MOCK_TMS_TOKEN_FILE must be a regular, non-symlink 0600 file owned by the process user"
+    );
+  }
+
+  let token;
+  try {
+    token = (await readFile(tokenFile, "utf8")).trim();
+  } catch {
+    throw new Error("MOCK_TMS_TOKEN_FILE is not readable");
+  }
+  if (!token) {
+    throw new Error("MOCK_TMS_TOKEN_FILE must not be empty");
+  }
+  return token;
 }

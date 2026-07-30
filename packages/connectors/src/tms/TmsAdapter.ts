@@ -4,11 +4,11 @@ import type {
   HealthCheckResult,
   HistoricalAnalysis,
   Rfq,
-  RfqLocation,
   Shipment,
   TmsCanonicalAvailabilityZone,
   TmsCanonicalPerformance,
   TmsCanonicalUnit,
+  TmsHttpV1HistoricalSearchRequest,
   UnitPosition,
   WriteQuoteInput,
   WriteQuoteResult,
@@ -36,29 +36,7 @@ export interface TmsAdapterHealthResult extends HealthCheckResult {
   capabilities: TmsAdapterCapabilities;
 }
 
-export interface HistoricalSearchQuery {
-  request_id: string;
-  origin: RfqLocation;
-  destination: RfqLocation;
-  vehicle_profile_id?: string | null;
-  equipment_request?: string | null;
-  customer_id?: string | null;
-  customer_type?: string | null;
-  cargo?: {
-    commodity?: string | null;
-    commodity_category?: string | null;
-    sector?: string | null;
-    weight_kg?: number | null;
-    hazmat?: boolean | null;
-    temperature_controlled?: boolean | null;
-  };
-  service_type?: string | null;
-  time_window: {
-    from: string;
-    to: string;
-  };
-  max_results?: number;
-}
+export type HistoricalSearchQuery = TmsHttpV1HistoricalSearchRequest;
 
 export interface ListNewRfqsQuery {
   received_after?: string;
