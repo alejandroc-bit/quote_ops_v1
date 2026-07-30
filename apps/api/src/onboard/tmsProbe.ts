@@ -1,13 +1,10 @@
 import { createHash, randomUUID } from "node:crypto";
-import { resolve4, resolve6 } from "node:dns/promises";
 import {
   mkdir,
+  readdir,
   readFile,
-  readlink,
-  symlink,
-  unlink
+  rmdir
 } from "node:fs/promises";
-import { isIP } from "node:net";
 import {
   historicalAnalysisSchema,
   TMS_HTTP_V1_CONTRACT,
@@ -27,10 +24,6 @@ import {
 import { z } from "zod";
 import { join } from "node:path";
 import {
-  isPublicInternetAddress,
-  validatePublicHostname
-} from "./cloudflareStep.js";
-import {
   atomicWriteJson,
   atomicWriteText,
   buildTmsAdapterYaml,
@@ -44,6 +37,8 @@ import {
   createPinnedTmsTransport,
   createTmsAbsoluteDeadline,
   type PinnedTmsRequestExecutor,
+  type PinnedTmsTransport,
+  TmsTransportError,
   type TmsAbsoluteDeadline
 } from "./tmsSafeTransport.js";
 
@@ -94,7 +89,8 @@ export type TmsProbeInput = {
   credentialRevision: number;
   receiptPath: string;
   sampleQuery: HistoricalSearchQuery;
-  fetch?: typeof fetch;
+  transport?: PinnedTmsTransport;
+  testPinnedRequest?: PinnedTmsRequestExecutor;
   now?: () => Date;
   resolveHostname?: (hostname: string) => Promise<string[]>;
   timeoutMs?: number;
@@ -119,7 +115,6 @@ export type ConfigureLegacyCustomHttpInput = {
 
 export type ConfigureTmsHttpV1Context = {
   env: Record<string, string | undefined>;
-  fetch: typeof fetch;
   paths: {
     clientSecretsFile: string;
     tmsAdapterConfigFile: string;
@@ -132,7 +127,7 @@ export type ConfigureTmsHttpV1Context = {
   answersRoot?: string;
   afterSecretOpen?: () => void | Promise<void>;
   afterAtomicRename?: (label: string) => void | Promise<void>;
-  pinnedRequest?: PinnedTmsRequestExecutor;
+  testPinnedRequest?: PinnedTmsRequestExecutor;
 };
 
 export class TmsProbeError extends Error {
@@ -285,7 +280,7 @@ async function configureTmsHttpGeneration<
     const transport = createPinnedTmsTransport({
       baseUrlOrigin: baseUrl,
       resolveHostname: context.resolveHostname,
-      request: context.pinnedRequest,
+      request: selectTestPinnedRequest(context.testPinnedRequest),
       maximumBodyBytes: DEFAULT_MAX_BODY_BYTES,
       acceptanceMode,
       deadline
@@ -302,7 +297,7 @@ async function configureTmsHttpGeneration<
       credentialRevision,
       receiptPath: context.paths.tmsProbeFile,
       sampleQuery: input.sampleQuery,
-      fetch: transport.fetch,
+      transport,
       resolveHostname: context.resolveHostname,
       now: context.now,
       timeoutMs: context.httpProbeTimeoutMs,
@@ -393,9 +388,25 @@ async function probeTmsHttpV1WithinDeadline(
   input: TmsProbeInput,
   deadline: TmsAbsoluteDeadline
 ): Promise<TmsHttpV1ProbeReceipt> {
-  const prepared = await prepareProbe(input, deadline);
+  const prepared = await prepareProbe(input);
   assertCanonicalV1Config(prepared.config);
-  const response = await fetchHealth(input, prepared.baseUrlOrigin, deadline);
+  const transport =
+    input.transport ??
+    createPinnedTmsTransport({
+      baseUrlOrigin: prepared.baseUrlOrigin,
+      resolveHostname: input.resolveHostname,
+      request: selectTestPinnedRequest(input.testPinnedRequest),
+      maximumBodyBytes:
+        input.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES,
+      acceptanceMode: input.acceptanceMode,
+      deadline
+    });
+  const response = await fetchHealth(
+    input,
+    transport,
+    prepared.baseUrlOrigin,
+    deadline
+  );
   if (response.status >= 300 && response.status < 400) {
     throw new TmsProbeError("health_redirect_rejected");
   }
@@ -470,7 +481,7 @@ async function probeLegacyCustomHttpWithinDeadline(
   input: TmsProbeInput,
   deadline: TmsAbsoluteDeadline
 ): Promise<LegacyCustomHttpProbeReceipt> {
-  const prepared = await prepareProbe(input, deadline);
+  const prepared = await prepareProbe(input);
   assertLegacyCustomConfig(prepared.config);
   const health = await boundedOperation(
     "legacy_health",
@@ -533,10 +544,7 @@ export async function hasMatchingTmsProbeReceipt(input: {
   }
 }
 
-async function prepareProbe(
-  input: TmsProbeInput,
-  deadline: TmsAbsoluteDeadline
-): Promise<{
+async function prepareProbe(input: TmsProbeInput): Promise<{
   baseUrlOrigin: string;
   adapterConfigSha256: string;
   config: TmsAdapterFactoryConfig;
@@ -556,12 +564,6 @@ async function prepareProbe(
   } catch {
     throw new TmsProbeError("base_url_invalid");
   }
-  await assertSafeOrigin(
-    new URL(baseUrlOrigin),
-    input.resolveHostname,
-    input.acceptanceMode,
-    deadline
-  );
   let config: TmsAdapterFactoryConfig;
   let configBytes: Buffer;
   try {
@@ -616,13 +618,14 @@ function assertLegacyCustomConfig(config: TmsAdapterFactoryConfig): void {
 
 async function fetchHealth(
   input: TmsProbeInput,
+  transport: PinnedTmsTransport,
   baseUrlOrigin: string,
   deadline: TmsAbsoluteDeadline
 ): Promise<Response> {
   try {
     return await boundedOperation(
       "health",
-      (input.fetch ?? fetch)(
+      transport.fetch(
         new URL(TMS_HTTP_V1_PATHS.health, `${baseUrlOrigin}/`),
         {
           method: "GET",
@@ -635,6 +638,15 @@ async function fetchHealth(
     );
   } catch (error) {
     if (error instanceof TmsProbeError) throw error;
+    if (error instanceof TmsTransportError) {
+      const code =
+        error.code === "response_body_too_large"
+          ? "health_body_too_large"
+          : error.code === "request_redirect_rejected"
+            ? "health_redirect_rejected"
+            : error.code;
+      throw new TmsProbeError(code);
+    }
     throw new TmsProbeError("health_unreachable");
   }
 }
@@ -783,47 +795,6 @@ async function readJsonBodyBounded(
   }
 }
 
-async function assertSafeOrigin(
-  url: URL,
-  resolver: ((hostname: string) => Promise<string[]>) | undefined,
-  acceptanceMode: string | undefined,
-  deadline: TmsAbsoluteDeadline
-): Promise<void> {
-  if (
-    acceptanceMode === "macbook" &&
-    url.origin === "http://host.docker.internal:19091"
-  ) {
-    return;
-  }
-  try {
-    if (isIP(url.hostname)) {
-      if (!isPublicInternetAddress(url.hostname)) {
-        throw new Error("unsafe");
-      }
-      return;
-    }
-    await boundedOperation(
-      "base_url_resolution",
-      validatePublicHostname(
-        url.hostname,
-        resolver ?? resolveInternetAddresses
-      ),
-      deadline
-    );
-  } catch (error) {
-    if (error instanceof TmsProbeError) throw error;
-    throw new TmsProbeError("base_url_unsafe");
-  }
-}
-
-async function resolveInternetAddresses(hostname: string): Promise<string[]> {
-  const [ipv4, ipv6] = await Promise.all([
-    resolve4(hostname).catch(() => []),
-    resolve6(hostname).catch(() => [])
-  ]);
-  return [...ipv4, ...ipv6];
-}
-
 function parseSafe<T>(
   schema: z.ZodType<T, z.ZodTypeDef, unknown>,
   value: unknown,
@@ -857,6 +828,16 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   );
 }
 
+function selectTestPinnedRequest(
+  request: PinnedTmsRequestExecutor | undefined
+): PinnedTmsRequestExecutor | undefined {
+  if (!request) return undefined;
+  if (process.env.NODE_ENV !== "test") {
+    throw new TmsProbeError("test_transport_forbidden");
+  }
+  return request;
+}
+
 export async function readTmsCredentialRevision(
   path: string
 ): Promise<number> {
@@ -879,53 +860,129 @@ async function acquireTmsConfigLock(
   settingsDir: string,
   deadline: TmsAbsoluteDeadline
 ): Promise<() => Promise<void>> {
-  const lockPath = join(settingsDir, "tms-config.lock");
-  await mkdir(settingsDir, { recursive: true, mode: 0o700 });
-  const owner = JSON.stringify({
-    schema_version: 1,
-    pid: process.pid,
-    token: randomUUID()
-  });
-  while (true) {
-    deadline.signal.throwIfAborted();
-    try {
-      await symlink(owner, lockPath);
-      return async () => {
-        const currentOwner = await readlink(lockPath).catch(() => "");
-        if (currentOwner === owner) {
-          await unlink(lockPath).catch(() => undefined);
-        }
-      };
-    } catch (error) {
-      if (!isFileExistsError(error)) throw error;
+  const lockDirectory = join(settingsDir, "tms-config-locks");
+  await mkdir(lockDirectory, { recursive: true, mode: 0o700 });
+  const token = randomUUID();
+  const choosingName = `choosing-${process.pid}-${token}`;
+  const choosingPath = join(lockDirectory, choosingName);
+  let ticketPath: string | undefined;
+  await mkdir(choosingPath, { mode: 0o700 });
+  try {
+    const snapshot = await readTmsLockEntries(lockDirectory);
+    const maximumTicket = snapshot.tickets.reduce(
+      (maximum, ticket) => Math.max(maximum, ticket.number),
+      0
+    );
+    if (maximumTicket >= Number.MAX_SAFE_INTEGER) {
+      throw new TmsProbeError("tms_config_lock_exhausted");
     }
+    const ticketNumber = maximumTicket + 1;
+    const ticketName =
+      `ticket-${String(ticketNumber).padStart(16, "0")}` +
+      `-${process.pid}-${token}`;
+    ticketPath = join(lockDirectory, ticketName);
+    await mkdir(ticketPath, { mode: 0o700 });
+    await rmdir(choosingPath);
 
-    const observedOwner = await readlink(lockPath).catch(() => "");
-    if (isAbandonedLockOwner(observedOwner)) {
-      const currentOwner = await readlink(lockPath).catch(() => "");
-      if (currentOwner === observedOwner) {
-        await unlink(lockPath).catch(() => undefined);
-        continue;
+    while (true) {
+      deadline.signal.throwIfAborted();
+      const entries = await readTmsLockEntries(lockDirectory);
+      const anotherOwnerChoosing = entries.choosing.some(
+        (entry) =>
+          entry.token !== token && isLockProcessAlive(entry.pid)
+      );
+      const earlierLiveTicket = entries.tickets.some(
+        (entry) =>
+          entry.token !== token &&
+          isLockProcessAlive(entry.pid) &&
+          compareLockTickets(
+            entry,
+            { number: ticketNumber, pid: process.pid, token }
+          ) < 0
+      );
+      if (!anotherOwnerChoosing && !earlierLiveTicket) {
+        const ownedTicketPath = ticketPath;
+        let released = false;
+        return async () => {
+          if (released) return;
+          released = true;
+          await rmdir(ownedTicketPath).catch((error) => {
+            if (!isFileMissingError(error)) throw error;
+          });
+        };
       }
+      await waitForLock(deadline.signal);
     }
-    await waitForLock(deadline.signal);
+  } catch (error) {
+    await rmdir(choosingPath).catch(() => undefined);
+    if (ticketPath) {
+      await rmdir(ticketPath).catch(() => undefined);
+    }
+    throw error;
   }
 }
 
-function isAbandonedLockOwner(rawOwner: string): boolean {
+type TmsChoosingEntry = {
+  pid: number;
+  token: string;
+};
+
+type TmsTicketEntry = TmsChoosingEntry & {
+  number: number;
+};
+
+async function readTmsLockEntries(lockDirectory: string): Promise<{
+  choosing: TmsChoosingEntry[];
+  tickets: TmsTicketEntry[];
+}> {
+  const choosing: TmsChoosingEntry[] = [];
+  const tickets: TmsTicketEntry[] = [];
+  const entries = await readdir(lockDirectory, {
+    withFileTypes: true
+  });
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const choosingMatch =
+      /^choosing-(\d+)-([A-Za-z0-9-]+)$/.exec(entry.name);
+    if (choosingMatch) {
+      choosing.push({
+        pid: Number(choosingMatch[1]),
+        token: choosingMatch[2] ?? ""
+      });
+      continue;
+    }
+    const ticketMatch =
+      /^ticket-(\d{16})-(\d+)-([A-Za-z0-9-]+)$/.exec(
+        entry.name
+      );
+    if (ticketMatch) {
+      tickets.push({
+        number: Number(ticketMatch[1]),
+        pid: Number(ticketMatch[2]),
+        token: ticketMatch[3] ?? ""
+      });
+    }
+  }
+  return { choosing, tickets };
+}
+
+function compareLockTickets(
+  left: TmsTicketEntry,
+  right: TmsTicketEntry
+): number {
+  if (left.number !== right.number) {
+    return left.number - right.number;
+  }
+  return left.token.localeCompare(right.token);
+}
+
+function isLockProcessAlive(pid: number): boolean {
+  if (!Number.isSafeInteger(pid) || pid < 1) return false;
   try {
-    const owner = JSON.parse(rawOwner) as { pid?: unknown };
-    if (!Number.isSafeInteger(owner.pid) || Number(owner.pid) < 1) {
-      return true;
-    }
-    try {
-      process.kill(Number(owner.pid), 0);
-      return false;
-    } catch (error) {
-      return isNoSuchProcessError(error);
-    }
-  } catch {
+    process.kill(pid, 0);
     return true;
+  } catch (error) {
+    return !isNoSuchProcessError(error);
   }
 }
 
@@ -945,12 +1002,12 @@ async function waitForLock(signal: AbortSignal): Promise<void> {
   });
 }
 
-function isFileExistsError(error: unknown): boolean {
+function isFileMissingError(error: unknown): boolean {
   return (
     typeof error === "object" &&
     error !== null &&
     "code" in error &&
-    error.code === "EEXIST"
+    error.code === "ENOENT"
   );
 }
 

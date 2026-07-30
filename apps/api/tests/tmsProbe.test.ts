@@ -1,6 +1,9 @@
 import { createHash } from "node:crypto";
+import { spawn } from "node:child_process";
 import {
+  mkdir,
   mkdtemp,
+  readdir,
   readFile,
   rm,
   stat,
@@ -24,6 +27,9 @@ import {
   TmsProbeError
 } from "../src/onboard/tmsProbe.js";
 import { readEnvFileValues } from "../src/onboard/onboardConfig.js";
+import type {
+  PinnedTmsRequest
+} from "../src/onboard/tmsSafeTransport.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -250,6 +256,103 @@ function canonicalFixtureFetch(): typeof fetch {
 }
 
 describe("probeTmsHttpV1", () => {
+  it("constructs its pinned transport when no fetch or transport is supplied", async () => {
+    const files = await fixtureFiles();
+    const requests: PinnedTmsRequest[] = [];
+
+    const receipt = await probeTmsHttpV1({
+      adapter: fixtureAdapter(),
+      resolvedBaseUrl: "https://does-not-resolve.invalid",
+      resolvedHeaders: {
+        authorization: "Bearer exported-probe-test-token"
+      },
+      adapterConfigPath: files.adapterConfigPath,
+      credentialRevision: 1,
+      receiptPath: files.receiptPath,
+      sampleQuery,
+      resolveHostname: async () => ["8.8.8.8"],
+      testPinnedRequest: async (request: PinnedTmsRequest) => {
+        requests.push(request);
+        return await healthFetch()(request.url, request.init);
+      }
+    });
+
+    expect(receipt.contract).toBe("quoteops-tms-http-v1");
+    expect(requests).toHaveLength(1);
+    expect(requests[0]?.url.hostname).toBe(
+      "does-not-resolve.invalid"
+    );
+    expect(requests[0]?.pinnedAddresses).toEqual(["8.8.8.8"]);
+  });
+
+  it("revalidates redirects in the exported probe and never sends Authorization after rebinding", async () => {
+    const files = await fixtureFiles();
+    const authorizationByRequest: Array<string | null> = [];
+    const resolver = vi
+      .fn()
+      .mockResolvedValueOnce(["8.8.8.8"])
+      .mockResolvedValueOnce(["127.0.0.1"]);
+    const request = vi.fn(async (input: PinnedTmsRequest) => {
+      authorizationByRequest.push(
+        new Headers(input.init.headers).get("authorization")
+      );
+      return new Response(null, {
+        status: 302,
+        headers: { location: "/quoteops/v1/health-again" }
+      });
+    });
+
+    await expect(
+      probeTmsHttpV1({
+        adapter: fixtureAdapter(),
+        resolvedBaseUrl: "https://does-not-resolve.invalid",
+        resolvedHeaders: {
+          authorization: "Bearer must-not-rebind"
+        },
+        adapterConfigPath: files.adapterConfigPath,
+        credentialRevision: 1,
+        receiptPath: files.receiptPath,
+        sampleQuery,
+        resolveHostname: resolver,
+        testPinnedRequest: request
+      })
+    ).rejects.toMatchObject({ code: "base_url_unsafe" });
+
+    expect(resolver).toHaveBeenCalledTimes(2);
+    expect(request).toHaveBeenCalledTimes(1);
+    expect(authorizationByRequest).toEqual([
+      "Bearer must-not-rebind"
+    ]);
+  });
+
+  it("forbids the pinned-request test seam outside the test runtime", async () => {
+    const files = await fixtureFiles();
+    const request = vi.fn();
+    vi.stubEnv("NODE_ENV", "production");
+    try {
+      await expect(
+        probeTmsHttpV1({
+          adapter: fixtureAdapter(),
+          resolvedBaseUrl: "https://tms.client.example",
+          resolvedHeaders: {
+            authorization: "Bearer must-never-reach-test-seam"
+          },
+          adapterConfigPath: files.adapterConfigPath,
+          credentialRevision: 1,
+          receiptPath: files.receiptPath,
+          sampleQuery,
+          resolveHostname: publicResolver,
+          testPinnedRequest: request
+        })
+      ).rejects.toMatchObject({
+        code: "test_transport_forbidden"
+      });
+      expect(request).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
   it("validates all read capabilities, never writes a quote, and persists a redacted receipt", async () => {
     const files = await fixtureFiles();
     const adapter = fixtureAdapter();
@@ -263,7 +366,7 @@ describe("probeTmsHttpV1", () => {
       credentialRevision: 1,
       receiptPath: files.receiptPath,
       sampleQuery,
-      fetch: fetchFn,
+      testPinnedRequest: pinnedRequestFromFetch(fetchFn),
       resolveHostname: publicResolver,
       now: () => new Date("2026-07-29T18:00:00.000Z")
     });
@@ -335,7 +438,9 @@ describe("probeTmsHttpV1", () => {
         credentialRevision: 1,
         receiptPath: files.receiptPath,
         sampleQuery,
-        fetch: healthFetch(body, status),
+        testPinnedRequest: pinnedRequestFromFetch(
+          healthFetch(body, status)
+        ),
         resolveHostname: publicResolver
       })
     ).rejects.toMatchObject({ code });
@@ -373,7 +478,7 @@ describe("probeTmsHttpV1", () => {
         credentialRevision: 1,
         receiptPath: files.receiptPath,
         sampleQuery,
-        fetch: healthFetch(),
+        testPinnedRequest: pinnedRequestFromFetch(healthFetch()),
         resolveHostname: publicResolver
       })
     ).rejects.toMatchObject({ code });
@@ -397,7 +502,7 @@ describe("probeTmsHttpV1", () => {
         credentialRevision: 1,
         receiptPath: files.receiptPath,
         sampleQuery,
-        fetch: healthFetch(),
+        testPinnedRequest: pinnedRequestFromFetch(healthFetch()),
         resolveHostname: publicResolver
       })
     ).rejects.toMatchObject({ code: "historical_quotes_insufficient_unexplained" });
@@ -417,7 +522,7 @@ describe("probeTmsHttpV1", () => {
         credentialRevision: 1,
         receiptPath: files.receiptPath,
         sampleQuery,
-        fetch: never,
+        testPinnedRequest: pinnedRequestFromFetch(never),
         resolveHostname: publicResolver,
         timeoutMs: 20
       })
@@ -438,18 +543,20 @@ describe("probeTmsHttpV1", () => {
     await expect(
       probeTmsHttpV1({
         ...common,
-        fetch: healthFetch(),
+        testPinnedRequest: pinnedRequestFromFetch(healthFetch()),
         resolveHostname: async () => ["127.0.0.1"]
       })
     ).rejects.toMatchObject({ code: "base_url_unsafe" });
     await expect(
       probeTmsHttpV1({
         ...common,
-        fetch: vi.fn().mockResolvedValue(
-          new Response(null, {
-            status: 302,
-            headers: { location: "http://127.0.0.1/private" }
-          })
+        testPinnedRequest: pinnedRequestFromFetch(
+          vi.fn().mockResolvedValue(
+            new Response(null, {
+              status: 302,
+              headers: { location: "http://127.0.0.1/private" }
+            })
+          ) as unknown as typeof fetch
         ),
         resolveHostname: publicResolver
       })
@@ -457,7 +564,11 @@ describe("probeTmsHttpV1", () => {
     await expect(
       probeTmsHttpV1({
         ...common,
-        fetch: healthFetch({ padding: "secret-body".repeat(1_000) }),
+        testPinnedRequest: pinnedRequestFromFetch(
+          healthFetch({
+            padding: "secret-body".repeat(1_000)
+          })
+        ),
         resolveHostname: publicResolver,
         maxBodyBytes: 100
       })
@@ -552,8 +663,7 @@ describe("configureTmsHttpV1", () => {
     }) as unknown as typeof fetch;
     const context = {
       env: runtimeEnv,
-      fetch: fetchFn,
-      pinnedRequest: pinnedRequestFromFetch(fetchFn),
+      testPinnedRequest: pinnedRequestFromFetch(fetchFn),
       paths,
       resolveHostname: publicResolver,
       now: () => new Date("2026-07-29T18:00:00.000Z")
@@ -621,8 +731,7 @@ describe("configureTmsHttpV1", () => {
     const fetchFn = canonicalFixtureFetch();
     const baseContext = {
       env: {},
-      fetch: fetchFn,
-      pinnedRequest: pinnedRequestFromFetch(fetchFn),
+      testPinnedRequest: pinnedRequestFromFetch(fetchFn),
       paths,
       resolveHostname: publicResolver
     };
@@ -664,7 +773,7 @@ describe("configureTmsHttpV1", () => {
     ).toBe(false);
   });
 
-  it("serializes two writers so generations cannot reuse a revision or mix env and receipt", async () => {
+  it("atomically resumes past an abandoned owner and serializes two writers", async () => {
     const directory = await mkdtemp(join(tmpdir(), "quoteops-tms-writers-"));
     temporaryDirectories.push(directory);
     const paths = {
@@ -674,12 +783,62 @@ describe("configureTmsHttpV1", () => {
       settingsDir: join(directory, "settings")
     };
     const fetchFn = canonicalFixtureFetch();
+    const lockDirectory = join(
+      paths.settingsDir,
+      "tms-config-locks"
+    );
+    const abandonedOwner = spawn(process.execPath, [
+      "-e",
+      "process.exit(0)"
+    ]);
+    const deadPid = abandonedOwner.pid;
+    if (!deadPid) throw new Error("abandoned_owner_pid_unavailable");
+    await new Promise<void>((resolve, reject) => {
+      abandonedOwner.once("error", reject);
+      abandonedOwner.once("exit", () => resolve());
+    });
+    const abandonedChoosing =
+      `choosing-${deadPid}-dead-owner-token`;
+    const abandonedTicket =
+      `ticket-0000000000000041-${deadPid}-dead-owner-token`;
+    await mkdir(join(lockDirectory, abandonedChoosing), {
+      recursive: true
+    });
+    await mkdir(join(lockDirectory, abandonedTicket));
+    let activeTransitions = 0;
+    let maximumActiveTransitions = 0;
+    const revisions: number[] = [];
     const context = {
       env: {},
-      fetch: fetchFn,
-      pinnedRequest: pinnedRequestFromFetch(fetchFn),
+      testPinnedRequest: pinnedRequestFromFetch(fetchFn),
       paths,
-      resolveHostname: publicResolver
+      resolveHostname: publicResolver,
+      async afterAtomicRename(label: string) {
+        if (label === "tms_credential_revision") {
+          activeTransitions += 1;
+          maximumActiveTransitions = Math.max(
+            maximumActiveTransitions,
+            activeTransitions
+          );
+          revisions.push(
+            await readTmsCredentialRevision(
+              join(paths.settingsDir, "tms-credential-revision")
+            )
+          );
+          const before = await readdir(lockDirectory);
+          const ownTicket = before.find(
+            (entry) =>
+              entry.startsWith("ticket-") &&
+              entry.includes(`-${process.pid}-`)
+          );
+          expect(ownTicket).toBeDefined();
+          await new Promise((resolve) => setTimeout(resolve, 10));
+          expect(await readdir(lockDirectory)).toContain(ownTicket);
+        }
+        if (label === "tms_probe_receipt") {
+          activeTransitions -= 1;
+        }
+      }
     };
 
     await Promise.all([
@@ -712,6 +871,9 @@ describe("configureTmsHttpV1", () => {
       base_url_origin: string;
     };
     expect(credentialRevision).toBe(2);
+    expect(revisions).toEqual([1, 2]);
+    expect(maximumActiveTransitions).toBe(1);
+    expect(activeTransitions).toBe(0);
     expect(receipt.credential_revision).toBe(2);
     expect(receipt.base_url_origin).toBe(
       configured.get("TMS_HTTP_BASE_URL")
@@ -737,6 +899,14 @@ describe("configureTmsHttpV1", () => {
         expectedContract: "quoteops-tms-http-v1"
       })
     ).toBe(true);
+    const remainingLocks = await readdir(lockDirectory);
+    expect(remainingLocks).toContain(abandonedChoosing);
+    expect(remainingLocks).toContain(abandonedTicket);
+    expect(
+      remainingLocks.some((entry) =>
+        entry.includes(`-${process.pid}-`)
+      )
+    ).toBe(false);
   });
 });
 
