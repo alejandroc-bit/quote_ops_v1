@@ -48,6 +48,7 @@ import type {
   QuoteOpsStore,
   WorkflowRunSummary
 } from "./storage/QuoteOpsStore.js";
+import { hasMatchingTmsProbeReceipt } from "./onboard/tmsProbe.js";
 
 export { createApplianceWorkflowTools, loadApplianceManifest } from "./runtimeTools.js";
 export { createInMemoryQuoteOpsStore } from "./storage/InMemoryQuoteOpsStore.js";
@@ -94,6 +95,18 @@ export {
   readCloudflareConfig,
   validatePublicHostname
 } from "./onboard/cloudflareStep.js";
+export {
+  hasMatchingTmsProbeReceipt,
+  probeLegacyCustomHttp,
+  probeTmsHttpV1,
+  TmsProbeError
+} from "./onboard/tmsProbe.js";
+export type {
+  LegacyCustomHttpProbeReceipt,
+  TmsHttpV1ProbeReceipt,
+  TmsProbeInput,
+  TmsProbeReceipt
+} from "./onboard/tmsProbe.js";
 export type {
   CloudflareTunnelConfig,
   ConfigureCloudflareTunnelInput
@@ -1198,7 +1211,24 @@ async function hasTmsConnection(
         if (key) requiredKeys.add(key);
       }
     }
-    return [...requiredKeys].every((key) => hasConfiguredKey(key, readiness, env));
+    if (
+      ![...requiredKeys].every((key) =>
+        hasConfiguredKey(key, readiness, env)
+      )
+    ) {
+      return false;
+    }
+    if (config.contract !== "quoteops-tms-http-v1") {
+      // Existing explicit-path HTTP remains a connection once its runtime
+      // inputs resolve, but its mapping/readiness gate stays closed until the
+      // distinct legacy live probe succeeds.
+      return true;
+    }
+    return hasCurrentTmsProbeReceipt({
+      env,
+      adapterPath,
+      expectedContract: "quoteops-tms-http-v1"
+    });
   } catch {
     return false;
   }
@@ -1213,6 +1243,26 @@ function hasConfiguredKey(
 }
 
 async function hasTmsMapping(env: NodeJS.ProcessEnv): Promise<boolean> {
+  const adapterPath = optionalEnv(env.QUOTEOPS_TMS_ADAPTER_CONFIG_PATH);
+  if (adapterPath) {
+    try {
+      const config = await loadTmsAdapterConfig(adapterPath);
+      if (config.provider === "http") {
+        if (config.contract === "quoteops-tms-http-v1") {
+          return true;
+        }
+        return hasCurrentTmsProbeReceipt({
+          env,
+          adapterPath,
+          expectedContract: "legacy-custom-http-canonical-output-v1"
+        });
+      }
+      if (config.provider === "file_import") return true;
+    } catch {
+      return false;
+    }
+  }
+
   const mappingPath = optionalEnv(env.QUOTEOPS_TMS_MAPPING_CONFIG_PATH);
   if (mappingPath) {
     try {
@@ -1223,12 +1273,10 @@ async function hasTmsMapping(env: NodeJS.ProcessEnv): Promise<boolean> {
     }
   }
 
-  const adapterPath = optionalEnv(env.QUOTEOPS_TMS_ADAPTER_CONFIG_PATH);
   if (adapterPath) {
     try {
       const config = await loadTmsAdapterConfig(adapterPath);
-      // file_import maps deterministically through the CSV templates;
-      // http providers need an explicit mapping config from onboarding
+      // file_import maps deterministically through the CSV templates.
       return config.provider === "file_import";
     } catch {
       return false;
@@ -1240,6 +1288,51 @@ async function hasTmsMapping(env: NodeJS.ProcessEnv): Promise<boolean> {
     return fileExists(rfqsPath);
   }
   return false;
+}
+
+async function hasCurrentTmsProbeReceipt(input: {
+  env: NodeJS.ProcessEnv;
+  adapterPath: string;
+  expectedContract:
+    | "quoteops-tms-http-v1"
+    | "legacy-custom-http-canonical-output-v1";
+}): Promise<boolean> {
+  const receiptPath =
+    optionalEnv(input.env.QUOTEOPS_TMS_PROBE_PATH) ??
+    defaultSettingsFile(input.env, "tms-probe.json");
+  const revisionPath =
+    optionalEnv(input.env.QUOTEOPS_TMS_CREDENTIAL_REVISION_PATH) ??
+    defaultSettingsFile(input.env, "tms-credential-revision");
+  if (!receiptPath || !revisionPath) return false;
+  const credentialRevision = await readTmsCredentialRevision(revisionPath);
+  if (credentialRevision < 1) return false;
+  return hasMatchingTmsProbeReceipt({
+    adapterConfigPath: input.adapterPath,
+    receiptPath,
+    credentialRevision,
+    expectedContract: input.expectedContract
+  });
+}
+
+async function readTmsCredentialRevision(path: string): Promise<number> {
+  try {
+    const value = JSON.parse(await readFile(path, "utf8")) as Record<
+      string,
+      unknown
+    >;
+    if (
+      Object.keys(value).sort().join(",") !==
+        "credential_revision,schema_version" ||
+      value.schema_version !== 1 ||
+      !Number.isSafeInteger(value.credential_revision) ||
+      Number(value.credential_revision) < 1
+    ) {
+      return 0;
+    }
+    return Number(value.credential_revision);
+  } catch {
+    return 0;
+  }
 }
 
 async function hasKnowledgeBase(env: NodeJS.ProcessEnv): Promise<boolean> {

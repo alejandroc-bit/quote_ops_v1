@@ -1,6 +1,27 @@
 import type { PublishedApplianceRelease } from "@quoteops/shared";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import type { MinimalClientRecord } from "./minimalRegistry.js";
+
+const TMS_HTTP_V1_OPENAPI = readFileSync(
+  fileURLToPath(
+    new URL(
+      "../../../docs/integrations/tms-http-v1.openapi.yaml",
+      import.meta.url
+    )
+  ),
+  "utf8"
+);
+const TMS_HTTP_V1_GUIDE = readFileSync(
+  fileURLToPath(
+    new URL(
+      "../../../docs/integrations/tms-http-v1.md",
+      import.meta.url
+    )
+  ),
+  "utf8"
+);
 
 export type InstallPack = {
   client_id: string;
@@ -88,6 +109,8 @@ export function createInstallPack(input: {
       "connectors/tms/availability-zones.csv": renderAvailabilityZonesCsvTemplate(),
       "connectors/tms/quote-writebacks.jsonl": "",
       "connectors/tms/status-writebacks.jsonl": "",
+      "connectors/tms-http-v1.openapi.yaml": TMS_HTTP_V1_OPENAPI,
+      "connectors/tms-http-v1.md": TMS_HTTP_V1_GUIDE,
       "connectors/tms-http-contract.md": renderHttpContract(),
       "connectors/tms-sql-contract.md": renderSqlContract()
     }

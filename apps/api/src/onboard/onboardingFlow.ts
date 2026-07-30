@@ -9,6 +9,7 @@ import {
 } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import type { HistoricalSearchQuery } from "@quoteops/connectors";
+import { tmsHttpV1HistoricalSearchRequestSchema } from "@quoteops/contracts";
 import { z } from "zod";
 import { parse as parseYaml } from "yaml";
 import type { Copilot } from "./onboardConfig.js";
@@ -134,49 +135,6 @@ export type OnboardingAnswers = {
 
 const secretFileRefSchema = z.object({ file: z.string().min(1) }).strict();
 const onboardingFileRefSchema = z.object({ file: z.string().min(1) }).strict();
-const optionalNullableText = z.string().min(1).nullable().optional();
-const historicalSearchQuerySchema = z
-  .object({
-    request_id: z.string().min(1),
-    origin: z
-      .object({
-        city: z.string().min(1),
-        state: z.string().min(1),
-        country: z.string().length(2)
-      })
-      .strict(),
-    destination: z
-      .object({
-        city: z.string().min(1),
-        state: z.string().min(1),
-        country: z.string().length(2)
-      })
-      .strict(),
-    vehicle_profile_id: optionalNullableText,
-    equipment_request: optionalNullableText,
-    customer_id: optionalNullableText,
-    customer_type: optionalNullableText,
-    cargo: z
-      .object({
-        commodity: optionalNullableText,
-        commodity_category: optionalNullableText,
-        sector: optionalNullableText,
-        weight_kg: z.number().finite().nonnegative().nullable().optional(),
-        hazmat: z.boolean().nullable().optional(),
-        temperature_controlled: z.boolean().nullable().optional()
-      })
-      .strict()
-      .optional(),
-    service_type: optionalNullableText,
-    time_window: z
-      .object({
-        from: z.string().datetime({ offset: true }),
-        to: z.string().datetime({ offset: true })
-      })
-      .strict(),
-    max_results: z.number().int().positive().optional()
-  })
-  .strict();
 
 export const onboardingAnswersSchema: z.ZodType<OnboardingAnswers> = z
   .object({
@@ -206,7 +164,7 @@ export const onboardingAnswersSchema: z.ZodType<OnboardingAnswers> = z
         mode: z.literal("quoteops-tms-http-v1"),
         base_url: z.string().url(),
         api_key: secretFileRefSchema,
-        sample_query: historicalSearchQuerySchema
+        sample_query: tmsHttpV1HistoricalSearchRequestSchema
       })
       .strict()
       .optional(),

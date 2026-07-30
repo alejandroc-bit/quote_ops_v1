@@ -138,6 +138,8 @@ services:
       QUOTEOPS_AGENT_CONFIG_PATH: /opt/quoteops-v1/connectors/agent/agent-config.yaml
       QUOTEOPS_TMS_ADAPTER_CONFIG_PATH: /opt/quoteops-v1/connectors/tms-adapter.yaml
       QUOTEOPS_TMS_MAPPING_CONFIG_PATH: ${QUOTEOPS_TMS_MAPPING_CONFIG_PATH:-}
+      QUOTEOPS_TMS_PROBE_PATH: /opt/quoteops-v1/settings/tms-probe.json
+      QUOTEOPS_TMS_CREDENTIAL_REVISION_PATH: /opt/quoteops-v1/settings/tms-credential-revision
       QUOTEOPS_ROUTE_CACHE_PATH: /opt/quoteops-v1/connectors/sakbe/route-cache.json
       QUOTEOPS_SAKBE_CACHE_MODE: ${QUOTEOPS_SAKBE_CACHE_MODE:-cache_first}
       QUOTEOPS_SAKBE_LIVE_ENABLED: ${QUOTEOPS_SAKBE_LIVE_ENABLED:-true}
@@ -188,6 +190,8 @@ services:
       QUOTEOPS_CONNECTORS_DIR: /opt/quoteops-v1/connectors
       QUOTEOPS_AGENT_CONFIG_PATH: /opt/quoteops-v1/connectors/agent/agent-config.yaml
       QUOTEOPS_TMS_ADAPTER_CONFIG_PATH: /opt/quoteops-v1/connectors/tms-adapter.yaml
+      QUOTEOPS_TMS_PROBE_PATH: /opt/quoteops-v1/settings/tms-probe.json
+      QUOTEOPS_TMS_CREDENTIAL_REVISION_PATH: /opt/quoteops-v1/settings/tms-credential-revision
       QUOTEOPS_TMS_RFQS_PATH: /opt/quoteops-v1/connectors/tms/rfqs.csv
       QUOTEOPS_TMS_HISTORICAL_QUOTES_PATH: /opt/quoteops-v1/connectors/tms/historical-quotes.csv
       QUOTEOPS_TMS_HISTORICAL_SHIPMENTS_PATH: /opt/quoteops-v1/connectors/tms/historical-shipments.csv
@@ -204,6 +208,7 @@ services:
       - quoteops_criteria:/opt/quoteops-v1/criteria
       - quoteops_connectors:/opt/quoteops-v1/connectors
       - quoteops_secrets:/opt/quoteops-v1/secrets
+      - quoteops_settings:/opt/quoteops-v1/settings
     logging:
       driver: json-file
       options:

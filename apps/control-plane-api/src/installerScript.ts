@@ -66,6 +66,8 @@ const CLIENT_OVERLAY_FILES = new Set([
   "connectors/tms/availability-zones.csv",
   "connectors/tms/quote-writebacks.jsonl",
   "connectors/tms/status-writebacks.jsonl",
+  "connectors/tms-http-v1.openapi.yaml",
+  "connectors/tms-http-v1.md",
   "connectors/tms-http-contract.md",
   "connectors/tms-sql-contract.md"
 ]);

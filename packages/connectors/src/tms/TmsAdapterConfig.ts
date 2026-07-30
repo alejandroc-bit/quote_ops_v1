@@ -44,6 +44,7 @@ const fileImportConfigSchema = z
 const httpConfigSchema = z
   .object({
     provider: z.literal("http"),
+    contract: z.literal("quoteops-tms-http-v1").optional(),
     base_url_env: envNameSchema,
     headers: headersSchema.optional(),
     health_endpoint_path: endpointPathSchema.optional(),

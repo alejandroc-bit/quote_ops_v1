@@ -1,7 +1,11 @@
 import { readFile, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
-import { createTmsAdapterFromConfig } from "@quoteops/connectors";
+import {
+  createTmsAdapterFromConfig,
+  loadTmsAdapterConfig,
+  type HistoricalSearchQuery
+} from "@quoteops/connectors";
 import type { QuoteManifest } from "@quoteops/quote-core";
 import type { TmsCanonicalPerformance } from "@quoteops/contracts";
 import {
@@ -27,10 +31,19 @@ import {
   createCopilot,
   applyAuthorizationToAgentConfig,
   mergeConfiguredProfileStubs,
+  readEnvFileValues,
+  readSingleLineSecret,
+  validateTmsBaseUrl,
   writeSecret,
   type Copilot,
   type ProfileCommercialLayer
 } from "./onboardConfig.js";
+import {
+  configureLegacyCustomHttp,
+  configureTmsHttpV1,
+  hasMatchingTmsProbeReceipt,
+  readTmsCredentialRevision
+} from "./tmsProbe.js";
 import {
   applyAuthorization,
   buildSampleQuoteRows,
@@ -196,8 +209,12 @@ async function main(argv: string[]): Promise<void> {
 async function runLegacyOnboarding(paths: OnboardPaths): Promise<void> {
   const copilot = await stepAiKey(paths);
   await stepSecrets(paths, copilot);
-  await stepTms(paths, copilot);
-  const configuredProfileIds = await stepSyncUnits(paths, copilot);
+  const tmsEnv = await stepTms(paths, copilot);
+  const configuredProfileIds = await stepSyncUnits(
+    paths,
+    copilot,
+    tmsEnv
+  );
   await stepAuthorization(paths, copilot);
   await stepValidatePricing(paths, copilot, configuredProfileIds);
   await stepIngest(paths, copilot);
@@ -211,16 +228,15 @@ function onboardingPhases(paths: OnboardPaths): OnboardingPhase[] {
   const tmsPhase: OnboardingPhase = {
     id: "tms",
     async isComplete(context) {
-      return (
-        (await exists(context.paths.tmsAdapterConfigFile)) &&
-        (await exists(context.paths.tmsProbeFile))
-      );
+      return isTmsPhaseComplete(context);
     },
     async run(context) {
-      if (!context.guided) {
-        throw new OnboardingError("onboarding_pending", { phase: "tms" });
-      }
-      await stepTms(paths, context.copilot ?? null);
+      const tmsEnv = await stepTms(
+        paths,
+        context.copilot ?? null,
+        context
+      );
+      context.env = tmsEnv as NodeJS.ProcessEnv;
     }
   };
   const unitsPhase: OnboardingPhase = {
@@ -237,7 +253,11 @@ function onboardingPhases(paths: OnboardPaths): OnboardingPhase[] {
       if (!context.guided) {
         throw new OnboardingError("onboarding_pending", { phase: "units" });
       }
-      await stepSyncUnits(paths, context.copilot ?? null);
+      await stepSyncUnits(
+        paths,
+        context.copilot ?? null,
+        context.env
+      );
     }
   };
   const authorizationPhase: OnboardingPhase = {
@@ -361,48 +381,122 @@ async function stepSecrets(paths: OnboardPaths, copilot: Copilot | null): Promis
   }
 }
 
-async function stepTms(paths: OnboardPaths, copilot: Copilot | null): Promise<void> {
+async function stepTms(
+  paths: OnboardPaths,
+  copilot: Copilot | null,
+  context?: OnboardingContext
+): Promise<Record<string, string | undefined>> {
   line(section("Paso 3 · Conexión al TMS"));
   await guide(
     copilot,
     "El TMS es la fuente de verdad de rendimientos, unidades, zonas e histórico.",
-    "Explica los tres niveles de integración TMS: file_import (exportaciones CSV), http (API moderna) y sql (base de datos del TMS casero)."
+    "Explica las integraciones TMS: API REST QuoteOps v1, REST avanzada existente, exportaciones CSV y SQL."
   );
 
-  const provider = (await select("¿Cómo conecta el TMS del cliente?", [
-    { value: "file_import", label: "Exportaciones CSV (file_import)" },
-    { value: "http", label: "API HTTP moderna" },
-    { value: "sql", label: "Base SQL profesional (Cloud SQL / Azure SQL / otra)" }
-  ])) as "file_import" | "http" | "sql";
+  if (context?.answers?.tms) {
+    const result = await configureTmsHttpV1(
+      {
+        baseUrl: context.answers.tms.base_url,
+        apiKey: context.answers.tms.api_key,
+        sampleQuery: context.answers.tms.sample_query
+      },
+      context
+    );
+    ok("Contrato REST QuoteOps v1 validado en vivo.");
+    return result.env;
+  }
+  if (context && !context.guided) {
+    throw new OnboardingError("onboarding_pending", { phase: "tms" });
+  }
+
+  const choose =
+    context?.io.select.bind(context.io) ??
+    (async <T extends string>(
+      prompt: string,
+      options: Array<{ value: T; label: string }>
+    ) => (await select(prompt, options)) as T);
+  const provider = await choose(
+    "¿Cómo conecta el TMS del cliente?",
+    [
+      {
+        value: "http_v1",
+        label: "API REST QuoteOps v1 (recomendado)"
+      },
+      {
+        value: "http_legacy",
+        label: "Configuración REST avanzada existente"
+      },
+      { value: "file_import", label: "Exportaciones CSV" },
+      { value: "sql", label: "SQL" }
+    ]
+  );
+  const askText = context?.io.ask.bind(context.io) ?? ask;
+  const askSecret = context?.io.askMasked.bind(context.io) ?? askMasked;
+  const runtimeContext = context ?? {
+    env: process.env,
+    fetch,
+    paths: paths.flow
+  };
 
   let yaml: string;
   if (provider === "file_import") {
     yaml = buildTmsAdapterYaml({ provider: "file_import" });
     info("Deja los CSV canónicos en el directorio de connectors/tms.");
-  } else if (provider === "http") {
-    const baseUrlEnv = "TMS_HTTP_BASE_URL";
-    const baseUrl = await ask("URL base de la API del TMS (https://…)");
-    if (baseUrl) await writeSecret(paths.secretsFile, baseUrlEnv, baseUrl);
-    yaml = buildTmsAdapterYaml({
-      provider: "http",
-      base_url_env: baseUrlEnv,
-      endpoints: {
-        search_historical_quotes_endpoint_path: await ask(
-          "Ruta de histórico de cotizaciones",
-          "/quotes/historical"
-        ),
-        get_units_endpoint_path: await ask("Ruta de unidades", "/units"),
-        get_unit_performance_endpoint_path: await ask("Ruta de rendimientos", "/units/performance"),
-        get_availability_zones_endpoint_path: await ask("Ruta de zonas de disponibilidad", "/zones")
-      }
-    });
+  } else if (provider === "http_v1" || provider === "http_legacy") {
+    const baseUrl = await askText(
+      "URL base HTTPS del TMS (sólo origen, sin ruta)"
+    );
+    const apiKey = await askSecret("Bearer token del TMS");
+    const sampleQuery = await captureHistoricalProbeQuery(askText);
+    const result =
+      provider === "http_v1"
+        ? await configureTmsHttpV1(
+            { baseUrl, apiKey, sampleQuery },
+            runtimeContext
+          )
+        : await configureLegacyCustomHttp(
+            {
+              baseUrl,
+              apiKey,
+              sampleQuery,
+              endpoints: {
+                health_endpoint_path: await askText(
+                  "Ruta de health",
+                  "/health"
+                ),
+                search_historical_quotes_endpoint_path: await askText(
+                  "Ruta de histórico de cotizaciones",
+                  "/historical-quotes/search"
+                ),
+                get_units_endpoint_path: await askText(
+                  "Ruta de unidades",
+                  "/units"
+                ),
+                get_unit_performance_endpoint_path: await askText(
+                  "Ruta de rendimientos",
+                  "/unit-performance"
+                ),
+                get_availability_zones_endpoint_path: await askText(
+                  "Ruta de zonas de disponibilidad",
+                  "/availability-zones"
+                ),
+                write_quote_endpoint_path: await askText(
+                  "Ruta de escritura de cotizaciones",
+                  "/quotes"
+                )
+              }
+            },
+            runtimeContext
+          );
+    ok("TMS validado en vivo sin ejecutar writeback.");
+    return result.env;
   } else {
     const dialect = (await select("¿Motor de la base SQL?", [
       { value: "postgres", label: "PostgreSQL (Google Cloud SQL / otra)" },
       { value: "mysql", label: "MySQL (Google Cloud SQL / otra)" },
       { value: "mssql", label: "SQL Server (Azure SQL / otra)" }
     ])) as "postgres" | "mysql" | "mssql";
-    const url = await askMasked("Cadena de conexión de la base SQL (usuario read-only)");
+    const url = await askSecret("Cadena de conexión de la base SQL (usuario read-only)");
     if (url) await writeSecret(paths.secretsFile, "TMS_SQL_URL", url);
     await guide(
       copilot,
@@ -421,6 +515,33 @@ async function stepTms(paths: OnboardPaths, copilot: Copilot | null): Promise<vo
 
   await writeFile(paths.tmsAdapterConfigPath, yaml, "utf8");
   ok(`Configuración del TMS escrita en ${paths.tmsAdapterConfigPath}.`);
+  return context?.env ?? process.env;
+}
+
+async function captureHistoricalProbeQuery(
+  askText: (prompt: string, initial?: string) => Promise<string>
+): Promise<HistoricalSearchQuery> {
+  return {
+    request_id: `onboarding-tms-${Date.now()}`,
+    origin: {
+      city: await askText("Ciudad origen de prueba"),
+      state: await askText("Estado origen de prueba"),
+      country: await askText("País origen ISO-2", "MX")
+    },
+    destination: {
+      city: await askText("Ciudad destino de prueba"),
+      state: await askText("Estado destino de prueba"),
+      country: await askText("País destino ISO-2", "MX")
+    },
+    vehicle_profile_id:
+      (await askText("ID de unidad/perfil de prueba (opcional)")) ||
+      undefined,
+    time_window: {
+      from: await askText("Ventana histórica desde (YYYY-MM-DD)"),
+      to: await askText("Ventana histórica hasta (YYYY-MM-DD)")
+    },
+    max_results: 20
+  };
 }
 
 async function captureSqlQueries(): Promise<Record<string, string>> {
@@ -438,7 +559,11 @@ async function captureSqlQueries(): Promise<Record<string, string>> {
   return queries;
 }
 
-async function stepSyncUnits(paths: OnboardPaths, copilot: Copilot | null): Promise<string[]> {
+async function stepSyncUnits(
+  paths: OnboardPaths,
+  copilot: Copilot | null,
+  env: Record<string, string | undefined> = process.env
+): Promise<string[]> {
   line(section("Paso 4 · Sincronizar unidades desde el TMS"));
   await guide(
     copilot,
@@ -449,7 +574,10 @@ async function stepSyncUnits(paths: OnboardPaths, copilot: Copilot | null): Prom
   let performance: TmsCanonicalPerformance[];
   const spin = createSpinner("Consultando rendimientos del TMS…");
   try {
-    const adapter = await createTmsAdapterFromConfig(paths.tmsAdapterConfigPath, { env: process.env });
+    const adapter = await createTmsAdapterFromConfig(
+      paths.tmsAdapterConfigPath,
+      { env }
+    );
     performance = await adapter.getUnitPerformance();
     spin.stop(`Recibidos ${performance.length} tipos de unidad.`);
   } catch (error) {
@@ -794,6 +922,60 @@ async function exists(path: string): Promise<boolean> {
   try {
     await readFile(path);
     return true;
+  } catch {
+    return false;
+  }
+}
+
+async function isTmsPhaseComplete(
+  context: OnboardingContext
+): Promise<boolean> {
+  try {
+    const config = await loadTmsAdapterConfig(
+      context.paths.tmsAdapterConfigFile
+    );
+    if (config.provider !== "http") return true;
+    const expectedContract =
+      config.contract === "quoteops-tms-http-v1"
+        ? "quoteops-tms-http-v1"
+        : "legacy-custom-http-canonical-output-v1";
+    if (
+      context.answers?.tms &&
+      expectedContract !== "quoteops-tms-http-v1"
+    ) {
+      return false;
+    }
+    if (context.answers?.tms) {
+      const configured = await readEnvFileValues(
+        context.paths.clientSecretsFile
+      );
+      const desiredKey = await readSingleLineSecret(
+        context.answers.tms.api_key,
+        context
+      );
+      if (
+        configured.get("TMS_HTTP_BASE_URL") !==
+          validateTmsBaseUrl(
+            context.answers.tms.base_url,
+            context.env.QUOTEOPS_ACCEPTANCE_MODE
+          ) ||
+        configured.get("TMS_API_KEY") !== desiredKey
+      ) {
+        return false;
+      }
+    }
+    const credentialRevision = await readTmsCredentialRevision(
+      join(context.paths.settingsDir, "tms-credential-revision")
+    );
+    return (
+      credentialRevision >= 1 &&
+      (await hasMatchingTmsProbeReceipt({
+        adapterConfigPath: context.paths.tmsAdapterConfigFile,
+        receiptPath: context.paths.tmsProbeFile,
+        credentialRevision,
+        expectedContract
+      }))
+    );
   } catch {
     return false;
   }

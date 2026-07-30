@@ -521,6 +521,19 @@ awk '
   in_api && /^  [A-Za-z0-9_.-]+:$/ { exit }
   in_api { print }
 ' "$COMPOSE_FILE" | grep -q 'QUOTEOPS_TMS_MAPPING_CONFIG_PATH: ${QUOTEOPS_TMS_MAPPING_CONFIG_PATH:-}' || fail "appliance compose must wire the TMS mapping path into quoteops-api"
+[[ "$(grep -c 'QUOTEOPS_TMS_PROBE_PATH: /opt/quoteops-v1/settings/tms-probe.json' "$COMPOSE_FILE")" == "2" ]] || fail "api and onboarding must share the canonical TMS probe receipt path"
+[[ "$(grep -c 'QUOTEOPS_TMS_CREDENTIAL_REVISION_PATH: /opt/quoteops-v1/settings/tms-credential-revision' "$COMPOSE_FILE")" == "2" ]] || fail "api and onboarding must share the TMS credential revision path"
+awk '
+  /^  quoteops-onboard:$/ { in_onboard = 1; next }
+  in_onboard && /^  [A-Za-z0-9_.-]+:$/ { exit }
+  in_onboard { print }
+' "$COMPOSE_FILE" | grep -q -- '- quoteops_settings:/opt/quoteops-v1/settings' || fail "onboarding must mount settings read-write for probe receipts"
+if grep -q 'QUOTEOPS_ACCEPTANCE_MODE' "$COMPOSE_FILE"; then
+  fail "production compose must never persist the bounded acceptance-mode override"
+fi
+grep -q '^contract: quoteops-tms-http-v1$' "$APPLIANCE_DIR/mock-tms/tms-adapter.http.yaml" || fail "mock TMS adapter must use the canonical v1 discriminator"
+grep -q '^health_endpoint_path: /quoteops/v1/health$' "$APPLIANCE_DIR/mock-tms/tms-adapter.http.yaml" || fail "mock TMS adapter must use the canonical v1 health path"
+grep -q '^write_quote_endpoint_path: /quoteops/v1/quotes$' "$APPLIANCE_DIR/mock-tms/tms-adapter.http.yaml" || fail "mock TMS adapter must declare the canonical write path"
 
 if docker_daemon_available; then
   validate_schema_sql_with_postgres

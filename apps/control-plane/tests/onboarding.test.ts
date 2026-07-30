@@ -15,10 +15,17 @@ const questionnaire: ClientQuestionnaireInput = {
     country: "MX"
   },
   tms: {
-    provider: "custom-http",
+    provider: "quoteops-tms-http-v1",
     base_url: "https://tms.cliente.example",
     auth_type: "api_key",
-    capabilities: ["historical_quotes", "writeback", "health_check"],
+    capabilities: [
+      "historical_quotes",
+      "units",
+      "unit_performance",
+      "availability_zones",
+      "writeback",
+      "health_check"
+    ],
     historical_quotes_source: "api",
     writeback_target: "api"
   },
@@ -125,10 +132,34 @@ describe("onboarding readiness", () => {
     expect(readiness.blocking_issues).toEqual([]);
     expect(readiness.capabilities).toMatchObject({
       historical_quotes: true,
+      units: true,
+      unit_performance: true,
+      availability_zones: true,
       writeback: true,
       health_check: true
     });
     expect(readiness.next_actions).toContain("run_tms_connection_test");
+  });
+
+  it.each([
+    "historical_quotes",
+    "units",
+    "unit_performance",
+    "availability_zones",
+    "writeback",
+    "health_check"
+  ] as const)("requires the %s capability for QuoteOps TMS HTTP v1", (missing) => {
+    const readiness = validateTms({
+      ...questionnaire.tms,
+      capabilities: questionnaire.tms.capabilities.filter(
+        (capability) => capability !== missing
+      )
+    });
+
+    expect(readiness.ready).toBe(false);
+    expect(readiness.blocking_issues).toContain(
+      `tms_${missing}_missing`
+    );
   });
 
   it("blocks readiness when TMS writeback is missing", () => {

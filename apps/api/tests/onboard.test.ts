@@ -10,7 +10,8 @@ import {
   createCopilot,
   mergeConfiguredProfileStubs,
   mergeProfileStubs,
-  upsertEnvLine
+  upsertEnvLine,
+  validateTmsBaseUrl
 } from "../src/onboard/onboardConfig.js";
 import {
   applyAuthorization,
@@ -53,6 +54,33 @@ describe("secret env upsert", () => {
 });
 
 describe("tms adapter yaml", () => {
+  it("builds the fixed QuoteOps HTTP v1 profile without embedding credentials", () => {
+    const yaml = buildTmsAdapterYaml({
+      provider: "http",
+      contract: "quoteops-tms-http-v1",
+      base_url_env: "TMS_HTTP_BASE_URL",
+      api_key_env: "TMS_API_KEY"
+    });
+
+    expect(parseYaml(yaml)).toEqual({
+      provider: "http",
+      contract: "quoteops-tms-http-v1",
+      base_url_env: "TMS_HTTP_BASE_URL",
+      headers: {
+        authorization: "Bearer ${TMS_API_KEY}"
+      },
+      health_endpoint_path: "/quoteops/v1/health",
+      search_historical_quotes_endpoint_path:
+        "/quoteops/v1/historical-quotes/search",
+      get_units_endpoint_path: "/quoteops/v1/units",
+      get_unit_performance_endpoint_path: "/quoteops/v1/unit-performance",
+      get_availability_zones_endpoint_path:
+        "/quoteops/v1/availability-zones",
+      write_quote_endpoint_path: "/quoteops/v1/quotes"
+    });
+    expect(yaml).not.toContain("actual-api-key");
+  });
+
   it("builds file_import with canonical env paths", () => {
     const config = parseYaml(buildTmsAdapterYaml({ provider: "file_import" }));
     expect(config.provider).toBe("file_import");
@@ -91,6 +119,30 @@ describe("tms adapter yaml", () => {
       queries: { performance: "SELECT tipo AS unit_type FROM rendimientos" },
       write_quote: { statement: "INSERT INTO outbox VALUES (:quote_id)" }
     });
+  });
+
+  it("accepts only normalized HTTPS origins plus the bounded macbook exception", () => {
+    expect(validateTmsBaseUrl("https://TMS.Client.Example/")).toBe(
+      "https://tms.client.example"
+    );
+    for (const invalid of [
+      "http://tms.client.example",
+      "https://user:password@tms.client.example",
+      "https://tms.client.example/prefix",
+      "https://tms.client.example/?query=yes",
+      "https://tms.client.example/#fragment"
+    ]) {
+      expect(() => validateTmsBaseUrl(invalid)).toThrow("tms_base_url_invalid");
+    }
+    expect(() =>
+      validateTmsBaseUrl("http://host.docker.internal:19091")
+    ).toThrow("tms_base_url_invalid");
+    expect(
+      validateTmsBaseUrl(
+        "http://host.docker.internal:19091/",
+        "macbook"
+      )
+    ).toBe("http://host.docker.internal:19091");
   });
 });
 

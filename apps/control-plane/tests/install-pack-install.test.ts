@@ -67,6 +67,18 @@ describe("generated install pack", () => {
     expect(pack.files["connectors/knowledge/README.md"]).toContain(
       "consentimiento"
     );
+    expect(pack.files["connectors/tms-http-v1.openapi.yaml"]).toBe(
+      await readFile(
+        join(repoDir, "docs/integrations/tms-http-v1.openapi.yaml"),
+        "utf8"
+      )
+    );
+    expect(pack.files["connectors/tms-http-v1.md"]).toBe(
+      await readFile(
+        join(repoDir, "docs/integrations/tms-http-v1.md"),
+        "utf8"
+      )
+    );
     await materializeFiles(packDir, pack.files);
     const result = spawnSync(
       "bash",

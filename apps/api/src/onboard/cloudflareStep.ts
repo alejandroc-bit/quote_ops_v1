@@ -252,7 +252,7 @@ async function hasMatchingPublicReceipt(
   }
 }
 
-function isPublicInternetAddress(address: string): boolean {
+export function isPublicInternetAddress(address: string): boolean {
   if (isIP(address) === 4) {
     const octets = address.split(".").map(Number);
     const value =

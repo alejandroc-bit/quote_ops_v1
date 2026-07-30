@@ -1365,6 +1365,118 @@ describe("QuoteOps API", () => {
     );
   });
 
+  it("requires an exact live receipt for canonical and legacy HTTP readiness", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "quoteops-tms-receipt-readiness-"));
+    tempDirs.push(dir);
+    const adapterPath = join(dir, "tms-adapter.yaml");
+    const receiptPath = join(dir, "tms-probe.json");
+    const revisionPath = join(dir, "tms-credential-revision");
+    const canonicalConfig = [
+      "provider: http",
+      "contract: quoteops-tms-http-v1",
+      "base_url_env: TMS_HTTP_BASE_URL",
+      "headers:",
+      "  authorization: Bearer ${TMS_API_KEY}",
+      "health_endpoint_path: /quoteops/v1/health",
+      "search_historical_quotes_endpoint_path: /quoteops/v1/historical-quotes/search",
+      "get_units_endpoint_path: /quoteops/v1/units",
+      "get_unit_performance_endpoint_path: /quoteops/v1/unit-performance",
+      "get_availability_zones_endpoint_path: /quoteops/v1/availability-zones",
+      "write_quote_endpoint_path: /quoteops/v1/quotes",
+      ""
+    ].join("\n");
+    await writeFile(adapterPath, canonicalConfig);
+    await writeFile(
+      revisionPath,
+      JSON.stringify({ schema_version: 1, credential_revision: 2 })
+    );
+    const env = await setupReadyEnv({
+      QUOTEOPS_TMS_ADAPTER_CONFIG_PATH: adapterPath,
+      QUOTEOPS_TMS_PROBE_PATH: receiptPath,
+      QUOTEOPS_TMS_CREDENTIAL_REVISION_PATH: revisionPath,
+      TMS_HTTP_BASE_URL: "https://tms.client.example",
+      TMS_API_KEY: "configured"
+    });
+
+    const readRequiredSteps = async (): Promise<string[]> => {
+      let requiredSteps: string[] = [];
+      await withEnv(env, async () => {
+        const baseUrl = await startApi({
+          defaultManifest: Promise.resolve(workflowInput.manifest)
+        });
+        const response = await fetch(`${baseUrl}/api/setup-state`);
+        requiredSteps = (await response.json()).required_steps;
+      });
+      clearApplianceTestApps();
+      return requiredSteps;
+    };
+
+    expect(await readRequiredSteps()).toContain("connect_tms");
+    expect(await readRequiredSteps()).not.toContain("map_tms");
+
+    const canonicalHash = createHash("sha256")
+      .update(await readFile(adapterPath))
+      .digest("hex");
+    await writeFile(
+      receiptPath,
+      JSON.stringify({
+        contract: "quoteops-tms-http-v1",
+        adapter_config_sha256: canonicalHash,
+        credential_revision: 2,
+        base_url_origin: "https://tms.client.example",
+        validated_at: "2026-07-29T18:00:00.000Z",
+        checks: {
+          health: "ok",
+          historical_quotes: "ok",
+          units: "ok",
+          unit_performance: "ok",
+          availability_zones: "ok",
+          write_quote_declared: "ok"
+        }
+      })
+    );
+    expect(await readRequiredSteps()).not.toContain("connect_tms");
+    expect(await readRequiredSteps()).not.toContain("map_tms");
+
+    const legacyConfig = canonicalConfig
+      .replace("contract: quoteops-tms-http-v1\n", "")
+      .replace("/quoteops/v1/health", "/health")
+      .replace(
+        "/quoteops/v1/historical-quotes/search",
+        "/historical-quotes/search"
+      )
+      .replace("/quoteops/v1/units", "/units")
+      .replace("/quoteops/v1/unit-performance", "/unit-performance")
+      .replace("/quoteops/v1/availability-zones", "/availability-zones")
+      .replace("/quoteops/v1/quotes", "/quotes");
+    await writeFile(adapterPath, legacyConfig);
+    expect(await readRequiredSteps()).not.toContain("connect_tms");
+    expect(await readRequiredSteps()).toContain("map_tms");
+
+    await writeFile(
+      receiptPath,
+      JSON.stringify({
+        contract: "legacy-custom-http-canonical-output-v1",
+        adapter_config_sha256: createHash("sha256")
+          .update(await readFile(adapterPath))
+          .digest("hex"),
+        credential_revision: 2,
+        base_url_origin: "https://tms.client.example",
+        validated_at: "2026-07-29T18:00:00.000Z",
+        checks: {
+          health: "ok",
+          historical_quotes: "ok",
+          units: "ok",
+          unit_performance: "ok",
+          availability_zones: "ok",
+          write_quote_configured: "ok"
+        }
+      })
+    );
+    expect(await readRequiredSteps()).not.toContain("connect_tms");
+    expect(await readRequiredSteps()).not.toContain("map_tms");
+  });
+
   it("does not treat staged knowledge or mailbox env keys as completed receipts", async () => {
     const dir = await mkdtemp(join(tmpdir(), "quoteops-receipt-gates-"));
     tempDirs.push(dir);

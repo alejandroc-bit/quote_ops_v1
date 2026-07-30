@@ -26,7 +26,11 @@ import type {
   QuoteManifest,
   QuoteVehicleProfile
 } from "@quoteops/quote-core";
-import type { TmsCanonicalPerformance } from "@quoteops/contracts";
+import {
+  TMS_HTTP_V1_CONTRACT,
+  TMS_HTTP_V1_PATHS,
+  type TmsCanonicalPerformance
+} from "@quoteops/contracts";
 import type { ManifestAuthorization } from "./wizardSteps.js";
 import {
   OnboardingError,
@@ -200,6 +204,39 @@ export function validateSingleLineSecret(value: string): string {
   return normalized;
 }
 
+export function validateTmsBaseUrl(
+  value: string,
+  acceptanceMode?: string
+): string {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new OnboardingError("tms_base_url_invalid");
+  }
+  if (
+    url.username ||
+    url.password ||
+    url.pathname !== "/" ||
+    url.search ||
+    url.hash
+  ) {
+    throw new OnboardingError("tms_base_url_invalid");
+  }
+  const origin = url.origin;
+  const macbookAcceptanceOrigin = "http://host.docker.internal:19091";
+  if (
+    url.protocol !== "https:" &&
+    !(
+      acceptanceMode === "macbook" &&
+      origin === macbookAcceptanceOrigin
+    )
+  ) {
+    throw new OnboardingError("tms_base_url_invalid");
+  }
+  return origin;
+}
+
 /**
  * Atomically merge a bounded set of env keys. All values are validated before
  * the original file is read, so a rejected value cannot cause a partial write.
@@ -350,7 +387,15 @@ export type TmsAdapterYamlInput =
   | {
       provider: "http";
       base_url_env: string;
-      endpoints?: Record<string, string>;
+      contract?: undefined;
+      endpoints: Record<string, string>;
+      headers?: Record<string, string>;
+    }
+  | {
+      provider: "http";
+      contract: typeof TMS_HTTP_V1_CONTRACT;
+      base_url_env: string;
+      api_key_env: string;
     }
   | {
       provider: "sql";
@@ -381,10 +426,30 @@ export function buildTmsAdapterYaml(input: TmsAdapterYamlInput): string {
     return stringifyYaml(FILE_IMPORT_DEFAULTS);
   }
   if (input.provider === "http") {
+    if (input.contract === TMS_HTTP_V1_CONTRACT) {
+      return stringifyYaml({
+        provider: "http",
+        contract: TMS_HTTP_V1_CONTRACT,
+        base_url_env: input.base_url_env,
+        headers: {
+          authorization: `Bearer \${${input.api_key_env}}`
+        },
+        health_endpoint_path: TMS_HTTP_V1_PATHS.health,
+        search_historical_quotes_endpoint_path:
+          TMS_HTTP_V1_PATHS.historical_quotes,
+        get_units_endpoint_path: TMS_HTTP_V1_PATHS.units,
+        get_unit_performance_endpoint_path:
+          TMS_HTTP_V1_PATHS.unit_performance,
+        get_availability_zones_endpoint_path:
+          TMS_HTTP_V1_PATHS.availability_zones,
+        write_quote_endpoint_path: TMS_HTTP_V1_PATHS.write_quote
+      });
+    }
     return stringifyYaml({
       provider: "http",
       base_url_env: input.base_url_env,
-      ...(input.endpoints ?? {})
+      ...(input.headers ? { headers: input.headers } : {}),
+      ...input.endpoints
     });
   }
   return stringifyYaml({
