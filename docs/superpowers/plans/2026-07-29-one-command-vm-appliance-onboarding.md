@@ -191,7 +191,7 @@ Release assets may change between versions; data and secret directories never mo
 
 **Interfaces:**
 - Produces: `applianceReleaseSchema`, `publishedApplianceReleaseSchema`, `ApplianceRelease`, `PublishedApplianceRelease`, and their parse functions.
-- Initial fixture command: `SOURCE_DATE_EPOCH=1785348000 npm run package:appliance -- --version v0.2.0 --git-sha 0123456789abcdef0123456789abcdef01234567 --agent-digest sha256:1111111111111111111111111111111111111111111111111111111111111111 --api-digest sha256:2222222222222222222222222222222222222222222222222222222222222222 --web-digest sha256:3333333333333333333333333333333333333333333333333333333333333333 --postgres-image postgres:16-alpine@sha256:4444444444444444444444444444444444444444444444444444444444444444 --redis-image redis:7-alpine@sha256:5555555555555555555555555555555555555555555555555555555555555555 --caddy-image caddy:2-alpine@sha256:6666666666666666666666666666666666666666666666666666666666666666`.
+- Initial fixture command: `SOURCE_DATE_EPOCH=1785348000 npm run package:appliance -- --version v0.2.0 --git-sha 0123456789abcdef0123456789abcdef01234567 --agent-digest sha256:1111111111111111111111111111111111111111111111111111111111111111 --api-digest sha256:2222222222222222222222222222222222222222222222222222222222222222 --web-digest sha256:3333333333333333333333333333333333333333333333333333333333333333 --postgres-image postgres:16-alpine@sha256:4444444444444444444444444444444444444444444444444444444444444444 --redis-image redis:7-alpine@sha256:5555555555555555555555555555555555555555555555555555555555555555 --caddy-image caddy:2-alpine@sha256:6666666666666666666666666666666666666666666666666666666666666666 --cloudflared-image cloudflare/cloudflared:2026.7.3@sha256:e39ee8da81ad5e05d77f38d2f51c60ca51bf2a8450ac3abab50c17fdb91d91bf`.
 - Initial output directory: `dist/appliance/v0.2.0/`, containing `quoteops-appliance-v0.2.0.tar.gz`, `release.json`, `bootstrap.sh`, and `SHA256SUMS`.
 - Consumed by: Tasks 2, 3, 8, and 9.
 
@@ -407,7 +407,7 @@ Create `scripts/package-appliance-release.mjs` to:
 1. require `--version` matching `^v\d+\.\d+\.\d+$`;
 2. require a 40-character lowercase `--git-sha`;
 3. accept `--assets-dir` for tests and default it to `deploy/appliance`; require `bootstrap.sh` there as a separate deployment asset, not a tar entry;
-4. require application digests through `--agent-digest`, `--api-digest`, and `--web-digest`, plus full `--postgres-image`, `--redis-image`, and `--caddy-image` digest references; build semver-tag-plus-digest application references;
+4. require application digests through `--agent-digest`, `--api-digest`, and `--web-digest`, plus full `--postgres-image`, `--redis-image`, `--caddy-image`, and `--cloudflared-image` digest references; build semver-tag-plus-digest application references;
 5. copy only the declared runtime assets into a temporary staging directory;
 6. generate `release.env` with only `QUOTEOPS_VERSION`, `QUOTEOPS_PLATFORM`, and the seven digest-pinned `QUOTEOPS_*_IMAGE` values for agent, API, web, PostgreSQL, Redis, Caddy, and cloudflared;
 7. normalize executable scripts to `0755` and configuration files to `0644`;
@@ -3786,7 +3786,8 @@ SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)" \
   --web-digest "$QUOTEOPS_WEB_DIGEST" \
   --postgres-image "$QUOTEOPS_POSTGRES_IMAGE" \
   --redis-image "$QUOTEOPS_REDIS_IMAGE" \
-  --caddy-image "$QUOTEOPS_CADDY_IMAGE"
+  --caddy-image "$QUOTEOPS_CADDY_IMAGE" \
+  --cloudflared-image "$QUOTEOPS_CLOUDFLARED_IMAGE"
 npm run test:appliance:mac
 ```
 
