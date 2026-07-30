@@ -237,13 +237,17 @@ printf '200'
 SH
   chmod 755 "$mock_bin/curl"
 
-  reset_access_secret() {
-    rm -f "$gate_home/settings/cloudflare-public-validation.json"
+  write_access_secret() {
     cat > "$gate_home/secrets/cloudflare-access-validation.env" <<'EOF'
 CF_ACCESS_CLIENT_ID=smoke-service-id.access
 CF_ACCESS_CLIENT_SECRET=smoke-service-secret
 EOF
     chmod 600 "$gate_home/secrets/cloudflare-access-validation.env"
+  }
+
+  reset_access_secret() {
+    rm -f "$gate_home/settings/cloudflare-public-validation.json"
+    write_access_secret
   }
 
   reset_access_secret
@@ -269,6 +273,25 @@ EOF
   )" || fail "Cloudflare verifier could not safely retry after response loss"
   jq -e '.status == "ready"' <<<"$output" >/dev/null ||
     fail "safe validation receipt retry did not remain ready"
+
+  write_access_secret
+  set +e
+  output="$(
+    PATH="$mock_bin:$PATH" QUOTEOPS_HOME="$gate_home" \
+      QUOTEOPS_VERIFY_TEST_DELETE_FAILURE=1 \
+      bash "$APPLIANCE_DIR/verify-install.sh" --resume-guided
+  )"
+  result=$?
+  set -e
+  [[ "$result" -eq 18 &&
+     -e "$gate_home/secrets/cloudflare-access-validation.env" ]] ||
+    fail "receipt shortcut returned ready when its Access file could not be deleted"
+  jq -e '.status == "failed" and .checks.authenticated_origin == "failed"' \
+    <<<"$output" >/dev/null ||
+    fail "receipt deletion failure did not emit failed JSON"
+  if grep -Eq 'smoke-service-id|smoke-service-secret|CF_ACCESS' <<<"$output"; then
+    fail "receipt deletion failure output contains Service Auth credentials"
+  fi
 
   reset_access_secret
   set +e

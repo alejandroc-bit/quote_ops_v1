@@ -54,32 +54,37 @@ file_owner_id() {
   fi
 }
 
-cloudflare_access_owner_is_valid() {
-  local expected_owner=0
+bounded_smoke_test_mode() {
   local physical_home
   local physical_tmp
+  [[ "${QUOTEOPS_VERIFY_TEST_MODE:-}" == "smoke" ]] || return 1
+  [[ -d "$QUOTEOPS_HOME" && ! -L "$QUOTEOPS_HOME" ]] || return 1
+  physical_home="$(cd "$QUOTEOPS_HOME" && pwd -P)" || return 1
+  physical_tmp="$(cd "${TMPDIR:-/tmp}" && pwd -P)" || return 1
+  case "$physical_home" in
+    "$physical_tmp"/quoteops-cloudflare-gate.*/home) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+cloudflare_access_owner_is_valid() {
+  local expected_owner=0
   case "${QUOTEOPS_VERIFY_TEST_MODE:-}" in
-    "")
-      ;;
+    "") ;;
     smoke)
-      [[ -d "$QUOTEOPS_HOME" && ! -L "$QUOTEOPS_HOME" ]] || return 1
-      physical_home="$(cd "$QUOTEOPS_HOME" && pwd -P)" || return 1
-      physical_tmp="$(cd "${TMPDIR:-/tmp}" && pwd -P)" || return 1
-      case "$physical_home" in
-        "$physical_tmp"/quoteops-cloudflare-gate.*/home)
-          expected_owner="$(id -u)"
-          ;;
-        *) return 1 ;;
-      esac
+      bounded_smoke_test_mode || return 1
+      expected_owner="$(id -u)"
       ;;
-    *)
-      return 1
-      ;;
+    *) return 1 ;;
   esac
   [[ "$(file_owner_id "$ACCESS_ENV_FILE")" == "$expected_owner" ]]
 }
 
 delete_access_file() {
+  if [[ "${QUOTEOPS_VERIFY_TEST_DELETE_FAILURE:-}" == "1" ]] &&
+     bounded_smoke_test_mode; then
+    return 1
+  fi
   rm -f -- "$ACCESS_ENV_FILE" >/dev/null 2>&1 || true
   [[ ! -e "$ACCESS_ENV_FILE" && ! -L "$ACCESS_ENV_FILE" ]]
 }
@@ -308,8 +313,9 @@ receipt_matches() {
 }
 
 if receipt_matches; then
-  ORIGIN_CHECK="ok"
   KEEP_ACCESS_ENV=0
+  delete_access_file || finish 18 failed
+  ORIGIN_CHECK="ok"
   finish 0 ready
 fi
 
