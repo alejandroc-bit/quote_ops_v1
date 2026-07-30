@@ -1,6 +1,12 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { resolve4, resolve6 } from "node:dns/promises";
-import { readFile } from "node:fs/promises";
+import {
+  mkdir,
+  readFile,
+  readlink,
+  symlink,
+  unlink
+} from "node:fs/promises";
 import { isIP } from "node:net";
 import {
   historicalAnalysisSchema,
@@ -34,6 +40,12 @@ import {
   validateTmsBaseUrl
 } from "./onboardConfig.js";
 import type { SecretFileRef } from "./onboardingFlow.js";
+import {
+  createPinnedTmsTransport,
+  createTmsAbsoluteDeadline,
+  type PinnedTmsRequestExecutor,
+  type TmsAbsoluteDeadline
+} from "./tmsSafeTransport.js";
 
 const DEFAULT_TIMEOUT_MS = 10_000;
 const DEFAULT_MAX_BODY_BYTES = 64 * 1024;
@@ -88,6 +100,8 @@ export type TmsProbeInput = {
   timeoutMs?: number;
   maxBodyBytes?: number;
   acceptanceMode?: string;
+  deadline?: TmsAbsoluteDeadline;
+  afterReceiptRename?: () => void | Promise<void>;
 };
 
 export type ConfigureTmsHttpV1Input = {
@@ -118,6 +132,7 @@ export type ConfigureTmsHttpV1Context = {
   answersRoot?: string;
   afterSecretOpen?: () => void | Promise<void>;
   afterAtomicRename?: (label: string) => void | Promise<void>;
+  pinnedRequest?: PinnedTmsRequestExecutor;
 };
 
 export class TmsProbeError extends Error {
@@ -139,92 +154,20 @@ export async function configureTmsHttpV1(
   credentialRevision: number;
   receipt: TmsHttpV1ProbeReceipt;
 }> {
-  const acceptanceMode = context.env.QUOTEOPS_ACCEPTANCE_MODE;
-  const baseUrl = validateTmsBaseUrl(input.baseUrl, acceptanceMode);
-  const apiKey = await readSingleLineSecret(input.apiKey, context);
-  const current = await readEnvFileValues(context.paths.clientSecretsFile);
-  const credentialChanged =
-    current.get("TMS_HTTP_BASE_URL") !== baseUrl ||
-    current.get("TMS_API_KEY") !== apiKey;
-  const revisionPath = join(
-    context.paths.settingsDir,
-    "tms-credential-revision"
-  );
-  const currentRevision = await readTmsCredentialRevision(revisionPath);
-  const credentialRevision =
-    credentialChanged || currentRevision < 1
-      ? currentRevision + 1
-      : currentRevision;
-
-  await updateAllowedEnv(
-    context.paths.clientSecretsFile,
-    {
-      TMS_HTTP_BASE_URL: baseUrl,
-      TMS_API_KEY: apiKey
-    },
-    ["TMS_HTTP_BASE_URL", "TMS_API_KEY"],
-    () => context.afterAtomicRename?.("tms_client_env")
-  );
-  await atomicWriteText(
-    context.paths.tmsAdapterConfigFile,
-    buildTmsAdapterYaml({
-      provider: "http",
-      contract: TMS_HTTP_V1_CONTRACT,
-      base_url_env: "TMS_HTTP_BASE_URL",
-      api_key_env: "TMS_API_KEY"
-    }),
-    {
-      mode: 0o600,
-      afterRename: () => context.afterAtomicRename?.("tms_adapter_config")
-    }
-  );
-  if (credentialChanged || currentRevision < 1) {
-    await atomicWriteJson(
-      revisionPath,
-      {
-        schema_version: 1,
-        credential_revision: credentialRevision
-      },
-      {
-        mode: 0o600,
-        afterRename: () =>
-          context.afterAtomicRename?.("tms_credential_revision")
-      }
-    );
-  }
-
-  const tmsEnv = {
-    ...context.env,
-    TMS_HTTP_BASE_URL: baseUrl,
-    TMS_API_KEY: apiKey
-  };
-  const safeFetch = buildSafeTmsFetch({
-    baseUrlOrigin: baseUrl,
-    fetch: context.fetch,
-    resolveHostname: context.resolveHostname,
-    acceptanceMode,
-    timeoutMs: context.httpProbeTimeoutMs ?? DEFAULT_TIMEOUT_MS,
-    maximumBodyBytes: DEFAULT_MAX_BODY_BYTES
+  const configYaml = buildTmsAdapterYaml({
+    provider: "http",
+    contract: TMS_HTTP_V1_CONTRACT,
+    base_url_env: "TMS_HTTP_BASE_URL",
+    api_key_env: "TMS_API_KEY"
   });
-  const adapter = await createTmsAdapterFromConfig(
-    context.paths.tmsAdapterConfigFile,
-    { env: tmsEnv, fetch: safeFetch }
-  );
-  const receipt = await probeTmsHttpV1({
-    adapter,
-    resolvedBaseUrl: baseUrl,
-    resolvedHeaders: { authorization: `Bearer ${apiKey}` },
-    adapterConfigPath: context.paths.tmsAdapterConfigFile,
-    credentialRevision,
-    receiptPath: context.paths.tmsProbeFile,
+  return await configureTmsHttpGeneration({
+    baseUrl: input.baseUrl,
+    apiKey: input.apiKey,
     sampleQuery: input.sampleQuery,
-    fetch: safeFetch,
-    resolveHostname: context.resolveHostname,
-    now: context.now,
-    timeoutMs: context.httpProbeTimeoutMs,
-    acceptanceMode
+    configYaml,
+    context,
+    probe: probeTmsHttpV1
   });
-  return { adapter, env: tmsEnv, credentialRevision, receipt };
 }
 
 export async function configureLegacyCustomHttp(
@@ -236,79 +179,143 @@ export async function configureLegacyCustomHttp(
   credentialRevision: number;
   receipt: LegacyCustomHttpProbeReceipt;
 }> {
+  const configYaml = buildTmsAdapterYaml({
+    provider: "http",
+    base_url_env: "TMS_HTTP_BASE_URL",
+    headers: { authorization: "Bearer ${TMS_API_KEY}" },
+    endpoints: input.endpoints
+  });
+  return await configureTmsHttpGeneration({
+    baseUrl: input.baseUrl,
+    apiKey: input.apiKey,
+    sampleQuery: input.sampleQuery,
+    configYaml,
+    context,
+    probe: probeLegacyCustomHttp
+  });
+}
+
+async function configureTmsHttpGeneration<
+  TReceipt extends TmsProbeReceipt
+>(input: {
+  baseUrl: string;
+  apiKey: string | SecretFileRef;
+  sampleQuery: HistoricalSearchQuery;
+  configYaml: string;
+  context: ConfigureTmsHttpV1Context;
+  probe: (input: TmsProbeInput) => Promise<TReceipt>;
+}): Promise<{
+  adapter: TmsAdapter;
+  env: Record<string, string | undefined>;
+  credentialRevision: number;
+  receipt: TReceipt;
+}> {
+  const { context } = input;
   const acceptanceMode = context.env.QUOTEOPS_ACCEPTANCE_MODE;
   const baseUrl = validateTmsBaseUrl(input.baseUrl, acceptanceMode);
   const apiKey = await readSingleLineSecret(input.apiKey, context);
-  const current = await readEnvFileValues(context.paths.clientSecretsFile);
-  const credentialChanged =
-    current.get("TMS_HTTP_BASE_URL") !== baseUrl ||
-    current.get("TMS_API_KEY") !== apiKey;
-  const revisionPath = join(
-    context.paths.settingsDir,
-    "tms-credential-revision"
+  const deadline = createTmsAbsoluteDeadline(
+    context.httpProbeTimeoutMs ?? DEFAULT_TIMEOUT_MS
   );
-  const currentRevision = await readTmsCredentialRevision(revisionPath);
-  const credentialRevision =
-    credentialChanged || currentRevision < 1
+  let releaseLock: (() => Promise<void>) | undefined;
+  try {
+    releaseLock = await acquireTmsConfigLock(
+      context.paths.settingsDir,
+      deadline
+    );
+    const revisionPath = join(
+      context.paths.settingsDir,
+      "tms-credential-revision"
+    );
+    const [current, currentConfig, currentRevision] = await Promise.all([
+      readEnvFileValues(context.paths.clientSecretsFile),
+      readFile(context.paths.tmsAdapterConfigFile, "utf8").catch(() => ""),
+      readTmsCredentialRevision(revisionPath)
+    ]);
+    const generationChanged =
+      currentRevision < 1 ||
+      current.get("TMS_HTTP_BASE_URL") !== baseUrl ||
+      current.get("TMS_API_KEY") !== apiKey ||
+      currentConfig !== input.configYaml;
+    const credentialRevision = generationChanged
       ? currentRevision + 1
       : currentRevision;
-  await updateAllowedEnv(
-    context.paths.clientSecretsFile,
-    { TMS_HTTP_BASE_URL: baseUrl, TMS_API_KEY: apiKey },
-    ["TMS_HTTP_BASE_URL", "TMS_API_KEY"],
-    () => context.afterAtomicRename?.("tms_client_env")
-  );
-  await atomicWriteText(
-    context.paths.tmsAdapterConfigFile,
-    buildTmsAdapterYaml({
-      provider: "http",
-      base_url_env: "TMS_HTTP_BASE_URL",
-      headers: { authorization: "Bearer ${TMS_API_KEY}" },
-      endpoints: input.endpoints
-    }),
-    {
-      mode: 0o600,
-      afterRename: () => context.afterAtomicRename?.("tms_adapter_config")
+
+    if (generationChanged) {
+      // The revision is the invalidation record. It must become durable before
+      // either the adapter config or its credentials can expose a new generation.
+      await atomicWriteJson(
+        revisionPath,
+        {
+          schema_version: 1,
+          credential_revision: credentialRevision
+        },
+        {
+          mode: 0o600,
+          afterRename: () =>
+            context.afterAtomicRename?.("tms_credential_revision")
+        }
+      );
+      await atomicWriteText(
+        context.paths.tmsAdapterConfigFile,
+        input.configYaml,
+        {
+          mode: 0o600,
+          afterRename: () =>
+            context.afterAtomicRename?.("tms_adapter_config")
+        }
+      );
+      await updateAllowedEnv(
+        context.paths.clientSecretsFile,
+        {
+          TMS_HTTP_BASE_URL: baseUrl,
+          TMS_API_KEY: apiKey
+        },
+        ["TMS_HTTP_BASE_URL", "TMS_API_KEY"],
+        () => context.afterAtomicRename?.("tms_client_env")
+      );
     }
-  );
-  if (credentialChanged || currentRevision < 1) {
-    await atomicWriteJson(
-      revisionPath,
-      { schema_version: 1, credential_revision: credentialRevision },
-      { mode: 0o600 }
+
+    deadline.signal.throwIfAborted();
+    const tmsEnv = {
+      ...context.env,
+      TMS_HTTP_BASE_URL: baseUrl,
+      TMS_API_KEY: apiKey
+    };
+    const transport = createPinnedTmsTransport({
+      baseUrlOrigin: baseUrl,
+      resolveHostname: context.resolveHostname,
+      request: context.pinnedRequest,
+      maximumBodyBytes: DEFAULT_MAX_BODY_BYTES,
+      acceptanceMode,
+      deadline
+    });
+    const adapter = await createTmsAdapterFromConfig(
+      context.paths.tmsAdapterConfigFile,
+      { env: tmsEnv, fetch: transport.fetch }
     );
+    const receipt = await input.probe({
+      adapter,
+      resolvedBaseUrl: baseUrl,
+      resolvedHeaders: { authorization: `Bearer ${apiKey}` },
+      adapterConfigPath: context.paths.tmsAdapterConfigFile,
+      credentialRevision,
+      receiptPath: context.paths.tmsProbeFile,
+      sampleQuery: input.sampleQuery,
+      fetch: transport.fetch,
+      resolveHostname: context.resolveHostname,
+      now: context.now,
+      timeoutMs: context.httpProbeTimeoutMs,
+      acceptanceMode,
+      deadline,
+      afterReceiptRename: () =>
+        context.afterAtomicRename?.("tms_probe_receipt")
+    });
+    return { adapter, env: tmsEnv, credentialRevision, receipt };
+  } finally {
+    await releaseLock?.();
+    deadline.dispose();
   }
-  const tmsEnv = {
-    ...context.env,
-    TMS_HTTP_BASE_URL: baseUrl,
-    TMS_API_KEY: apiKey
-  };
-  const safeFetch = buildSafeTmsFetch({
-    baseUrlOrigin: baseUrl,
-    fetch: context.fetch,
-    resolveHostname: context.resolveHostname,
-    acceptanceMode,
-    timeoutMs: context.httpProbeTimeoutMs ?? DEFAULT_TIMEOUT_MS,
-    maximumBodyBytes: DEFAULT_MAX_BODY_BYTES
-  });
-  const adapter = await createTmsAdapterFromConfig(
-    context.paths.tmsAdapterConfigFile,
-    { env: tmsEnv, fetch: safeFetch }
-  );
-  const receipt = await probeLegacyCustomHttp({
-    adapter,
-    resolvedBaseUrl: baseUrl,
-    resolvedHeaders: { authorization: `Bearer ${apiKey}` },
-    adapterConfigPath: context.paths.tmsAdapterConfigFile,
-    credentialRevision,
-    receiptPath: context.paths.tmsProbeFile,
-    sampleQuery: input.sampleQuery,
-    resolveHostname: context.resolveHostname,
-    now: context.now,
-    timeoutMs: context.httpProbeTimeoutMs,
-    acceptanceMode
-  });
-  return { adapter, env: tmsEnv, credentialRevision, receipt };
 }
 
 const receiptOriginSchema = z.string().url().refine((value) => {
@@ -371,9 +378,24 @@ const receiptSchema = z.discriminatedUnion("contract", [
 export async function probeTmsHttpV1(
   input: TmsProbeInput
 ): Promise<TmsHttpV1ProbeReceipt> {
-  const prepared = await prepareProbe(input);
+  const ownedDeadline = input.deadline
+    ? null
+    : createTmsAbsoluteDeadline(input.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+  const deadline = input.deadline ?? ownedDeadline!;
+  try {
+    return await probeTmsHttpV1WithinDeadline(input, deadline);
+  } finally {
+    ownedDeadline?.dispose();
+  }
+}
+
+async function probeTmsHttpV1WithinDeadline(
+  input: TmsProbeInput,
+  deadline: TmsAbsoluteDeadline
+): Promise<TmsHttpV1ProbeReceipt> {
+  const prepared = await prepareProbe(input, deadline);
   assertCanonicalV1Config(prepared.config);
-  const response = await fetchHealth(input, prepared.baseUrlOrigin);
+  const response = await fetchHealth(input, prepared.baseUrlOrigin, deadline);
   if (response.status >= 300 && response.status < 400) {
     throw new TmsProbeError("health_redirect_rejected");
   }
@@ -384,9 +406,10 @@ export async function probeTmsHttpV1(
     "health_body",
     readJsonBodyBounded(
       response,
-      input.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES
+      input.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES,
+      deadline
     ),
-    input.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+    deadline,
     () => void response.body?.cancel().catch(() => undefined)
   );
   if (
@@ -405,7 +428,7 @@ export async function probeTmsHttpV1(
     throw new TmsProbeError("write_quote_not_declared");
   }
 
-  await validateCanonicalOutputs(input);
+  await validateCanonicalOutputs(input, deadline);
   const receipt: TmsHttpV1ProbeReceipt = {
     contract: TMS_HTTP_V1_CONTRACT,
     adapter_config_sha256: prepared.adapterConfigSha256,
@@ -421,19 +444,38 @@ export async function probeTmsHttpV1(
       write_quote_declared: "ok"
     }
   };
-  await persistReceipt(input.receiptPath, receipt);
+  await persistReceipt(
+    input.receiptPath,
+    receipt,
+    input.afterReceiptRename
+  );
   return receipt;
 }
 
 export async function probeLegacyCustomHttp(
   input: TmsProbeInput
 ): Promise<LegacyCustomHttpProbeReceipt> {
-  const prepared = await prepareProbe(input);
+  const ownedDeadline = input.deadline
+    ? null
+    : createTmsAbsoluteDeadline(input.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+  const deadline = input.deadline ?? ownedDeadline!;
+  try {
+    return await probeLegacyCustomHttpWithinDeadline(input, deadline);
+  } finally {
+    ownedDeadline?.dispose();
+  }
+}
+
+async function probeLegacyCustomHttpWithinDeadline(
+  input: TmsProbeInput,
+  deadline: TmsAbsoluteDeadline
+): Promise<LegacyCustomHttpProbeReceipt> {
+  const prepared = await prepareProbe(input, deadline);
   assertLegacyCustomConfig(prepared.config);
   const health = await boundedOperation(
     "legacy_health",
     input.adapter.healthCheck(),
-    input.timeoutMs ?? DEFAULT_TIMEOUT_MS
+    deadline
   );
   if (
     health.ok !== true ||
@@ -443,7 +485,7 @@ export async function probeLegacyCustomHttp(
     throw new TmsProbeError("legacy_health_failed");
   }
 
-  await validateCanonicalOutputs(input);
+  await validateCanonicalOutputs(input, deadline);
   const receipt: LegacyCustomHttpProbeReceipt = {
     contract: LEGACY_CONTRACT,
     adapter_config_sha256: prepared.adapterConfigSha256,
@@ -459,7 +501,11 @@ export async function probeLegacyCustomHttp(
       write_quote_configured: "ok"
     }
   };
-  await persistReceipt(input.receiptPath, receipt);
+  await persistReceipt(
+    input.receiptPath,
+    receipt,
+    input.afterReceiptRename
+  );
   return receipt;
 }
 
@@ -487,7 +533,10 @@ export async function hasMatchingTmsProbeReceipt(input: {
   }
 }
 
-async function prepareProbe(input: TmsProbeInput): Promise<{
+async function prepareProbe(
+  input: TmsProbeInput,
+  deadline: TmsAbsoluteDeadline
+): Promise<{
   baseUrlOrigin: string;
   adapterConfigSha256: string;
   config: TmsAdapterFactoryConfig;
@@ -510,7 +559,8 @@ async function prepareProbe(input: TmsProbeInput): Promise<{
   await assertSafeOrigin(
     new URL(baseUrlOrigin),
     input.resolveHostname,
-    input.acceptanceMode
+    input.acceptanceMode,
+    deadline
   );
   let config: TmsAdapterFactoryConfig;
   let configBytes: Buffer;
@@ -566,9 +616,9 @@ function assertLegacyCustomConfig(config: TmsAdapterFactoryConfig): void {
 
 async function fetchHealth(
   input: TmsProbeInput,
-  baseUrlOrigin: string
+  baseUrlOrigin: string,
+  deadline: TmsAbsoluteDeadline
 ): Promise<Response> {
-  const controller = new AbortController();
   try {
     return await boundedOperation(
       "health",
@@ -578,11 +628,10 @@ async function fetchHealth(
           method: "GET",
           headers: input.resolvedHeaders,
           redirect: "manual",
-          signal: controller.signal
+          signal: deadline.signal
         }
       ),
-      input.timeoutMs ?? DEFAULT_TIMEOUT_MS,
-      () => controller.abort()
+      deadline
     );
   } catch (error) {
     if (error instanceof TmsProbeError) throw error;
@@ -590,25 +639,27 @@ async function fetchHealth(
   }
 }
 
-async function validateCanonicalOutputs(input: TmsProbeInput): Promise<void> {
-  const timeoutMs = input.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+async function validateCanonicalOutputs(
+  input: TmsProbeInput,
+  deadline: TmsAbsoluteDeadline
+): Promise<void> {
   const [historicalValue, unitsValue, performanceValue, zonesValue] =
     await Promise.all([
       boundedAdapterOperation(
         "historical_quotes",
         input.adapter.searchHistoricalQuotes(input.sampleQuery),
-        timeoutMs
+        deadline
       ),
-      boundedAdapterOperation("units", input.adapter.getUnits(), timeoutMs),
+      boundedAdapterOperation("units", input.adapter.getUnits(), deadline),
       boundedAdapterOperation(
         "unit_performance",
         input.adapter.getUnitPerformance(),
-        timeoutMs
+        deadline
       ),
       boundedAdapterOperation(
         "availability_zones",
         input.adapter.getAvailabilityZones(),
-        timeoutMs
+        deadline
       )
     ]);
 
@@ -654,10 +705,10 @@ async function validateCanonicalOutputs(input: TmsProbeInput): Promise<void> {
 async function boundedAdapterOperation<T>(
   endpoint: string,
   promise: Promise<T>,
-  timeoutMs: number
+  deadline: TmsAbsoluteDeadline
 ): Promise<T> {
   try {
-    return await boundedOperation(endpoint, promise, timeoutMs);
+    return await boundedOperation(endpoint, promise, deadline);
   } catch (error) {
     if (error instanceof TmsProbeError) throw error;
     throw new TmsProbeError(`${endpoint}_invalid`);
@@ -667,26 +718,29 @@ async function boundedAdapterOperation<T>(
 async function boundedOperation<T>(
   endpoint: string,
   promise: Promise<T>,
-  timeoutMs: number,
+  deadline: TmsAbsoluteDeadline,
   onTimeout?: () => void
 ): Promise<T> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const deadline = new Promise<never>((_resolve, reject) => {
-    timer = setTimeout(() => {
+  if (deadline.signal.aborted) {
+    onTimeout?.();
+    throw new TmsProbeError(`${endpoint}_timeout`);
+  }
+  return await new Promise<T>((resolve, reject) => {
+    const abort = () => {
       onTimeout?.();
       reject(new TmsProbeError(`${endpoint}_timeout`));
-    }, timeoutMs);
+    };
+    deadline.signal.addEventListener("abort", abort, { once: true });
+    promise.then(resolve, reject).finally(() => {
+      deadline.signal.removeEventListener("abort", abort);
+    });
   });
-  try {
-    return await Promise.race([promise, deadline]);
-  } finally {
-    if (timer) clearTimeout(timer);
-  }
 }
 
 async function readJsonBodyBounded(
   response: Response,
-  maximumBytes: number
+  maximumBytes: number,
+  deadline: TmsAbsoluteDeadline
 ): Promise<unknown> {
   const declaredLength = Number(response.headers.get("content-length"));
   if (Number.isFinite(declaredLength) && declaredLength > maximumBytes) {
@@ -699,7 +753,13 @@ async function readJsonBodyBounded(
   let total = 0;
   try {
     while (true) {
-      const { done, value } = await reader.read();
+      const { done, value } = await boundedOperation(
+        "health_body",
+        reader.read(),
+        deadline,
+        () => void reader.cancel(deadline.signal.reason).catch(() => undefined)
+      );
+      deadline.signal.throwIfAborted();
       if (done) break;
       if (!value) continue;
       total += value.byteLength;
@@ -723,99 +783,11 @@ async function readJsonBodyBounded(
   }
 }
 
-function buildSafeTmsFetch(input: {
-  baseUrlOrigin: string;
-  fetch: typeof fetch;
-  resolveHostname?: (hostname: string) => Promise<string[]>;
-  acceptanceMode?: string;
-  timeoutMs: number;
-  maximumBodyBytes: number;
-}): typeof fetch {
-  return (async (
-    request: URL | RequestInfo,
-    init: RequestInit = {}
-  ): Promise<Response> => {
-    let url: URL;
-    try {
-      url = new URL(
-        request instanceof URL
-          ? request.href
-          : request instanceof Request
-            ? request.url
-            : String(request)
-      );
-    } catch {
-      throw new TmsProbeError("request_url_invalid");
-    }
-    if (url.origin !== input.baseUrlOrigin) {
-      throw new TmsProbeError("request_origin_changed");
-    }
-    await assertSafeOrigin(
-      url,
-      input.resolveHostname,
-      input.acceptanceMode
-    );
-    const response = await input.fetch(url, {
-      ...init,
-      redirect: "manual"
-    });
-    if (response.status >= 300 && response.status < 400) {
-      await response.body?.cancel().catch(() => undefined);
-      throw new TmsProbeError("request_redirect_rejected");
-    }
-    if (!response.body) return response;
-    const bytes = await boundedOperation(
-      "response_body",
-      readResponseBytesBounded(response, input.maximumBodyBytes),
-      input.timeoutMs,
-      () => void response.body?.cancel().catch(() => undefined)
-    );
-    return new Response(Buffer.from(bytes), {
-      status: response.status,
-      statusText: response.statusText,
-      headers: response.headers
-    });
-  }) as typeof fetch;
-}
-
-async function readResponseBytesBounded(
-  response: Response,
-  maximumBytes: number
-): Promise<Uint8Array> {
-  const declaredLength = Number(response.headers.get("content-length"));
-  if (Number.isFinite(declaredLength) && declaredLength > maximumBytes) {
-    await response.body?.cancel().catch(() => undefined);
-    throw new TmsProbeError("response_body_too_large");
-  }
-  if (!response.body) return new Uint8Array();
-  const reader = response.body.getReader();
-  const chunks: Uint8Array[] = [];
-  let total = 0;
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      if (!value) continue;
-      total += value.byteLength;
-      if (total > maximumBytes) {
-        await reader.cancel().catch(() => undefined);
-        throw new TmsProbeError("response_body_too_large");
-      }
-      chunks.push(value);
-    }
-  } finally {
-    reader.releaseLock();
-  }
-  return Buffer.concat(
-    chunks.map((chunk) => Buffer.from(chunk)),
-    total
-  );
-}
-
 async function assertSafeOrigin(
   url: URL,
   resolver: ((hostname: string) => Promise<string[]>) | undefined,
-  acceptanceMode: string | undefined
+  acceptanceMode: string | undefined,
+  deadline: TmsAbsoluteDeadline
 ): Promise<void> {
   if (
     acceptanceMode === "macbook" &&
@@ -830,11 +802,16 @@ async function assertSafeOrigin(
       }
       return;
     }
-    await validatePublicHostname(
-      url.hostname,
-      resolver ?? resolveInternetAddresses
+    await boundedOperation(
+      "base_url_resolution",
+      validatePublicHostname(
+        url.hostname,
+        resolver ?? resolveInternetAddresses
+      ),
+      deadline
     );
-  } catch {
+  } catch (error) {
+    if (error instanceof TmsProbeError) throw error;
     throw new TmsProbeError("base_url_unsafe");
   }
 }
@@ -859,9 +836,13 @@ function parseSafe<T>(
 
 async function persistReceipt(
   receiptPath: string,
-  receipt: TmsProbeReceipt
+  receipt: TmsProbeReceipt,
+  afterRename?: () => void | Promise<void>
 ): Promise<void> {
-  await atomicWriteJson(receiptPath, receipt, { mode: 0o600 });
+  await atomicWriteJson(receiptPath, receipt, {
+    mode: 0o600,
+    afterRename
+  });
 }
 
 function sha256(bytes: Uint8Array): string {
@@ -892,4 +873,92 @@ export async function readTmsCredentialRevision(
   } catch {
     return 0;
   }
+}
+
+async function acquireTmsConfigLock(
+  settingsDir: string,
+  deadline: TmsAbsoluteDeadline
+): Promise<() => Promise<void>> {
+  const lockPath = join(settingsDir, "tms-config.lock");
+  await mkdir(settingsDir, { recursive: true, mode: 0o700 });
+  const owner = JSON.stringify({
+    schema_version: 1,
+    pid: process.pid,
+    token: randomUUID()
+  });
+  while (true) {
+    deadline.signal.throwIfAborted();
+    try {
+      await symlink(owner, lockPath);
+      return async () => {
+        const currentOwner = await readlink(lockPath).catch(() => "");
+        if (currentOwner === owner) {
+          await unlink(lockPath).catch(() => undefined);
+        }
+      };
+    } catch (error) {
+      if (!isFileExistsError(error)) throw error;
+    }
+
+    const observedOwner = await readlink(lockPath).catch(() => "");
+    if (isAbandonedLockOwner(observedOwner)) {
+      const currentOwner = await readlink(lockPath).catch(() => "");
+      if (currentOwner === observedOwner) {
+        await unlink(lockPath).catch(() => undefined);
+        continue;
+      }
+    }
+    await waitForLock(deadline.signal);
+  }
+}
+
+function isAbandonedLockOwner(rawOwner: string): boolean {
+  try {
+    const owner = JSON.parse(rawOwner) as { pid?: unknown };
+    if (!Number.isSafeInteger(owner.pid) || Number(owner.pid) < 1) {
+      return true;
+    }
+    try {
+      process.kill(Number(owner.pid), 0);
+      return false;
+    } catch (error) {
+      return isNoSuchProcessError(error);
+    }
+  } catch {
+    return true;
+  }
+}
+
+async function waitForLock(signal: AbortSignal): Promise<void> {
+  if (signal.aborted) throw signal.reason;
+  await new Promise<void>((resolve, reject) => {
+    const done = () => {
+      signal.removeEventListener("abort", abort);
+      resolve();
+    };
+    const timer = setTimeout(done, 10);
+    const abort = () => {
+      clearTimeout(timer);
+      reject(signal.reason);
+    };
+    signal.addEventListener("abort", abort, { once: true });
+  });
+}
+
+function isFileExistsError(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    error.code === "EEXIST"
+  );
+}
+
+function isNoSuchProcessError(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    error.code === "ESRCH"
+  );
 }

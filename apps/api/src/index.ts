@@ -1219,10 +1219,11 @@ async function hasTmsConnection(
       return false;
     }
     if (config.contract !== "quoteops-tms-http-v1") {
-      // Existing explicit-path HTTP remains a connection once its runtime
-      // inputs resolve, but its mapping/readiness gate stays closed until the
-      // distinct legacy live probe succeeds.
-      return true;
+      return hasCurrentTmsProbeReceipt({
+        env,
+        adapterPath,
+        expectedContract: "legacy-custom-http-canonical-output-v1"
+      });
     }
     return hasCurrentTmsProbeReceipt({
       env,

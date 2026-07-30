@@ -1450,7 +1450,7 @@ describe("QuoteOps API", () => {
       .replace("/quoteops/v1/availability-zones", "/availability-zones")
       .replace("/quoteops/v1/quotes", "/quotes");
     await writeFile(adapterPath, legacyConfig);
-    expect(await readRequiredSteps()).not.toContain("connect_tms");
+    expect(await readRequiredSteps()).toContain("connect_tms");
     expect(await readRequiredSteps()).toContain("map_tms");
 
     await writeFile(

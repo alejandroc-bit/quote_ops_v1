@@ -20,8 +20,10 @@ import {
   hasMatchingTmsProbeReceipt,
   probeLegacyCustomHttp,
   probeTmsHttpV1,
+  readTmsCredentialRevision,
   TmsProbeError
 } from "../src/onboard/tmsProbe.js";
+import { readEnvFileValues } from "../src/onboard/onboardConfig.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -58,6 +60,11 @@ const historical: HistoricalAnalysis = {
   ],
   insufficient_data: []
 };
+
+function pinnedRequestFromFetch(fetchFn: typeof fetch) {
+  return async ({ url, init }: { url: URL; init: RequestInit }) =>
+    await fetchFn(url, init);
+}
 
 function fixtureAdapter(
   overrides: Partial<TmsAdapter> = {}
@@ -184,6 +191,62 @@ function healthFetch(body: unknown = v1Health(), status = 200): typeof fetch {
 
 function publicResolver(): Promise<string[]> {
   return Promise.resolve(["8.8.8.8"]);
+}
+
+function canonicalFixtureFetch(): typeof fetch {
+  return vi.fn(async (request: URL | RequestInfo) => {
+    const url = new URL(
+      request instanceof URL
+        ? request.href
+        : request instanceof Request
+          ? request.url
+          : String(request)
+    );
+    const bodies: Record<string, unknown> = {
+      "/quoteops/v1/health": v1Health(),
+      "/quoteops/v1/historical-quotes/search": [
+        {
+          origin_city: "Monterrey",
+          origin_state: "NL",
+          origin_country: "MX",
+          destination_city: "Saltillo",
+          destination_state: "COA",
+          destination_country: "MX",
+          vehicle_profile_id: "unit-1",
+          rate_mxn: 1000,
+          quoted_at: "2026-06-01T00:00:00.000Z"
+        }
+      ],
+      "/quoteops/v1/units": [
+        {
+          unit_id: "unit-1",
+          current_lat: 25.6866,
+          current_lng: -100.3161,
+          status: "Available"
+        }
+      ],
+      "/quoteops/v1/unit-performance": [
+        {
+          unit_type: "unit-1",
+          kpl_yield: 2.7,
+          real_cost_per_km: 22
+        }
+      ],
+      "/quoteops/v1/availability-zones": [
+        {
+          zone_id: "north",
+          city: "Monterrey",
+          state: "NL",
+          country: "MX",
+          available_units: 1
+        }
+      ]
+    };
+    if (!(url.pathname in bodies)) throw new Error("unexpected endpoint");
+    return new Response(JSON.stringify(bodies[url.pathname]), {
+      status: 200
+    });
+  }) as unknown as typeof fetch;
 }
 
 describe("probeTmsHttpV1", () => {
@@ -490,6 +553,7 @@ describe("configureTmsHttpV1", () => {
     const context = {
       env: runtimeEnv,
       fetch: fetchFn,
+      pinnedRequest: pinnedRequestFromFetch(fetchFn),
       paths,
       resolveHostname: publicResolver,
       now: () => new Date("2026-07-29T18:00:00.000Z")
@@ -539,6 +603,140 @@ describe("configureTmsHttpV1", () => {
     );
     expect(rotated.credentialRevision).toBe(2);
     expect(rotated.env.TMS_API_KEY).toBe("token-two");
+  });
+
+  it.each([
+    "tms_credential_revision",
+    "tms_adapter_config",
+    "tms_client_env"
+  ])("leaves readiness false after a crash following %s rename", async (crashLabel) => {
+    const directory = await mkdtemp(join(tmpdir(), "quoteops-tms-crash-"));
+    temporaryDirectories.push(directory);
+    const paths = {
+      clientSecretsFile: join(directory, "secrets", "client.env"),
+      tmsAdapterConfigFile: join(directory, "connectors", "tms-adapter.yaml"),
+      tmsProbeFile: join(directory, "settings", "tms-probe.json"),
+      settingsDir: join(directory, "settings")
+    };
+    const fetchFn = canonicalFixtureFetch();
+    const baseContext = {
+      env: {},
+      fetch: fetchFn,
+      pinnedRequest: pinnedRequestFromFetch(fetchFn),
+      paths,
+      resolveHostname: publicResolver
+    };
+    await configureTmsHttpV1(
+      {
+        baseUrl: "https://old-tms.client.example",
+        apiKey: "old-token",
+        sampleQuery
+      },
+      baseContext
+    );
+
+    await expect(
+      configureTmsHttpV1(
+        {
+          baseUrl: "https://new-tms.client.example",
+          apiKey: "new-token",
+          sampleQuery
+        },
+        {
+          ...baseContext,
+          afterAtomicRename(label) {
+            if (label === crashLabel) throw new Error("simulated_crash");
+          }
+        }
+      )
+    ).rejects.toThrow("simulated_crash");
+
+    const credentialRevision = await readTmsCredentialRevision(
+      join(paths.settingsDir, "tms-credential-revision")
+    );
+    expect(
+      await hasMatchingTmsProbeReceipt({
+        adapterConfigPath: paths.tmsAdapterConfigFile,
+        receiptPath: paths.tmsProbeFile,
+        credentialRevision,
+        expectedContract: "quoteops-tms-http-v1"
+      })
+    ).toBe(false);
+  });
+
+  it("serializes two writers so generations cannot reuse a revision or mix env and receipt", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "quoteops-tms-writers-"));
+    temporaryDirectories.push(directory);
+    const paths = {
+      clientSecretsFile: join(directory, "secrets", "client.env"),
+      tmsAdapterConfigFile: join(directory, "connectors", "tms-adapter.yaml"),
+      tmsProbeFile: join(directory, "settings", "tms-probe.json"),
+      settingsDir: join(directory, "settings")
+    };
+    const fetchFn = canonicalFixtureFetch();
+    const context = {
+      env: {},
+      fetch: fetchFn,
+      pinnedRequest: pinnedRequestFromFetch(fetchFn),
+      paths,
+      resolveHostname: publicResolver
+    };
+
+    await Promise.all([
+      configureTmsHttpV1(
+        {
+          baseUrl: "https://writer-a.client.example",
+          apiKey: "token-a",
+          sampleQuery
+        },
+        context
+      ),
+      configureTmsHttpV1(
+        {
+          baseUrl: "https://writer-b.client.example",
+          apiKey: "token-b",
+          sampleQuery
+        },
+        context
+      )
+    ]);
+
+    const credentialRevision = await readTmsCredentialRevision(
+      join(paths.settingsDir, "tms-credential-revision")
+    );
+    const configured = await readEnvFileValues(paths.clientSecretsFile);
+    const receipt = JSON.parse(
+      await readFile(paths.tmsProbeFile, "utf8")
+    ) as {
+      credential_revision: number;
+      base_url_origin: string;
+    };
+    expect(credentialRevision).toBe(2);
+    expect(receipt.credential_revision).toBe(2);
+    expect(receipt.base_url_origin).toBe(
+      configured.get("TMS_HTTP_BASE_URL")
+    );
+    expect([
+      {
+        baseUrl: "https://writer-a.client.example",
+        apiKey: "token-a"
+      },
+      {
+        baseUrl: "https://writer-b.client.example",
+        apiKey: "token-b"
+      }
+    ]).toContainEqual({
+      baseUrl: configured.get("TMS_HTTP_BASE_URL"),
+      apiKey: configured.get("TMS_API_KEY")
+    });
+    expect(
+      await hasMatchingTmsProbeReceipt({
+        adapterConfigPath: paths.tmsAdapterConfigFile,
+        receiptPath: paths.tmsProbeFile,
+        credentialRevision,
+        expectedContract: "quoteops-tms-http-v1"
+      })
+    ).toBe(true);
   });
 });
 
