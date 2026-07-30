@@ -415,6 +415,96 @@ describe("resumable onboarding flow", () => {
     expect(await isApplianceSecretsComplete(context)).toBe(true);
   });
 
+  it("rejects mailbox answers when current configuration keeps mailbox disabled", async () => {
+    const fetchMock = vi.fn(async () => {
+      throw new Error("mailbox probe must not run");
+    });
+    const context = await testContext({
+      guided: false,
+      fetch: fetchMock as unknown as typeof fetch
+    });
+    const mailboxKey = await secretRef(
+      context,
+      "unexpected-disabled-mailbox.key",
+      "mailbox-secret"
+    );
+    const embeddingKey = await secretRef(
+      context,
+      "disabled-authority-embedding.key",
+      "embedding-secret"
+    );
+    context.answers = {
+      schema_version: 1,
+      mailbox: {
+        provider: "resend",
+        api_key: mailboxKey,
+        intake_address: "intake@example.com",
+        from_address: "quotes@example.com"
+      },
+      embeddings: {
+        provider: "gemini",
+        model: "text-embedding-004",
+        api_key: embeddingKey
+      }
+    };
+    const originalConfig = "unrelated:\n  keep: true\n";
+    const originalEnv = 'UNRELATED_SETTING="keep"\n';
+    await writeFile(context.paths.agentConfigFile, originalConfig, {
+      mode: 0o600
+    });
+    await writeFile(context.paths.clientSecretsFile, originalEnv, {
+      mode: 0o600
+    });
+    const phases: OnboardingPhase[] = [
+      {
+        id: "ai_provider",
+        async isComplete() {
+          return true;
+        },
+        async run() {
+          throw new Error("unexpected");
+        }
+      },
+      {
+        id: "cloudflare",
+        async isComplete() {
+          return true;
+        },
+        async run() {
+          throw new Error("unexpected");
+        }
+      },
+      applianceSecretsPhase
+    ];
+
+    await expect(
+      runOnboarding({
+        phases,
+        context,
+        selection: { mode: "only", phase: "appliance_secrets" }
+      })
+    ).rejects.toMatchObject({
+      code: "onboarding_pending",
+      phase: "appliance_secrets"
+    });
+    await expect(applianceSecretsPhase.run(context)).rejects.toMatchObject({
+      code: "onboarding_pending",
+      phase: "appliance_secrets"
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(await readFile(context.paths.agentConfigFile, "utf8")).toBe(
+      originalConfig
+    );
+    expect(await readFile(context.paths.clientSecretsFile, "utf8")).toBe(
+      originalEnv
+    );
+    expect(
+      await readFile(context.paths.mailboxProbeReceiptFile, "utf8").catch(
+        () => ""
+      )
+    ).toBe("");
+  });
+
   it("keeps a disabled mailbox incomplete while stale managed keys remain", async () => {
     const context = await testContext();
     await writeFile(

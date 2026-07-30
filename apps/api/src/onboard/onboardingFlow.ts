@@ -474,7 +474,7 @@ async function assertUnattendedPhaseAnswers(
           : phase === "appliance_secrets"
             ? Boolean(
                 answers?.embeddings &&
-                  (!mailboxEnabled || answers.mailbox)
+                  Boolean(answers.mailbox) === mailboxEnabled
               )
             : phase === "tms"
               ? Boolean(answers?.tms)

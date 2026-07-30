@@ -257,7 +257,7 @@ export const applianceSecretsPhase: OnboardingPhase = {
       const mailboxEnabled = await isMailboxEnabled(context);
       if (
         !context.answers.embeddings ||
-        (mailboxEnabled && !context.answers.mailbox)
+        mailboxEnabled !== Boolean(context.answers.mailbox)
       ) {
         throw new OnboardingError("onboarding_pending", {
           phase: "appliance_secrets"
