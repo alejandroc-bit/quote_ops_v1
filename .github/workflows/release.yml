@@ -31,18 +31,19 @@ jobs:
       matrix:
         include:
           - image: quote-ops-agent
+            key: agent
             dockerfile: deploy/appliance/Dockerfile
             build_args: |
               QUOTEOPS_SERVICE=agent
           - image: quote-ops-api
+            key: api
             dockerfile: deploy/appliance/Dockerfile
             build_args: |
               QUOTEOPS_SERVICE=api
           - image: quote-ops-web
+            key: web
             dockerfile: deploy/appliance/Dockerfile.web
             build_args: ""
-    outputs:
-      digest: ${{ steps.build.outputs.digest }}
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
@@ -62,24 +63,59 @@ jobs:
           push: true
           build-args: ${{ matrix.build_args }}
           tags: ghcr.io/alejandroc-bit/${{ matrix.image }}:${{ github.ref_name }}
+      - name: Save pushed digest
+        run: echo '${{ steps.build.outputs.digest }}' > ${{ matrix.key }}.digest
+      - uses: actions/upload-artifact@v4
+        with:
+          name: appliance-${{ matrix.key }}-digest
+          path: ${{ matrix.key }}.digest
+          retention-days: 1
+
+  collect-image-digests:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    outputs:
+      agent_digest: ${{ steps.digests.outputs.agent_digest }}
+      api_digest: ${{ steps.digests.outputs.api_digest }}
+      web_digest: ${{ steps.digests.outputs.web_digest }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: appliance-*-digest
+          merge-multiple: true
+      - id: digests
+        name: Expose distinct application digests
+        run: |
+          set -euo pipefail
+          for image in agent api web; do
+            digest="$(cat "$image.digest")"
+            [[ "$digest" =~ ^sha256:[a-f0-9]{64}$ ]]
+            echo "${image}_digest=$digest" >> "$GITHUB_OUTPUT"
+          done
 
   verify-anonymous-pulls:
-    needs: build-and-push
+    needs: collect-image-digests
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: read
     steps:
-      - uses: docker/setup-buildx-action@v3
       - name: Require anonymously pullable immutable application images
         env:
           VERSION: ${{ github.ref_name }}
+          AGENT_DIGEST: ${{ needs.collect-image-digests.outputs.agent_digest }}
+          API_DIGEST: ${{ needs.collect-image-digests.outputs.api_digest }}
+          WEB_DIGEST: ${{ needs.collect-image-digests.outputs.web_digest }}
         run: |
           set -euo pipefail
           [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
-          for image in quote-ops-agent quote-ops-api quote-ops-web; do
+          for image_and_digest in \
+            "quote-ops-agent:$AGENT_DIGEST" \
+            "quote-ops-api:$API_DIGEST" \
+            "quote-ops-web:$WEB_DIGEST"; do
+            image="${image_and_digest%%:*}"
+            digest="${image_and_digest#*:}"
             repository="ghcr.io/alejandroc-bit/$image"
-            digest="$(docker buildx imagetools inspect "$repository:$VERSION" --format '{{.Manifest.Digest}}')"
             [[ "$digest" =~ ^sha256:[a-f0-9]{64}$ ]]
             reference="$repository:$VERSION@$digest"
             [[ "$reference" != *:latest@* ]]

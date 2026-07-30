@@ -129,7 +129,16 @@ describe("Task D workflows", () => {
     expect(body).toContain("needs: verify");
     expect(body).toContain("verify-anonymous-pulls:");
     expect(body).toContain("docker pull \"$reference\"");
-    expect(body).toContain("steps.build.outputs.digest");
+    expect(body).toContain("collect-image-digests:");
+    for (const image of ["agent", "api", "web"]) {
+      expect(body).toContain(`key: ${image}`);
+      expect(body).toContain(`${image}_digest: \${{ steps.digests.outputs.${image}_digest }}`);
+      expect(body).toContain(`\${{ needs.collect-image-digests.outputs.${image}_digest }}`);
+    }
+    expect(body).toContain("name: appliance-${{ matrix.key }}-digest");
+    expect(body).toContain("path: ${{ matrix.key }}.digest");
+    expect(body).not.toContain("outputs:\n      digest: \${{ steps.build.outputs.digest }}");
+    expect(body).not.toContain("docker buildx imagetools inspect");
     expect(body).not.toContain("tags: ghcr.io/alejandroc-bit/${{ matrix.image }}:latest");
     expect(body).not.toContain("github.repository_owner");
   });
