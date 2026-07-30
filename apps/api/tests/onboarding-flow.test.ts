@@ -28,6 +28,17 @@ import {
   validateAiProviderCredential
 } from "../src/onboard/aiProviderStep.js";
 import {
+  activateLicenseFromOnboarding,
+  licenseActivationPhase
+} from "../src/onboard/licenseActivationStep.js";
+import {
+  deterministicReadinessRunId,
+  readinessRfqRequest,
+  requestSha256ForReadinessRfq,
+  runTestRfqPhase,
+  testRfqPhase
+} from "../src/onboard/testRfqStep.js";
+import {
   configureCloudflareTunnel,
   validatePublicHostname
 } from "../src/onboard/cloudflareStep.js";
@@ -61,9 +72,15 @@ describe("resumable onboarding flow", () => {
     const calls: string[] = [];
     const phases = [
       phase("ai_provider", calls),
+      phase("license_activation", calls),
       phase("cloudflare", calls),
       phase("appliance_secrets", calls),
-      phase("tms", calls)
+      phase("tms", calls),
+      phase("units", calls),
+      phase("authorization", calls),
+      phase("pricing", calls),
+      phase("knowledge", calls),
+      phase("test_rfq", calls)
     ];
 
     const result = await runOnboarding({
@@ -74,16 +91,28 @@ describe("resumable onboarding flow", () => {
 
     expect(calls).toEqual([
       "ai_provider",
+      "license_activation",
       "cloudflare",
       "appliance_secrets",
-      "tms"
+      "tms",
+      "units",
+      "authorization",
+      "pricing",
+      "knowledge",
+      "test_rfq"
     ]);
     expect(result.pending_phases).toEqual([]);
     expect(result.completed_phases).toEqual([
       "ai_provider",
+      "license_activation",
       "cloudflare",
       "appliance_secrets",
-      "tms"
+      "tms",
+      "units",
+      "authorization",
+      "pricing",
+      "knowledge",
+      "test_rfq"
     ]);
     const audit = await context.stateStore.load();
     expect(Object.keys(audit)).toEqual(["schema_version", "observed_complete"]);
@@ -93,6 +122,340 @@ describe("resumable onboarding flow", () => {
           Object.keys(entry).sort().join(",") === "observed_at,phase"
       )
     ).toBe(true);
+  });
+
+  it("activates the authorized email through the fixed internal API and confirms the persisted license", async () => {
+    const requests: Array<{ url: string; init?: RequestInit }> = [];
+    let activated = false;
+    const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      requests.push({ url, init });
+      if (url.endsWith("/api/setup-state")) {
+        return Response.json({
+          activation: {
+            required: true,
+            status: activated ? "unlocked" : "locked",
+            client_id: "CLIENT-001",
+            installation_id: "INSTALL-001"
+          },
+          required_steps: activated ? [] : ["activate_license"]
+        });
+      }
+      activated = true;
+      return Response.json({
+        activated: true,
+        client_id: "CLIENT-001",
+        installation_id: "INSTALL-001"
+      });
+    });
+    const context = await testContext({
+      guided: false,
+      answers: {
+        schema_version: 1,
+        activation: { authorized_email: "owner@example.com" }
+      },
+      env: {
+        QUOTEOPS_CLIENT_ID: "CLIENT-001",
+        QUOTEOPS_INSTALLATION_ID: "INSTALL-001"
+      },
+      fetch: fetchMock as unknown as typeof fetch
+    });
+
+    expect(await licenseActivationPhase.isComplete(context)).toBe(false);
+    await licenseActivationPhase.run(context);
+    expect(await licenseActivationPhase.isComplete(context)).toBe(true);
+    expect(requests.map((request) => request.url)).toEqual([
+      "http://quoteops-api:8080/api/setup-state",
+      "http://quoteops-api:8080/api/onboarding/activate",
+      "http://quoteops-api:8080/api/setup-state",
+      "http://quoteops-api:8080/api/setup-state"
+    ]);
+    expect(JSON.parse(String(requests[1]?.init?.body))).toEqual({
+      email: "owner@example.com"
+    });
+  });
+
+  it("does not mutate activation when the current valid license matches this appliance", async () => {
+    const fetchMock = vi.fn(async () =>
+      Response.json({
+        activation: {
+          required: true,
+          status: "unlocked",
+          client_id: "CLIENT-001",
+          installation_id: "INSTALL-001"
+        },
+        required_steps: []
+      })
+    );
+    const context = await testContext({
+      env: {
+        QUOTEOPS_CLIENT_ID: "CLIENT-001",
+        QUOTEOPS_INSTALLATION_ID: "INSTALL-001"
+      },
+      fetch: fetchMock as unknown as typeof fetch
+    });
+
+    expect(await licenseActivationPhase.isComplete(context)).toBe(true);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("maps an activation timeout to a safe code and never accepts an alternate origin", async () => {
+    const fetchMock = vi.fn(
+      async (_input: string | URL | Request, init?: RequestInit) =>
+        await new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => reject(init.signal?.reason), {
+            once: true
+          });
+        })
+    );
+
+    await expect(
+      activateLicenseFromOnboarding({
+        email: "owner@example.com",
+        fetch: fetchMock as unknown as typeof fetch
+      })
+    ).rejects.toMatchObject({ code: "activation_unreachable" });
+    expect(String(fetchMock.mock.calls[0]?.[0])).toBe(
+      "http://quoteops-api:8080/api/onboarding/activate"
+    );
+
+    const context = await testContext({
+      env: {
+        QUOTEOPS_ONBOARD_API_URL: "https://attacker.example",
+        QUOTEOPS_CLIENT_ID: "CLIENT-001",
+        QUOTEOPS_INSTALLATION_ID: "INSTALL-001"
+      },
+      fetch: fetchMock as unknown as typeof fetch
+    });
+    await expect(licenseActivationPhase.isComplete(context)).rejects.toMatchObject({
+      code: "onboarding_api_origin_invalid"
+    });
+  }, 15_000);
+
+  it("reuses an approved test RFQ receipt on resume without posting again", async () => {
+    const context = await testContext({
+      env: { QUOTEOPS_INSTALLATION_ID: "INSTALL-001" }
+    });
+    const runId = deterministicReadinessRunId("INSTALL-001");
+    await writeFile(
+      context.paths.testRfqReceiptFile,
+      JSON.stringify({
+        schema_version: 1,
+        run_id: runId,
+        request_sha256: requestSha256ForReadinessRfq(),
+        state: "complete",
+        submitted_at: "2026-07-30T00:00:00.000Z",
+        completed_at: "2026-07-30T00:00:02.000Z",
+        base_quote_status: "APPROVED",
+        approval_required: false
+      }),
+      { mode: 0o600 }
+    );
+    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+      expect(String(input)).toBe(`http://quoteops-api:8080/api/rfqs/${runId}`);
+      return Response.json(passingTestRfq(runId));
+    });
+    context.fetch = fetchMock as unknown as typeof fetch;
+
+    expect(await testRfqPhase.isComplete(context)).toBe(true);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(
+      fetchMock.mock.calls.some(([, init]) => init?.method === "POST")
+    ).toBe(false);
+  });
+
+  it("keeps a completed receipt pending when the referenced RFQ requires review", async () => {
+    const context = await testContext({
+      env: { QUOTEOPS_INSTALLATION_ID: "INSTALL-001" }
+    });
+    const runId = deterministicReadinessRunId("INSTALL-001");
+    await writeFile(
+      context.paths.testRfqReceiptFile,
+      JSON.stringify({
+        schema_version: 1,
+        run_id: runId,
+        request_sha256: requestSha256ForReadinessRfq(),
+        state: "complete",
+        submitted_at: "2026-07-30T00:00:00.000Z",
+        completed_at: "2026-07-30T00:00:02.000Z",
+        base_quote_status: "APPROVED",
+        approval_required: false
+      }),
+      { mode: 0o600 }
+    );
+    context.fetch = vi.fn(async () =>
+      Response.json({
+        ...passingTestRfq(runId),
+        status: "REVIEW_REQUIRED",
+        approval_required: true,
+        base_quote: { status: "REVIEW_REQUIRED", base_rate_mxn: 42_000 }
+      })
+    ) as unknown as typeof fetch;
+
+    expect(await testRfqPhase.isComplete(context)).toBe(false);
+  });
+
+  it.each([
+    {
+      label: "corrupt",
+      contents: "{not-json",
+      code: "test_rfq_receipt_invalid"
+    },
+    {
+      label: "mismatched",
+      contents: JSON.stringify({
+        schema_version: 1,
+        run_id: deterministicReadinessRunId("INSTALL-001"),
+        request_sha256: "f".repeat(64),
+        state: "submitted",
+        submitted_at: "2026-07-30T00:00:00.000Z"
+      }),
+      code: "test_rfq_receipt_mismatch"
+    }
+  ])("fails closed for a $label test RFQ receipt", async ({ contents, code }) => {
+    const context = await testContext({
+      env: { QUOTEOPS_INSTALLATION_ID: "INSTALL-001" }
+    });
+    const fetchMock = vi.fn();
+    context.fetch = fetchMock as unknown as typeof fetch;
+    await writeFile(context.paths.testRfqReceiptFile, contents, { mode: 0o600 });
+
+    await expect(testRfqPhase.isComplete(context)).rejects.toMatchObject({ code });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("writes test RFQ intent before POST and resumes with GET first after interruption", async () => {
+    const context = await testContext({
+      env: { QUOTEOPS_INSTALLATION_ID: "INSTALL-001" },
+      afterAtomicRename(label) {
+        if (label === "test_rfq_submitted") {
+          throw new Error("crash-after-intent");
+        }
+      }
+    });
+    const firstFetch = vi.fn();
+    context.fetch = firstFetch as unknown as typeof fetch;
+
+    await expect(runTestRfqPhase(context)).rejects.toThrow("crash-after-intent");
+    expect(firstFetch).not.toHaveBeenCalled();
+    const receipt = JSON.parse(
+      await readFile(context.paths.testRfqReceiptFile, "utf8")
+    );
+    expect(receipt).toMatchObject({
+      schema_version: 1,
+      request_sha256: requestSha256ForReadinessRfq(),
+      state: "submitted"
+    });
+
+    context.afterAtomicRename = undefined;
+    let getCount = 0;
+    let postCount = 0;
+    context.fetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      if (init?.method === "POST") {
+        postCount += 1;
+        expect(JSON.parse(String(init.body))).toMatchObject({
+          ...readinessRfqRequest,
+          run_id: receipt.run_id,
+          request_sha256: receipt.request_sha256
+        });
+        return Response.json({ run_id: receipt.run_id }, { status: 202 });
+      }
+      getCount += 1;
+      return getCount === 1
+        ? Response.json({ error: "workflow_run_not_found" }, { status: 404 })
+        : Response.json(passingTestRfq(receipt.run_id));
+    }) as unknown as typeof fetch;
+
+    await runTestRfqPhase(context, { pollIntervalMs: 0, timeoutMs: 1_000 });
+    expect(getCount).toBe(2);
+    expect(postCount).toBe(1);
+  });
+
+  it("resumes with GET after an accepted POST response is lost", async () => {
+    const context = await testContext({
+      env: { QUOTEOPS_INSTALLATION_ID: "INSTALL-001" }
+    });
+    let workflowAccepted = false;
+    const firstFetch = vi.fn(
+      async (_input: string | URL | Request, init?: RequestInit) => {
+        if (init?.method === "POST") {
+          workflowAccepted = true;
+          throw new Error("response-lost-after-accept");
+        }
+        return Response.json({ error: "workflow_run_not_found" }, { status: 404 });
+      }
+    );
+    context.fetch = firstFetch as unknown as typeof fetch;
+
+    await expect(
+      runTestRfqPhase(context, { pollIntervalMs: 0, timeoutMs: 1_000 })
+    ).rejects.toMatchObject({ code: "test_rfq_unreachable" });
+    expect(workflowAccepted).toBe(true);
+
+    const resumeFetch = vi.fn(
+      async (_input: string | URL | Request, init?: RequestInit) => {
+        expect(init?.method).not.toBe("POST");
+        return Response.json(
+          passingTestRfq(deterministicReadinessRunId("INSTALL-001"))
+        );
+      }
+    );
+    context.fetch = resumeFetch as unknown as typeof fetch;
+
+    await runTestRfqPhase(context, { pollIntervalMs: 0, timeoutMs: 1_000 });
+    expect(resumeFetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("resumes polling an accepted RFQ without posting a second workflow", async () => {
+    const context = await testContext({
+      env: { QUOTEOPS_INSTALLATION_ID: "INSTALL-001" }
+    });
+    let call = 0;
+    context.fetch = vi.fn(
+      async (_input: string | URL | Request, init?: RequestInit) => {
+        call += 1;
+        if (call === 1) {
+          return Response.json(
+            { error: "workflow_run_not_found" },
+            { status: 404 }
+          );
+        }
+        if (call === 2) {
+          expect(init?.method).toBe("POST");
+          return Response.json(
+            { run_id: deterministicReadinessRunId("INSTALL-001") },
+            { status: 202 }
+          );
+        }
+        if (call === 3) {
+          return Response.json({
+            run_id: deterministicReadinessRunId("INSTALL-001"),
+            status: "RECEIVED",
+            approval_required: false,
+            base_quote: null
+          });
+        }
+        throw new Error("poll-interrupted");
+      }
+    ) as unknown as typeof fetch;
+
+    await expect(
+      runTestRfqPhase(context, { pollIntervalMs: 0, timeoutMs: 1_000 })
+    ).rejects.toMatchObject({ code: "test_rfq_unreachable" });
+    expect(call).toBe(4);
+
+    const resumeFetch = vi.fn(
+      async (_input: string | URL | Request, init?: RequestInit) => {
+        expect(init?.method).not.toBe("POST");
+        return Response.json(
+          passingTestRfq(deterministicReadinessRunId("INSTALL-001"))
+        );
+      }
+    );
+    context.fetch = resumeFetch as unknown as typeof fetch;
+
+    await runTestRfqPhase(context, { pollIntervalMs: 0, timeoutMs: 1_000 });
+    expect(resumeFetch).toHaveBeenCalledTimes(1);
   });
 
   it("derives resume from current truth instead of the audit file", async () => {
@@ -1695,4 +2058,17 @@ async function secretRef(
   await writeFile(file, value, { mode: 0o600 });
   await chmod(file, 0o600);
   return { file };
+}
+
+function passingTestRfq(runId: string) {
+  return {
+    run_id: runId,
+    status: "APPROVED",
+    approval_required: false,
+    route_source: "sakbe",
+    base_quote: { status: "APPROVED", total_mxn: 42_000 },
+    route_evidence: { status: "resolved" },
+    writeback_result: { status: "written" },
+    node_status: { writeback: "completed" }
+  };
 }

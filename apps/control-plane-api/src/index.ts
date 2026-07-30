@@ -548,7 +548,19 @@ export function createControlPlaneApi(
       return;
     }
     if (token.used_at) {
-      res.status(403).json({ error: "registration_token_used" });
+      if (
+        client.status === "active" &&
+        client.installation.license_status === "active"
+      ) {
+        res.json({
+          activated: true,
+          client,
+          license: issueLicense(client, keyPair.private_key_pem, token.used_at),
+          public_key_pem: keyPair.public_key_pem
+        });
+        return;
+      }
+      res.status(409).json({ error: "registration_token_used_without_license" });
       return;
     }
     if (Date.parse(token.expires_at) <= now().getTime()) {

@@ -1,4 +1,13 @@
-import { access, mkdir, readFile, readdir, rename, unlink, writeFile } from "node:fs/promises";
+import {
+  access,
+  lstat,
+  mkdir,
+  readFile,
+  readdir,
+  rename,
+  unlink,
+  writeFile
+} from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { dirname, join } from "node:path";
 import express, { type Express, type Request, type Response } from "express";
@@ -90,6 +99,20 @@ export type {
   OnboardingAiConfig
 } from "./onboard/aiProviderStep.js";
 export {
+  activateLicenseFromOnboarding,
+  activationOnboardingResponseSchema,
+  licenseActivationPhase,
+  ONBOARD_INTERNAL_API_ORIGIN
+} from "./onboard/licenseActivationStep.js";
+export {
+  deterministicReadinessRunId,
+  readinessRfqRequest,
+  requestSha256ForReadinessRfq,
+  runTestRfqPhase,
+  testRfqPhase
+} from "./onboard/testRfqStep.js";
+export type { TestRfqReceipt } from "./onboard/testRfqStep.js";
+export {
   cloudflarePhase,
   configureCloudflareTunnel,
   readCloudflareConfig,
@@ -132,17 +155,39 @@ export type QuoteOpsApiDependencies = {
   defaultManifest: Promise<QuoteManifest | null>;
   store: QuoteOpsStore;
   graphRuntime: Pick<QuoteAgentRuntime, "resume">;
+  tunnelReadinessProbe: TunnelReadinessProbe;
 };
 
 export type SetupStepId =
   | "activate_license"
   | "configure_secrets"
+  | "connect_cloudflare"
   | "connect_tms"
   | "map_tms"
   | "connect_knowledge_base"
   | "connect_mailbox"
   | "connect_sakbe"
   | "run_test_rfq";
+
+export type TunnelSetupState = {
+  provider: "cloudflare";
+  required: true;
+  status:
+    | "missing_config"
+    | "missing_token"
+    | "starting"
+    | "ready"
+    | "unreachable"
+    | "access_unprotected"
+    | "pending_manual_public_validation";
+  public_hostname: string | null;
+  last_checked_at: string;
+};
+
+export type TunnelReadinessProbe = {
+  getHaConnections(): Promise<number>;
+  fetchPublic(url: URL, init: RequestInit): Promise<globalThis.Response>;
+};
 
 export type LocalSetupState = {
   activation: {
@@ -151,6 +196,7 @@ export type LocalSetupState = {
     client_id: string | null;
     installation_id: string | null;
   };
+  tunnel: TunnelSetupState;
   required_steps: SetupStepId[];
 };
 
@@ -183,7 +229,8 @@ export function createQuoteOpsApi(
       await buildLocalSetupState({
         env: process.env,
         manifest,
-        testRfqReady
+        testRfqReady,
+        tunnelReadinessProbe: dependencies.tunnelReadinessProbe
       })
     );
   }));
@@ -355,8 +402,24 @@ export function createQuoteOpsApi(
       return;
     }
 
-    const rawRfq = buildPlaygroundRfq(request, manifest);
     const runId = request.run_id ?? createPlaygroundRunId(manifest.client_id);
+    const requestFingerprint = playgroundRequestFingerprint(request);
+    const existing = await store.getWorkflowRun(runId);
+    if (existing) {
+      const storedFingerprint = (
+        existing as QuoteWorkflowState & {
+          playground_request_fingerprint?: string;
+        }
+      ).playground_request_fingerprint;
+      if (storedFingerprint !== requestFingerprint) {
+        res.status(409).json({ error: "playground_run_conflict" });
+        return;
+      }
+      res.status(202).json(playgroundSubmissionResponse(existing));
+      return;
+    }
+
+    const rawRfq = buildPlaygroundRfq(request, manifest);
     const input = await withDefaultTools(
       {
         run_id: runId,
@@ -379,20 +442,24 @@ export function createQuoteOpsApi(
       intakePlanner: "completed",
       normalizer: "pending"
     };
+    (
+      queuedRun as QuoteWorkflowState & {
+        playground_request_fingerprint?: string;
+      }
+    ).playground_request_fingerprint = requestFingerprint;
     await store.saveWorkflowRun(queuedRun);
     void workflowRunner(input)
-      .then((result) => store.saveWorkflowRun(result))
+      .then((result) => {
+        (
+          result as QuoteWorkflowState & {
+            playground_request_fingerprint?: string;
+          }
+        ).playground_request_fingerprint = requestFingerprint;
+        return store.saveWorkflowRun(result);
+      })
       .catch((error) => store.saveWorkflowRun(failedPlaygroundRun(queuedRun, error)));
 
-    res.status(202).json({
-      run_id: queuedRun.run_id,
-      rfq_id: queuedRun.raw_rfq.rfq_id,
-      status: "RECEIVED",
-      approval_required: false,
-      route_source: null,
-      base_rate_mxn: null,
-      recommended_rate_mxn: null
-    });
+    res.status(202).json(playgroundSubmissionResponse(queuedRun));
   }));
 
   app.get("/api/workflow-state/:runId", asyncRoute(async (req, res) => {
@@ -685,22 +752,30 @@ export function startControlPlaneSyncScheduler({
   return timer;
 }
 
-async function buildLocalSetupState({
+export async function buildLocalSetupState({
   env,
   manifest,
   testRfqReady,
-  providerReadiness
+  providerReadiness,
+  tunnelReadinessProbe
 }: {
   env: NodeJS.ProcessEnv;
   manifest: QuoteManifest | null;
   testRfqReady: boolean;
   providerReadiness?: ProviderReadiness;
+  tunnelReadinessProbe?: TunnelReadinessProbe;
 }): Promise<LocalSetupState> {
   const resolvedProviderReadiness = providerReadiness ?? (await loadProviderReadiness(env));
   const clientId = manifest?.client_id ?? optionalEnv(env.QUOTEOPS_CLIENT_ID) ?? null;
   const installationId = optionalEnv(env.QUOTEOPS_INSTALLATION_ID) ?? null;
   const activationRequired = true;
   const activationStatus = await deriveActivationStatus({ env, clientId, installationId });
+  const tunnel = await deriveTunnelSetupState({
+    env,
+    clientId,
+    installationId,
+    probe: tunnelReadinessProbe ?? defaultTunnelReadinessProbe
+  });
   const requiredSteps: SetupStepId[] = [];
 
   if (activationStatus !== "unlocked") {
@@ -708,6 +783,9 @@ async function buildLocalSetupState({
   }
   if (!(await hasConfiguredSecrets(resolvedProviderReadiness, env))) {
     requiredSteps.push("configure_secrets");
+  }
+  if (tunnel.status !== "ready") {
+    requiredSteps.push("connect_cloudflare");
   }
   if (!(await hasTmsConnection(resolvedProviderReadiness, env))) {
     requiredSteps.push("connect_tms");
@@ -735,8 +813,253 @@ async function buildLocalSetupState({
       client_id: clientId,
       installation_id: installationId
     },
+    tunnel,
     required_steps: [...new Set(requiredSteps)]
   };
+}
+
+const defaultTunnelReadinessProbe: TunnelReadinessProbe = {
+  async getHaConnections() {
+    const response = await fetch("http://cloudflared:2000/metrics", {
+      signal: AbortSignal.timeout(3_000)
+    });
+    if (!response.ok) throw new Error("cloudflared_metrics_unreachable");
+    const metrics = await response.text();
+    let found = false;
+    let connections = 0;
+    for (const line of metrics.split(/\r?\n/)) {
+      const match =
+        /^cloudflared_tunnel_ha_connections(?:\{[^}]*\})?\s+([0-9]+(?:\.[0-9]+)?)\s*$/.exec(
+          line
+        );
+      if (!match) continue;
+      const value = Number(match[1]);
+      if (!Number.isFinite(value)) throw new Error("cloudflared_metrics_invalid");
+      found = true;
+      connections += value;
+    }
+    if (!found) throw new Error("cloudflared_metrics_invalid");
+    return connections;
+  },
+  fetchPublic(url, init) {
+    return fetch(url, init);
+  }
+};
+
+async function deriveTunnelSetupState({
+  env,
+  clientId,
+  installationId,
+  probe
+}: {
+  env: NodeJS.ProcessEnv;
+  clientId: string | null;
+  installationId: string | null;
+  probe: TunnelReadinessProbe;
+}): Promise<TunnelSetupState> {
+  const checkedAt = new Date().toISOString();
+  const base = {
+    provider: "cloudflare" as const,
+    required: true as const,
+    last_checked_at: checkedAt
+  };
+  const config = await readTunnelConfig(env);
+  if (!config) {
+    return {
+      ...base,
+      status: "missing_config",
+      public_hostname: null
+    };
+  }
+  if (!(await hasTunnelToken(env))) {
+    return {
+      ...base,
+      status: "missing_token",
+      public_hostname: config.public_hostname
+    };
+  }
+
+  let connections: number;
+  try {
+    connections = await probe.getHaConnections();
+  } catch {
+    return {
+      ...base,
+      status: "unreachable",
+      public_hostname: config.public_hostname
+    };
+  }
+  if (!Number.isFinite(connections) || connections <= 0) {
+    return {
+      ...base,
+      status: "starting",
+      public_hostname: config.public_hostname
+    };
+  }
+
+  let publicResponse: globalThis.Response;
+  try {
+    publicResponse = await probe.fetchPublic(
+      new URL(`https://${config.public_hostname}/api/health`),
+      {
+        redirect: "manual",
+        signal: AbortSignal.timeout(3_000)
+      }
+    );
+  } catch {
+    return {
+      ...base,
+      status: "unreachable",
+      public_hostname: config.public_hostname
+    };
+  }
+  if (!hasCloudflareAccessEvidence(publicResponse)) {
+    return {
+      ...base,
+      status: "access_unprotected",
+      public_hostname: config.public_hostname
+    };
+  }
+  if (
+    !(await hasMatchingAuthenticatedOriginReceipt({
+      env,
+      hostname: config.public_hostname,
+      clientId,
+      installationId
+    }))
+  ) {
+    return {
+      ...base,
+      status: "pending_manual_public_validation",
+      public_hostname: config.public_hostname
+    };
+  }
+  return {
+    ...base,
+    status: "ready",
+    public_hostname: config.public_hostname
+  };
+}
+
+async function readTunnelConfig(
+  env: NodeJS.ProcessEnv
+): Promise<{ public_hostname: string } | null> {
+  const path =
+    optionalEnv(env.QUOTEOPS_CLOUDFLARE_CONFIG_PATH) ??
+    join(resolveSettingsDir(env), "cloudflare.json");
+  const value = await readSafeJsonObject(path);
+  if (
+    !value ||
+    value.provider !== "cloudflare" ||
+    value.origin_url !== "http://caddy:80" ||
+    typeof value.public_hostname !== "string" ||
+    !/^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/i.test(
+      value.public_hostname
+    )
+  ) {
+    return null;
+  }
+  return { public_hostname: value.public_hostname.toLowerCase() };
+}
+
+async function hasTunnelToken(env: NodeJS.ProcessEnv): Promise<boolean> {
+  if (Object.prototype.hasOwnProperty.call(env, "TUNNEL_TOKEN")) return true;
+  const path =
+    optionalEnv(env.QUOTEOPS_CLOUDFLARE_ENV_FILE) ??
+    (optionalEnv(env.QUOTEOPS_HOME)
+      ? join(optionalEnv(env.QUOTEOPS_HOME)!, "secrets/cloudflare.env")
+      : null);
+  if (!path) return false;
+  try {
+    const metadata = await lstat(path);
+    if (!metadata.isFile() || metadata.isSymbolicLink()) return false;
+    const contents = await readFile(path, "utf8");
+    return contents.split(/\r?\n/).some((line) => /^\s*TUNNEL_TOKEN=/.test(line));
+  } catch {
+    return false;
+  }
+}
+
+function hasCloudflareAccessEvidence(response: globalThis.Response): boolean {
+  const status = response.status;
+  const server = response.headers.get("server")?.trim().toLowerCase();
+  const ray = response.headers.get("cf-ray")?.trim();
+  if (server !== "cloudflare" || !ray) return false;
+  if (status === 401 || status === 403) return true;
+  if (![301, 302, 303, 307, 308].includes(status)) return false;
+  const location = response.headers.get("location");
+  if (!location) return false;
+  try {
+    const url = new URL(location);
+    return (
+      url.protocol === "https:" &&
+      (url.hostname === "cloudflareaccess.com" ||
+        url.hostname.endsWith(".cloudflareaccess.com")) &&
+      url.pathname.startsWith("/cdn-cgi/access/login/")
+    );
+  } catch {
+    return false;
+  }
+}
+
+async function hasMatchingAuthenticatedOriginReceipt({
+  env,
+  hostname,
+  clientId,
+  installationId
+}: {
+  env: NodeJS.ProcessEnv;
+  hostname: string;
+  clientId: string | null;
+  installationId: string | null;
+}): Promise<boolean> {
+  const version = optionalEnv(env.QUOTEOPS_VERSION);
+  if (!version || !clientId || !installationId) return false;
+  const path =
+    optionalEnv(env.QUOTEOPS_CLOUDFLARE_PUBLIC_VALIDATION_RECEIPT_PATH) ??
+    join(resolveSettingsDir(env), "cloudflare-public-validation.json");
+  const receipt = await readSafeJsonObject(path);
+  if (!receipt) return false;
+  return (
+    receipt.public_hostname === hostname &&
+    receipt.version === version &&
+    receipt.client_id === clientId &&
+    receipt.installation_id === installationId &&
+    receipt.authenticated_origin === true &&
+    Object.keys(receipt).every((key) =>
+      [
+        "public_hostname",
+        "version",
+        "client_id",
+        "installation_id",
+        "authenticated_origin"
+      ].includes(key)
+    )
+  );
+}
+
+async function readSafeJsonObject(
+  path: string
+): Promise<Record<string, unknown> | null> {
+  try {
+    const metadata = await lstat(path);
+    if (!metadata.isFile() || metadata.isSymbolicLink()) return null;
+    const value = JSON.parse(await readFile(path, "utf8")) as unknown;
+    return value && typeof value === "object" && !Array.isArray(value)
+      ? (value as Record<string, unknown>)
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function resolveSettingsDir(env: NodeJS.ProcessEnv): string {
+  return (
+    optionalEnv(env.QUOTEOPS_SETTINGS_DIR) ??
+    (optionalEnv(env.QUOTEOPS_HOME)
+      ? join(optionalEnv(env.QUOTEOPS_HOME)!, "settings")
+      : "/opt/quoteops-v1/settings")
+  );
 }
 
 type CloudActivationResponse = {
@@ -1724,6 +2047,7 @@ function parseApprovalDecision(body: Record<string, unknown>): ApprovalDecision 
 
 type PlaygroundRfqRequest = {
   run_id?: string;
+  request_sha256?: string;
   manifest_version?: string;
   criteria_version?: string;
   origin_city: string;
@@ -1749,6 +2073,7 @@ type PlaygroundRfqRequest = {
 function parsePlaygroundRfqRequest(body: Record<string, unknown>): PlaygroundRfqRequest {
   return {
     run_id: optionalText(body.run_id),
+    request_sha256: optionalSha256(body.request_sha256),
     manifest_version: optionalText(body.manifest_version),
     criteria_version: optionalText(body.criteria_version),
     origin_city: requiredText(body.origin_city, "origin_city"),
@@ -1769,6 +2094,28 @@ function parsePlaygroundRfqRequest(body: Record<string, unknown>): PlaygroundRfq
     customer_type: optionalText(body.customer_type),
     business_unit_id: optionalText(body.business_unit_id),
     route_policy: optionalText(body.route_policy)
+  };
+}
+
+function playgroundRequestFingerprint(request: PlaygroundRfqRequest): string {
+  const { run_id: _runId, ...structuralRequest } = request;
+  return createHash("sha256")
+    .update(JSON.stringify(structuralRequest))
+    .digest("hex");
+}
+
+function playgroundSubmissionResponse(run: QuoteWorkflowState) {
+  return {
+    run_id: run.run_id,
+    rfq_id: run.raw_rfq.rfq_id,
+    status:
+      run.base_quote || run.approval_state?.required
+        ? playgroundStatus(run)
+        : "RECEIVED",
+    approval_required: run.approval_state?.required ?? false,
+    route_source: run.route_evidence?.source ?? null,
+    base_rate_mxn: run.base_quote?.base_rate_mxn ?? null,
+    recommended_rate_mxn: null
   };
 }
 
@@ -1874,6 +2221,15 @@ function requiredText(value: unknown, field: string): string {
 
 function optionalText(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function optionalSha256(value: unknown): string | undefined {
+  const parsed = optionalText(value);
+  if (parsed === undefined) return undefined;
+  if (!/^[a-f0-9]{64}$/.test(parsed)) {
+    throw new Error("playground RFQ request_sha256 must be lowercase sha256");
+  }
+  return parsed;
 }
 
 function optionalNumberOrNull(value: unknown): number | null {

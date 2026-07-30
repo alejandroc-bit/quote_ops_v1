@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -60,6 +60,22 @@ describe("generated install pack", () => {
     tempDirs.push(workDir);
     const packDir = join(workDir, "pack");
     const homeDir = join(workDir, "home");
+    const mockBinDir = join(workDir, "bin");
+    await mkdir(mockBinDir, { recursive: true });
+    await writeFile(
+      join(mockBinDir, "docker"),
+      `#!/usr/bin/env bash
+if [[ "$1" == "volume" && "\${2:-}" == "inspect" ]]; then
+  exit 1
+fi
+if [[ "$1" == "volume" && "\${2:-}" == "ls" ]]; then
+  exit 0
+fi
+exit 1
+`,
+      "utf8"
+    );
+    await chmod(join(mockBinDir, "docker"), 0o755);
 
     expect(pack.files["connectors/knowledge/README.md"]).toContain(
       "documentos de conocimiento"
@@ -104,7 +120,11 @@ describe("generated install pack", () => {
       ],
       {
         cwd: packDir,
-        encoding: "utf8"
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          PATH: `${mockBinDir}:${process.env.PATH ?? ""}`
+        }
       }
     );
 
@@ -127,6 +147,36 @@ describe("generated install pack", () => {
     expect(installedAgentConfig).toContain("api_key_env: OPENROUTER_API_KEY");
     expect(installedTmsAdapter).toContain("provider: file_import");
     expect(installedRfqs).toContain("rfq_id,lane_id");
+    const generatedManifest = parseYaml(
+      pack.files["client-manifest.yaml"]!
+    ) as {
+      business_units: Array<{
+        business_unit_id: string;
+        default: boolean;
+      }>;
+      vehicle_profiles: Array<{
+        vehicle_profile_id: string;
+        business_unit_id: string;
+        pricing_model: string;
+        margin_target_pct: number;
+        minimum_margin_pct: number;
+      }>;
+    };
+    expect(generatedManifest.business_units).toContainEqual(
+      expect.objectContaining({
+        business_unit_id: "general",
+        default: true
+      })
+    );
+    expect(generatedManifest.vehicle_profiles).toContainEqual(
+      expect.objectContaining({
+        vehicle_profile_id: "T3S3_53_DRYVAN",
+        business_unit_id: "general",
+        pricing_model: "profitability",
+        margin_target_pct: 0.2,
+        minimum_margin_pct: 0.12
+      })
+    );
     expect(pack.release).toEqual({
       version: "v0.2.0",
       bundle_sha256: "a".repeat(64)

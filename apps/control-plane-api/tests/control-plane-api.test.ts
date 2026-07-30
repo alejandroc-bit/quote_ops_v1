@@ -97,7 +97,17 @@ describe("minimal control-plane API", () => {
 
   it("creates a client, generates an install pack and activates with a signed license", async () => {
     const keyPair = generateLicenseKeyPair();
+    const baseData = createInMemoryControlPlaneData();
+    let tokenConsumptionTransitions = 0;
+    const data: ControlPlaneData = {
+      ...baseData,
+      async markRegistrationTokenUsed(tokenHash, usedAt) {
+        tokenConsumptionTransitions += 1;
+        return baseData.markRegistrationTokenUsed(tokenHash, usedAt);
+      }
+    };
     const api = await startApi({
+      data,
       keyPair,
       tokenGenerator: () => "registration-token-1",
       now: () => new Date("2026-06-25T12:00:00.000Z")
@@ -144,14 +154,23 @@ describe("minimal control-plane API", () => {
       expected_installation_id: "nmx-prod-001"
     });
 
+    // Simulate response loss: retry the same activation after the first request
+    // committed both the licensed installation and token consumption.
     const reused = await api.post("/api/onboarding/activate", {
       client_id: "NMX",
       installation_id: "nmx-prod-001",
       email: "ops@nmx.example",
       registration_token: "registration-token-1"
     });
-    expect(reused.status).toBe(403);
-    expect(reused.body.error).toBe("registration_token_used");
+    expect(reused.status).toBe(200);
+    expect(reused.body.activated).toBe(true);
+    verifyInstallationLicense(reused.body.license as InstallationLicense, {
+      public_key_pem: keyPair.public_key_pem,
+      now: "2026-06-25T12:01:00.000Z",
+      expected_client_id: "NMX",
+      expected_installation_id: "nmx-prod-001"
+    });
+    expect(tokenConsumptionTransitions).toBe(1);
   });
 
   it("fails closed on admin routes without a valid Supabase session", async () => {
@@ -351,6 +370,8 @@ describe("minimal control-plane API", () => {
     expect(installer.text).toContain("--client 'NMX'");
     expect(installer.text).toContain("--installation-id 'nmx-prod-001'");
     expect(installer.text).toContain("--version 'v0.2.0'");
+    expect(installer.text).toContain("--guided");
+    expect(installer.text).toContain('"$@"');
     // the token authorizes the download but is never embedded in the script
     expect(installer.text).not.toContain(registrationToken);
 

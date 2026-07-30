@@ -46,6 +46,8 @@ GUIDED=0
 RESUME_GUIDED=0
 EXISTING_INSTALL=0
 POSTGRES_PASSWORD_FLAG_SET=0
+ANSWERS_DIR=""
+ANSWERS_OVERRIDE_FILE=""
 
 usage() {
   cat <<USAGE
@@ -77,6 +79,7 @@ Options:
   --installation-id ID     Stable appliance installation id
   --guided                 Require checksum-verified release-local runtime assets
   --resume-guided          Resume guided verification using protected local state
+  --answers-dir HOST_DIR   Mac acceptance inputs (bounded 0700 directory; guided only)
   --force                  Replace existing env file and manifest copy
   --skip-start             Prepare files without running docker compose up
   --no-pull                Skip docker compose pull; validate config and start pre-loaded images
@@ -444,6 +447,246 @@ require_compose_224() {
   : "$patch"
 }
 
+cleanup_answers_override() {
+  if [[ -n "$ANSWERS_OVERRIDE_FILE" ]]; then
+    rm -f -- "$ANSWERS_OVERRIDE_FILE"
+    ANSWERS_OVERRIDE_FILE=""
+  fi
+}
+
+validate_acceptance_answers_dir() {
+  local requested="$1"
+  local physical_tmp
+  local acceptance_root
+  local physical_dir
+  local operator_uid
+  local owner
+  local reference
+  local relative_ref
+  local host_file
+
+  [[ "${QUOTEOPS_BOOTSTRAP_TEST_MODE:-}" == "macbook" ]] ||
+    die "--answers-dir is restricted to Mac acceptance mode"
+  [[ "${QUOTEOPS_AUTOMATION_MODE:-}" == "1" ]] ||
+    die "--answers-dir requires noninteractive acceptance mode"
+  [[ -d "$requested" && ! -L "$requested" ]] ||
+    die "acceptance answers directory must be physical"
+  physical_dir="$(cd "$requested" && pwd -P)"
+  [[ "$(file_mode "$physical_dir")" == "700" ]] ||
+    die "acceptance answers directory must have mode 0700"
+  physical_tmp="$(cd "${TMPDIR:-/tmp}" && pwd -P)"
+  case "$QUOTEOPS_HOME" in
+    "$physical_tmp"/quoteops-mac-e2e.*/quoteops-v1) ;;
+    *) die "--answers-dir requires a bounded Mac acceptance root" ;;
+  esac
+  acceptance_root="$(dirname "$QUOTEOPS_HOME")"
+  case "$physical_dir" in
+    "$acceptance_root"/*) ;;
+    *) die "acceptance answers directory escaped the bounded root" ;;
+  esac
+
+  operator_uid="${SUDO_UID:-$(id -u)}"
+  owner="$(file_owner_id "$physical_dir")"
+  [[ "$owner" == "$operator_uid" || "$owner" == "0" ]] ||
+    die "acceptance answers directory has the wrong owner"
+  [[ -f "$physical_dir/answers.json" && ! -L "$physical_dir/answers.json" ]] ||
+    die "acceptance answers file must be regular"
+  [[ "$(file_mode "$physical_dir/answers.json")" == "600" ]] ||
+    die "acceptance answers file must have mode 0600"
+  owner="$(file_owner_id "$physical_dir/answers.json")"
+  [[ "$owner" == "$operator_uid" || "$owner" == "0" ]] ||
+    die "acceptance answers file has the wrong owner"
+
+  need_command jq
+  jq -e 'type == "object"' "$physical_dir/answers.json" >/dev/null 2>&1 ||
+    die "acceptance answers JSON is invalid"
+  while IFS= read -r reference; do
+    case "$reference" in
+      /run/quoteops-onboard-input/*)
+        relative_ref="${reference#/run/quoteops-onboard-input/}"
+        ;;
+      *) die "acceptance input reference escaped the fixed container mount" ;;
+    esac
+    [[ -n "$relative_ref" && "$relative_ref" != "." && "$relative_ref" != ".." &&
+       "$relative_ref" != */* ]] ||
+      die "acceptance input reference must name a file in the mounted directory"
+    host_file="$physical_dir/$relative_ref"
+    [[ -f "$host_file" && ! -L "$host_file" ]] ||
+      die "acceptance input reference must be a regular non-symlink file"
+    [[ "$(file_mode "$host_file")" == "600" ]] ||
+      die "acceptance input reference must have mode 0600"
+    owner="$(file_owner_id "$host_file")"
+    [[ "$owner" == "$operator_uid" || "$owner" == "0" ]] ||
+      die "acceptance input reference has the wrong owner"
+  done < <(jq -er '.. | objects | select(has("file")) | .file | strings' \
+    "$physical_dir/answers.json")
+
+  ANSWERS_DIR="$physical_dir"
+}
+
+create_acceptance_override() {
+  [[ -n "$ANSWERS_DIR" ]] || return 0
+  ANSWERS_OVERRIDE_FILE="$QUOTEOPS_HOME/settings/.onboard-acceptance.$$.json"
+  [[ ! -e "$ANSWERS_OVERRIDE_FILE" && ! -L "$ANSWERS_OVERRIDE_FILE" ]] ||
+    die "temporary acceptance override already exists"
+  jq -n --arg source "$ANSWERS_DIR" '{
+    services: {
+      "quoteops-onboard": {
+        environment: { QUOTEOPS_ACCEPTANCE_MODE: "macbook" },
+        volumes: [{
+          type: "bind",
+          source: $source,
+          target: "/run/quoteops-onboard-input",
+          read_only: true
+        }]
+      }
+    }
+  }' > "$ANSWERS_OVERRIDE_FILE"
+  chmod 600 "$ANSWERS_OVERRIDE_FILE"
+}
+
+guided_compose() {
+  local command=(
+    docker compose
+    --env-file "$ENV_FILE"
+    --env-file "$RELEASE_ENV_FILE"
+    -f "$COMPOSE_FILE"
+  )
+  if [[ -n "$ANSWERS_OVERRIDE_FILE" ]]; then
+    command+=(-f "$ANSWERS_OVERRIDE_FILE")
+  fi
+  "${command[@]}" "$@"
+}
+
+guided_pending() {
+  printf '%s\n' \
+    "Onboarding pendiente. Reanuda con:" \
+    "sudo quoteops onboard --resume"
+  return 20
+}
+
+run_guided_onboarding_container() {
+  local selection_flag="$1"
+  local selection_phase="$2"
+  local command=(
+    --profile onboarding run --rm
+  )
+  if [[ "${QUOTEOPS_AUTOMATION_MODE:-}" == "1" || -n "$ANSWERS_DIR" ]]; then
+    command+=(-T)
+  fi
+  command+=(quoteops-onboard --resume "$selection_flag" "$selection_phase")
+  if [[ -n "$ANSWERS_DIR" ]]; then
+    command+=(--answers-file /run/quoteops-onboard-input/answers.json)
+  fi
+  if [[ "${QUOTEOPS_AUTOMATION_MODE:-}" == "1" || -n "$ANSWERS_DIR" ]]; then
+    guided_compose "${command[@]}"
+  else
+    guided_compose "${command[@]}" < /dev/tty
+  fi
+}
+
+run_guided_sequence() {
+  local core_services=(postgres redis quoteops-agent quoteops-api quoteops-web caddy)
+  local health=""
+  local attempt
+  local public_hostname
+
+  guided_compose up -d "${core_services[@]}" || {
+    guided_pending
+    return 20
+  }
+  for attempt in $(seq 1 30); do
+    if health="$(guided_compose exec -T caddy wget -qO- -T 3 \
+      "http://127.0.0.1/api/health" 2>/dev/null)" &&
+       printf '%s' "$health" | grep -Eq '"ok"[[:space:]]*:[[:space:]]*true'; then
+      break
+    fi
+    health=""
+    sleep 2
+  done
+  [[ -n "$health" ]] || {
+    guided_pending
+    return 20
+  }
+  run_guided_onboarding_container --until knowledge || {
+    guided_pending
+    return 20
+  }
+  guided_compose up -d "${core_services[@]}" || {
+    guided_pending
+    return 20
+  }
+  run_guided_onboarding_container --only test_rfq || {
+    guided_pending
+    return 20
+  }
+  guided_compose --profile tunnel up -d cloudflared || {
+    guided_pending
+    return 20
+  }
+  QUOTEOPS_HOME="$QUOTEOPS_HOME" \
+    bash "$RELEASE_DIR/verify-install.sh" --resume-guided || {
+      guided_pending
+      return 20
+    }
+
+  public_hostname="$(jq -er '.public_hostname | strings | select(length > 0)' \
+    "$CLOUDFLARE_SETTINGS_FILE" 2>/dev/null)" || {
+      guided_pending
+      return 20
+    }
+  printf 'https://%s\n' "$public_hostname"
+}
+
+resume_guided_install() {
+  local physical_current
+  [[ -d "$QUOTEOPS_HOME" && ! -L "$QUOTEOPS_HOME" ]] ||
+    die "guided resume requires a physical QUOTEOPS_HOME"
+  QUOTEOPS_HOME="$(cd "$QUOTEOPS_HOME" && pwd -P)"
+  [[ "$QUOTEOPS_HOME" != "/" ]] || die "QUOTEOPS_HOME cannot be /"
+  ENV_FILE="$QUOTEOPS_HOME/.env"
+  [[ -f "$ENV_FILE" && ! -L "$ENV_FILE" ]] ||
+    die "guided resume requires the stored appliance env"
+  [[ -L "$QUOTEOPS_HOME/current" ]] ||
+    die "guided resume requires an active release"
+  physical_current="$(cd "$QUOTEOPS_HOME/current" && pwd -P)"
+  [[ "$(dirname "$physical_current")" == "$QUOTEOPS_HOME/releases" &&
+     "$(basename "$physical_current")" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] ||
+    die "guided resume current release escaped the release store"
+  RELEASE_DIR="$physical_current"
+  COMPOSE_FILE="$RELEASE_DIR/docker-compose.yml"
+  RELEASE_ENV_FILE="$RELEASE_DIR/release.env"
+  [[ -f "$COMPOSE_FILE" && ! -L "$COMPOSE_FILE" &&
+     -f "$RELEASE_ENV_FILE" && ! -L "$RELEASE_ENV_FILE" ]] ||
+    die "guided resume release is incomplete"
+  CLIENT_ID="$(read_env_value QUOTEOPS_CLIENT_ID "$ENV_FILE")"
+  QUOTEOPS_INSTALLATION_ID="$(read_env_value QUOTEOPS_INSTALLATION_ID "$ENV_FILE")"
+  QUOTEOPS_VERSION="$(read_env_value QUOTEOPS_VERSION "$RELEASE_ENV_FILE")"
+  [[ -n "$CLIENT_ID" && -n "$QUOTEOPS_INSTALLATION_ID" ]] ||
+    die "guided resume requires stored client and installation identity"
+  [[ -n "$QUOTEOPS_VERSION" ]] ||
+    die "guided resume requires a pinned release version"
+  CLOUDFLARE_SETTINGS_FILE="$QUOTEOPS_HOME/settings/cloudflare.json"
+  need_command docker
+  require_compose_224
+  if [[ -n "$ANSWERS_DIR" ]]; then
+    validate_acceptance_answers_dir "$ANSWERS_DIR"
+    create_acceptance_override
+  fi
+  trap cleanup_answers_override EXIT
+  local status
+  if run_guided_sequence; then
+    cleanup_answers_override
+    trap - EXIT
+    return 0
+  else
+    status=$?
+  fi
+  cleanup_answers_override
+  trap - EXIT
+  return "$status"
+}
+
 postgres_volume_state() {
   local volume_name="${COMPOSE_PROJECT_NAME}_postgres_data"
   local volumes
@@ -665,6 +908,11 @@ while [[ $# -gt 0 ]]; do
       QUOTEOPS_INSTALLATION_ID="$2"
       shift 2
       ;;
+    --answers-dir)
+      require_value "$1" "${2:-}"
+      ANSWERS_DIR="$2"
+      shift 2
+      ;;
     --force)
       FORCE=1
       shift
@@ -696,8 +944,18 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+if [[ "$RESUME_GUIDED" -eq 1 ]]; then
+  [[ -z "$CLIENT_ID" && -z "$MANIFEST_PATH" && -z "$QUOTEOPS_REGISTRATION_TOKEN_FILE" ]] ||
+    die "--resume-guided uses only protected local appliance state"
+  resume_guided_install
+  exit $?
+fi
+
 [[ -n "$CLIENT_ID" ]] || die "--client is required"
 [[ -n "$MANIFEST_PATH" ]] || die "--manifest is required"
+if [[ -n "$ANSWERS_DIR" && "$GUIDED" -ne 1 ]]; then
+  die "--answers-dir requires --guided"
+fi
 if [[ "$GUIDED" -eq 1 ]]; then
   [[ "$VERSION_SET" -eq 1 ]] || die "--version is required with --guided"
   [[ "$POSTGRES_PASSWORD_FLAG_SET" -eq 0 ]] ||
@@ -790,6 +1048,9 @@ if [[ "${QUOTEOPS_BOOTSTRAP_TEST_MODE:-}" == "macbook" ]]; then
 elif [[ -n "${QUOTEOPS_BOOTSTRAP_TEST_MODE:-}" ]]; then
   die "unknown bootstrap test mode"
 fi
+if [[ -n "$ANSWERS_DIR" ]]; then
+  validate_acceptance_answers_dir "$ANSWERS_DIR"
+fi
 ENV_FILE="$(absolute_new_path "$ENV_FILE")"
 SECRETS_ENV_FILE="$(absolute_new_path "$SECRETS_ENV_FILE")"
 CLOUDFLARE_ENV_FILE="$(absolute_new_path "$CLOUDFLARE_ENV_FILE")"
@@ -875,6 +1136,9 @@ mkdir -p "$QUOTEOPS_CONNECTORS_DIR/agent" "$QUOTEOPS_CONNECTORS_DIR/sakbe" "$QUO
 chmod 700 "$QUOTEOPS_HOME" "$QUOTEOPS_SECRETS_DIR" "$QUOTEOPS_MANIFEST_DIR" \
   "$QUOTEOPS_CRITERIA_DIR" "$QUOTEOPS_CONNECTORS_DIR" "$QUOTEOPS_LOG_DIR" \
   "$QUOTEOPS_BACKUP_DIR" "$QUOTEOPS_SETTINGS_DIR" "$QUOTEOPS_HOME/state"
+if [[ -n "$ANSWERS_DIR" ]]; then
+  create_acceptance_override
+fi
 
 if [[ ! -e "$SECRETS_ENV_FILE" ]]; then
   : > "$SECRETS_ENV_FILE"
@@ -936,6 +1200,7 @@ TMP_ENV="$ENV_FILE.tmp.$$"
 TMP_MANIFEST="$TARGET_MANIFEST.tmp.$$"
 cleanup() {
   rm -f "$TMP_ENV" "$TMP_MANIFEST"
+  cleanup_answers_override
 }
 trap cleanup EXIT
 
@@ -1063,13 +1328,16 @@ if [[ "$START_STACK" -eq 1 ]]; then
     docker compose --env-file "$ENV_FILE" --env-file "$RELEASE_ENV_FILE" \
       -f "$COMPOSE_FILE" --profile tunnel pull
   fi
-  docker compose --env-file "$ENV_FILE" --env-file "$RELEASE_ENV_FILE" \
-    -f "$COMPOSE_FILE" --profile tunnel up -d
   if [[ "$GUIDED" -eq 1 ]]; then
-    if ! QUOTEOPS_HOME="$QUOTEOPS_HOME" \
-      bash "$RELEASE_DIR/verify-install.sh" --resume-guided; then
-      die "Cloudflare public readiness verification failed"
+    if run_guided_sequence; then
+      :
+    else
+      guided_status=$?
+      exit "$guided_status"
     fi
+  else
+    docker compose --env-file "$ENV_FILE" --env-file "$RELEASE_ENV_FILE" \
+      -f "$COMPOSE_FILE" --profile tunnel up -d
   fi
 fi
 
@@ -1084,6 +1352,8 @@ if [[ -f "$TARGET_TMS_MAPPING_CONFIG" ]]; then
   echo "TMS mapping config: $TARGET_TMS_MAPPING_CONFIG"
 fi
 echo
-echo "Next: run the guided TRON onboarding (captures the AI key, secrets, TMS, units and knowledge):"
-echo "  quoteops onboard"
-echo "Re-run a single step anytime: append --sync-units, --map-tms or --ingest to that command."
+if [[ "$GUIDED" -ne 1 ]]; then
+  echo "Next: run the guided TRON onboarding (captures the AI key, secrets, TMS, units and knowledge):"
+  echo "  quoteops onboard"
+  echo "Re-run a single step anytime: append --sync-units, --map-tms or --ingest to that command."
+fi

@@ -68,12 +68,14 @@ import {
   type OnboardingPhase
 } from "./onboardingFlow.js";
 import { aiProviderPhase } from "./aiProviderStep.js";
+import { licenseActivationPhase } from "./licenseActivationStep.js";
 import {
   applianceSecretsPhase,
   knowledgePhase,
   runKnowledgeIngestion
 } from "./applianceSecretsStep.js";
 import { cloudflarePhase } from "./cloudflareStep.js";
+import { testRfqPhase } from "./testRfqStep.js";
 
 type OnboardPaths = {
   secretsFile: string;
@@ -317,13 +319,15 @@ function onboardingPhases(paths: OnboardPaths): OnboardingPhase[] {
   };
   return [
     aiProviderPhase,
+    licenseActivationPhase,
     cloudflarePhase,
     applianceSecretsPhase,
     tmsPhase,
     unitsPhase,
     authorizationPhase,
     pricingPhase,
-    knowledgePhase
+    knowledgePhase,
+    testRfqPhase
   ];
 }
 

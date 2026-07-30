@@ -45,11 +45,9 @@ esac
 case "${1:-}" in
   status)   exec "$SCRIPT_DIR/verify-install.sh" --summary ;;
   doctor)   exec "$SCRIPT_DIR/verify-install.sh" --verbose ;;
-  onboard)  shift; require_compose_224
-            exec docker compose --env-file "$QUOTEOPS_HOME/.env" \
-              --env-file "$QUOTEOPS_HOME/current/release.env" \
-              -f "$QUOTEOPS_HOME/current/docker-compose.yml" \
-              --profile onboarding run --rm quoteops-onboard "$@" ;;
+  onboard)  shift
+            if [[ "${1:-}" == "--resume" ]]; then shift; fi
+            exec "$SCRIPT_DIR/install.sh" --resume-guided "$@" ;;
   update)   shift; exec "$SCRIPT_DIR/upgrade.sh" "$@" ;;
   rollback) shift; exec "$SCRIPT_DIR/upgrade.sh" --rollback "$@" ;;
   backup)   shift; exec "$SCRIPT_DIR/backup.sh" \

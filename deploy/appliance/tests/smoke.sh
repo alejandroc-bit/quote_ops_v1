@@ -906,6 +906,140 @@ SH
     fail "install accepted a different client id for an existing appliance"
   fi
   test "$(readlink "$TEST_HOME/current")" = "$CURRENT_BEFORE" || fail "client-id rejection modified current"
+
+  ACCEPTANCE_ANSWERS_DIR="$E2E_ROOT/onboard-input"
+  ACCEPTANCE_SECRET_FILE="$ACCEPTANCE_ANSWERS_DIR/provider-secret"
+  ACCEPTANCE_SECRET_VALUE="acceptance-secret-must-not-log"
+  ACCEPTANCE_DOCKER_LOG="$E2E_ROOT/acceptance-docker.log"
+  ACCEPTANCE_OVERRIDE_CAPTURE="$E2E_ROOT/acceptance-override.json"
+  mkdir -m 700 "$ACCEPTANCE_ANSWERS_DIR"
+  printf '%s' "$ACCEPTANCE_SECRET_VALUE" > "$ACCEPTANCE_SECRET_FILE"
+  chmod 600 "$ACCEPTANCE_SECRET_FILE"
+  cat > "$ACCEPTANCE_ANSWERS_DIR/answers.json" <<'JSON'
+{
+  "schema_version": 1,
+  "ai_provider": {
+    "provider": "openrouter",
+    "api_key": {
+      "file": "/run/quoteops-onboard-input/provider-secret"
+    }
+  }
+}
+JSON
+  chmod 600 "$ACCEPTANCE_ANSWERS_DIR/answers.json"
+  cat > "$TEST_HOME/settings/cloudflare.json" <<'JSON'
+{"public_hostname":"quotes.client.example"}
+JSON
+  cat > "$TEST_HOME/current/verify-install.sh" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "verify-install.sh" >> "$ACCEPTANCE_DOCKER_LOG"
+SH
+  chmod +x "$TEST_HOME/current/verify-install.sh"
+  cat > "$BOOTSTRAP_MOCK_DIR/docker" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$ACCEPTANCE_DOCKER_LOG"
+previous=""
+for argument in "$@"; do
+  if [[ "$previous" == "-f" && "$argument" == *"/.onboard-acceptance."*".json" ]]; then
+    cp "$argument" "$ACCEPTANCE_OVERRIDE_CAPTURE"
+  fi
+  previous="$argument"
+done
+if [[ "$*" == "compose version --short" ]]; then
+  printf '%s\n' "2.24.0"
+elif [[ "$*" == *"exec -T caddy wget"*"/api/health"* ]]; then
+  printf '%s\n' '{"ok":true}'
+fi
+SH
+  chmod +x "$BOOTSTRAP_MOCK_DIR/docker"
+
+  : > "$ACCEPTANCE_DOCKER_LOG"
+  PATH="$BOOTSTRAP_MOCK_DIR:$PATH" \
+    QUOTEOPS_BOOTSTRAP_TEST_MODE=macbook \
+    QUOTEOPS_AUTOMATION_MODE=1 \
+    QUOTEOPS_HOME="$TEST_HOME" \
+    ACCEPTANCE_DOCKER_LOG="$ACCEPTANCE_DOCKER_LOG" \
+    ACCEPTANCE_OVERRIDE_CAPTURE="$ACCEPTANCE_OVERRIDE_CAPTURE" \
+    bash "$TEST_HOME/current/quoteops.sh" onboard --resume \
+      --answers-dir "$ACCEPTANCE_ANSWERS_DIR" \
+      >"$E2E_ROOT/acceptance-guided.log" 2>&1 ||
+    fail "Mac acceptance guided resume failed"
+
+  grep -q 'run --rm -T quoteops-onboard --resume --until knowledge --answers-file /run/quoteops-onboard-input/answers.json' \
+    "$ACCEPTANCE_DOCKER_LOG" ||
+    fail "answers-file automation did not disable TTY or use the fixed container path"
+  grep -q 'run --rm -T quoteops-onboard --resume --only test_rfq --answers-file /run/quoteops-onboard-input/answers.json' \
+    "$ACCEPTANCE_DOCKER_LOG" ||
+    fail "test RFQ automation did not receive the fixed answers path"
+  test -f "$ACCEPTANCE_OVERRIDE_CAPTURE" ||
+    fail "Mac acceptance guided resume did not create a compose override"
+  jq -e --arg source "$ACCEPTANCE_ANSWERS_DIR" '
+    (.services | keys) == ["quoteops-onboard"] and
+    .services["quoteops-onboard"].environment.QUOTEOPS_ACCEPTANCE_MODE == "macbook" and
+    .services["quoteops-onboard"].volumes == [{
+      type: "bind",
+      source: $source,
+      target: "/run/quoteops-onboard-input",
+      read_only: true
+    }]
+  ' "$ACCEPTANCE_OVERRIDE_CAPTURE" >/dev/null ||
+    fail "Mac acceptance compose override was not narrowly scoped and read-only"
+  if grep -Eq "$ACCEPTANCE_SECRET_VALUE|provider-secret" \
+    "$ACCEPTANCE_DOCKER_LOG" "$E2E_ROOT/acceptance-guided.log"; then
+    fail "Mac acceptance logs exposed an answer secret or referenced secret filename"
+  fi
+  if compgen -G "$TEST_HOME/settings/.onboard-acceptance.*.json" >/dev/null; then
+    fail "Mac acceptance temporary compose override was not removed"
+  fi
+  if grep -Eq 'QUOTEOPS_ACCEPTANCE_MODE|/run/quoteops-onboard-input' \
+    "$TEST_HOME/.env" \
+    "$TEST_HOME/secrets/client.env" \
+    "$TEST_HOME/secrets/cloudflare.env" \
+    "$TEST_HOME/current/release.env" \
+    "$APPLIANCE_DIR/docker-compose.yml"; then
+    fail "production compose configuration contains acceptance-only mounts or environment"
+  fi
+  if [[ -f "$TEST_HOME/secrets/cloudflare-access-validation.env" ]] &&
+    grep -Eq 'QUOTEOPS_ACCEPTANCE_MODE|/run/quoteops-onboard-input' \
+      "$TEST_HOME/secrets/cloudflare-access-validation.env"; then
+    fail "Cloudflare Access secrets contain acceptance-only configuration"
+  fi
+  grep -Fq 'guided_compose "${command[@]}" < /dev/tty' \
+    "$TEST_HOME/current/install.sh" ||
+    fail "interactive onboarding no longer reads from the operator TTY"
+
+  if command -v docker >/dev/null 2>&1 &&
+    docker info >/dev/null 2>&1 &&
+    docker image inspect alpine:3.20 >/dev/null 2>&1; then
+    ACCEPTANCE_UID_RECORD="$E2E_ROOT/acceptance-bind-uids.log"
+    host_answers_uid="$(
+      stat -f '%u' "$ACCEPTANCE_ANSWERS_DIR/answers.json" 2>/dev/null ||
+        stat -c '%u' "$ACCEPTANCE_ANSWERS_DIR/answers.json"
+    )"
+    container_answers_uid="$(
+      docker run --rm --pull=never \
+        -v "$ACCEPTANCE_ANSWERS_DIR:/run/quoteops-onboard-input:ro" \
+        --entrypoint /bin/sh alpine:3.20 -c '
+          answers=/run/quoteops-onboard-input/answers.json
+          secret=/run/quoteops-onboard-input/provider-secret
+          [ -f "$answers" ] && [ ! -L "$answers" ]
+          [ -f "$secret" ] && [ ! -L "$secret" ]
+          case "$(stat -c %a "$answers")" in 600|400) ;; *) exit 1 ;; esac
+          case "$(stat -c %a "$secret")" in 600|400) ;; *) exit 1 ;; esac
+          ! touch /run/quoteops-onboard-input/.write-probe 2>/dev/null
+          stat -c %u "$answers"
+        '
+    )" || fail "real Docker bind did not preserve a safe known read-only input mount"
+    printf 'host_uid=%s container_uid=%s\n' \
+      "$host_answers_uid" "$container_answers_uid" > "$ACCEPTANCE_UID_RECORD"
+    grep -Eq '^host_uid=[0-9]+ container_uid=[0-9]+$' "$ACCEPTANCE_UID_RECORD" ||
+      fail "real Docker bind did not record both observed UIDs"
+  else
+    echo "smoke.sh: Docker daemon/alpine:3.20 unavailable; skipped real Mac bind UID observation"
+  fi
+  rm -rf "$ACCEPTANCE_ANSWERS_DIR"
+  test ! -e "$ACCEPTANCE_ANSWERS_DIR" ||
+    fail "Mac acceptance harness did not remove host answer inputs immediately"
 fi
 
 MOCK_DOCKER_DIR="$(mktemp -d "${TMPDIR:-/tmp}/quoteops-mock-docker.XXXXXX")"
@@ -1010,6 +1144,102 @@ PATH="$MOCK_DOCKER_DIR:$PATH" MOCK_DOCKER_LOG="$MOCK_DOCKER_LOG" \
     --version v0.2.0 >/dev/null
 test "$(cat "$VOLUME_ABSENT_HOME/secrets/client.env")" = "$ABSENT_CLIENT_ENV_BEFORE" ||
   fail "reinstall changed the generated PostgreSQL password"
+
+GUIDED_FLOW_ROOT="$INSTALL_GUARD_DIR/guided-flow"
+GUIDED_FLOW_HOME="$GUIDED_FLOW_ROOT/quoteops-v1"
+GUIDED_FLOW_RELEASE="$GUIDED_FLOW_HOME/releases/v0.2.0"
+GUIDED_FLOW_BIN="$GUIDED_FLOW_ROOT/bin"
+GUIDED_FLOW_LOG="$GUIDED_FLOW_ROOT/sequence.log"
+mkdir -p \
+  "$GUIDED_FLOW_RELEASE" \
+  "$GUIDED_FLOW_HOME/settings" \
+  "$GUIDED_FLOW_HOME/secrets" \
+  "$GUIDED_FLOW_BIN"
+cp "$APPLIANCE_DIR/install.sh" "$GUIDED_FLOW_RELEASE/install.sh"
+cp "$APPLIANCE_DIR/quoteops.sh" "$GUIDED_FLOW_RELEASE/quoteops.sh"
+chmod +x "$GUIDED_FLOW_RELEASE/install.sh" "$GUIDED_FLOW_RELEASE/quoteops.sh"
+printf '%s\n' 'services: {}' > "$GUIDED_FLOW_RELEASE/docker-compose.yml"
+cat > "$GUIDED_FLOW_RELEASE/release.env" <<'EOF'
+QUOTEOPS_VERSION=v0.2.0
+EOF
+cat > "$GUIDED_FLOW_HOME/.env" <<EOF
+QUOTEOPS_CLIENT_ID=smoke
+QUOTEOPS_INSTALLATION_ID=smoke-install-001
+EOF
+cat > "$GUIDED_FLOW_HOME/settings/cloudflare.json" <<'EOF'
+{"provider":"cloudflare","public_hostname":"quotes.client.example","origin_url":"http://caddy:80"}
+EOF
+cat > "$GUIDED_FLOW_RELEASE/verify-install.sh" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' 'verify-install.sh' >> "$GUIDED_FLOW_LOG"
+exit "${GUIDED_VERIFY_EXIT:-0}"
+SH
+chmod +x "$GUIDED_FLOW_RELEASE/verify-install.sh"
+ln -s "$GUIDED_FLOW_RELEASE" "$GUIDED_FLOW_HOME/current"
+cat > "$GUIDED_FLOW_BIN/docker" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$GUIDED_FLOW_LOG"
+if [[ "$*" == "compose version --short" ]]; then
+  printf '%s\n' '2.24.0'
+elif [[ "$*" == *"exec -T caddy wget"*"http://127.0.0.1/api/health"* ]]; then
+  printf '%s\n' '{"ok":true}'
+elif [[ "$*" == *"quoteops-onboard --resume --until knowledge"* &&
+        "${GUIDED_ONBOARD_FAIL:-0}" == "1" ]]; then
+  exit 1
+fi
+SH
+chmod +x "$GUIDED_FLOW_BIN/docker"
+
+: > "$GUIDED_FLOW_LOG"
+PATH="$GUIDED_FLOW_BIN:$PATH" GUIDED_FLOW_LOG="$GUIDED_FLOW_LOG" \
+  QUOTEOPS_HOME="$GUIDED_FLOW_HOME" QUOTEOPS_AUTOMATION_MODE=1 \
+  bash "$GUIDED_FLOW_RELEASE/quoteops.sh" onboard --resume \
+  >"$GUIDED_FLOW_ROOT/success.log" 2>&1 ||
+  fail "quoteops onboard --resume did not complete guided orchestration"
+
+GUIDED_CORE_PATTERN='up -d postgres redis quoteops-agent quoteops-api quoteops-web caddy'
+GUIDED_KNOWLEDGE_PATTERN='--profile onboarding run --rm -T quoteops-onboard --resume --until knowledge'
+GUIDED_TEST_RFQ_PATTERN='--profile onboarding run --rm -T quoteops-onboard --resume --only test_rfq'
+GUIDED_TUNNEL_PATTERN='--profile tunnel up -d cloudflared'
+core_first="$(grep -n -- "$GUIDED_CORE_PATTERN" "$GUIDED_FLOW_LOG" | sed -n '1s/:.*//p')"
+knowledge_line="$(grep -n -- "$GUIDED_KNOWLEDGE_PATTERN" "$GUIDED_FLOW_LOG" | sed -n '1s/:.*//p')"
+core_second="$(grep -n -- "$GUIDED_CORE_PATTERN" "$GUIDED_FLOW_LOG" | sed -n '2s/:.*//p')"
+test_rfq_line="$(grep -n -- "$GUIDED_TEST_RFQ_PATTERN" "$GUIDED_FLOW_LOG" | sed -n '1s/:.*//p')"
+tunnel_line="$(grep -n -- "$GUIDED_TUNNEL_PATTERN" "$GUIDED_FLOW_LOG" | sed -n '1s/:.*//p')"
+verify_line="$(grep -n -- '^verify-install.sh$' "$GUIDED_FLOW_LOG" | sed -n '1s/:.*//p')"
+[[ -n "$core_first" && -n "$knowledge_line" && -n "$core_second" &&
+   -n "$test_rfq_line" && -n "$tunnel_line" && -n "$verify_line" &&
+   "$core_first" -lt "$knowledge_line" &&
+   "$knowledge_line" -lt "$core_second" &&
+   "$core_second" -lt "$test_rfq_line" &&
+   "$test_rfq_line" -lt "$tunnel_line" &&
+   "$tunnel_line" -lt "$verify_line" ]] ||
+  fail "guided resume did not follow the required core/onboard/restart/test/tunnel/verify sequence"
+grep -q 'https://quotes.client.example' "$GUIDED_FLOW_ROOT/success.log" ||
+  fail "guided resume did not print the public URL after readiness"
+
+: > "$GUIDED_FLOW_LOG"
+if PATH="$GUIDED_FLOW_BIN:$PATH" GUIDED_FLOW_LOG="$GUIDED_FLOW_LOG" \
+  GUIDED_ONBOARD_FAIL=1 QUOTEOPS_HOME="$GUIDED_FLOW_HOME" \
+  QUOTEOPS_AUTOMATION_MODE=1 \
+  bash "$GUIDED_FLOW_RELEASE/quoteops.sh" onboard --resume \
+  >"$GUIDED_FLOW_ROOT/failure.log" 2>&1; then
+  fail "guided resume succeeded after onboarding failure"
+else
+  guided_failure_status=$?
+fi
+[[ "$guided_failure_status" -eq 20 ]] ||
+  fail "guided resume did not return exit 20 after onboarding failure"
+grep -q '^Onboarding pendiente. Reanuda con:$' "$GUIDED_FLOW_ROOT/failure.log" ||
+  fail "guided failure omitted the pending heading"
+grep -q '^sudo quoteops onboard --resume$' "$GUIDED_FLOW_ROOT/failure.log" ||
+  fail "guided failure omitted the local resume command"
+if grep -q -- "$GUIDED_TUNNEL_PATTERN" "$GUIDED_FLOW_LOG"; then
+  fail "guided failure started cloudflared"
+fi
+if grep -q '^verify-install.sh$' "$GUIDED_FLOW_LOG"; then
+  fail "guided failure switched to verification"
+fi
 
 NO_PULL_HOME="$INSTALL_GUARD_DIR/home-no-pull"
 mkdir -p "$NO_PULL_HOME/secrets"

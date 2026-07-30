@@ -5,14 +5,16 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Duplex, Readable } from "node:stream";
 import { gzipSync } from "node:zlib";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import tar from "tar-stream";
 import {
   createApplianceWorkflowTools,
+  buildLocalSetupState,
   createInMemoryQuoteOpsStore,
   createQuoteOpsApi,
   startControlPlaneSyncScheduler,
-  type QuoteOpsApiDependencies
+  type QuoteOpsApiDependencies,
+  type TunnelReadinessProbe
 } from "../src/index";
 import { createControlPlaneApi } from "../../control-plane-api/src/index";
 import {
@@ -135,6 +137,62 @@ describe("QuoteOps API", () => {
         approval_required: false
       })
     );
+  });
+
+  it("reuses a structurally identical deterministic Playground run and rejects conflicts", async () => {
+    const writeback = vi.fn(async () => ({
+      status: "written" as const,
+      quote_id: "QUOTE-READINESS-1"
+    }));
+    const baseUrl = await startApi({
+      defaultManifest: Promise.resolve(workflowInput.manifest),
+      defaultTools: { ...workflowInput.tools, writeback }
+    });
+    const request = {
+      run_id: "RUN-READINESS-IDEMPOTENT-001",
+      request_sha256: "a".repeat(64),
+      origin_city: "Guadalajara",
+      origin_state: "Jalisco",
+      destination_city: "Monterrey",
+      destination_state: "Nuevo Leon",
+      equipment_request: "caja seca 53",
+      vehicle_profile_id: "T3S2_53_DRYVAN",
+      weight_kg: 18000,
+      commodity: "general",
+      sector: "industrial",
+      value_mxn: 250000,
+      business_unit_id: "general"
+    };
+    const submit = () =>
+      fetch(`${baseUrl}/api/playground/rfqs`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(request)
+      });
+
+    const first = await submit();
+    const duplicate = await submit();
+    const conflict = await fetch(`${baseUrl}/api/playground/rfqs`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        ...request,
+        destination_city: "Saltillo"
+      })
+    });
+    await waitForWorkflow(baseUrl, request.run_id);
+    for (let attempt = 0; attempt < 25 && writeback.mock.calls.length === 0; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+
+    expect(first.status).toBe(202);
+    expect(duplicate.status).toBe(202);
+    expect((await duplicate.json()).run_id).toBe(request.run_id);
+    expect(conflict.status).toBe(409);
+    expect(await conflict.json()).toEqual({
+      error: "playground_run_conflict"
+    });
+    expect(writeback.mock.calls.length).toBeLessThanOrEqual(1);
   });
 
   it("lists submitted RFQs and exposes a minimal approval envelope", async () => {
@@ -870,6 +928,7 @@ describe("QuoteOps API", () => {
           expect.arrayContaining([
             "activate_license",
             "configure_secrets",
+            "connect_cloudflare",
             "connect_tms",
             "map_tms",
             "connect_knowledge_base",
@@ -878,6 +937,15 @@ describe("QuoteOps API", () => {
             "run_test_rfq"
           ])
         );
+        expect(body.tunnel).toEqual({
+          provider: "cloudflare",
+          required: true,
+          status: "missing_config",
+          public_hostname: null,
+          last_checked_at: expect.any(String)
+        });
+        expect(body.required_steps).toContain("connect_cloudflare");
+        expect(serialized).not.toContain("TUNNEL_TOKEN");
         expect(serialized).not.toContain("compras@cliente.com");
         expect(serialized).not.toContain("raw_rfq");
         expect(serialized).not.toContain("TMS_API_KEY");
@@ -885,6 +953,158 @@ describe("QuoteOps API", () => {
       }
     );
   });
+
+  it("derives tunnel readiness only from connections, Access evidence, and a matching authenticated-origin receipt", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "quoteops-tunnel-state-"));
+    tempDirs.push(dir);
+    const configPath = join(dir, "cloudflare.json");
+    const receiptPath = join(dir, "cloudflare-public-validation.json");
+    await writeFile(
+      configPath,
+      JSON.stringify({
+        provider: "cloudflare",
+        public_hostname: "quotes.client.example",
+        origin_url: "http://caddy:80"
+      })
+    );
+    const env = {
+      QUOTEOPS_INSTALLATION_ID: "cliente-demo-prod-001",
+      QUOTEOPS_VERSION: "v0.2.0",
+      QUOTEOPS_CLOUDFLARE_CONFIG_PATH: configPath,
+      QUOTEOPS_CLOUDFLARE_PUBLIC_VALIDATION_RECEIPT_PATH: receiptPath,
+      TUNNEL_TOKEN: ""
+    };
+    const publicProtected = new Response(null, {
+      status: 403,
+      headers: { server: "cloudflare", "cf-ray": "abc-MTY" }
+    });
+
+    const zeroConnections: TunnelReadinessProbe = {
+      getHaConnections: async () => 0,
+      fetchPublic: vi.fn(async () => publicProtected)
+    };
+    const zero = await buildLocalSetupState({
+      env,
+      manifest: workflowInput.manifest,
+      testRfqReady: true,
+      tunnelReadinessProbe: zeroConnections
+    });
+    expect(zero.tunnel.status).toBe("starting");
+    expect(zero.required_steps).toContain("connect_cloudflare");
+    expect(zeroConnections.fetchPublic).not.toHaveBeenCalled();
+
+    const unprotected = await buildLocalSetupState({
+      env,
+      manifest: workflowInput.manifest,
+      testRfqReady: true,
+      tunnelReadinessProbe: {
+        getHaConnections: async () => 1,
+        fetchPublic: async () => Response.json({ ok: true })
+      }
+    });
+    expect(unprotected.tunnel.status).toBe("access_unprotected");
+
+    const protectedWithoutReceipt = await buildLocalSetupState({
+      env,
+      manifest: workflowInput.manifest,
+      testRfqReady: true,
+      tunnelReadinessProbe: {
+        getHaConnections: async () => 1,
+        fetchPublic: async () => publicProtected
+      }
+    });
+    expect(protectedWithoutReceipt.tunnel.status).toBe(
+      "pending_manual_public_validation"
+    );
+
+    await writeFile(
+      receiptPath,
+      JSON.stringify({
+        public_hostname: "quotes.client.example",
+        version: "v0.1.9",
+        client_id: "cliente-demo",
+        installation_id: "wrong-installation",
+        authenticated_origin: true
+      })
+    );
+    const mismatched = await buildLocalSetupState({
+      env,
+      manifest: workflowInput.manifest,
+      testRfqReady: true,
+      tunnelReadinessProbe: {
+        getHaConnections: async () => 1,
+        fetchPublic: async () => publicProtected
+      }
+    });
+    expect(mismatched.tunnel.status).toBe("pending_manual_public_validation");
+
+    await writeFile(
+      receiptPath,
+      JSON.stringify({
+        public_hostname: "quotes.client.example",
+        version: "v0.2.0",
+        client_id: "cliente-demo",
+        installation_id: "cliente-demo-prod-001",
+        authenticated_origin: true
+      })
+    );
+    const ready = await buildLocalSetupState({
+      env,
+      manifest: workflowInput.manifest,
+      testRfqReady: true,
+      tunnelReadinessProbe: {
+        getHaConnections: async () => 1,
+        fetchPublic: async () => publicProtected
+      }
+    });
+    expect(ready.tunnel).toMatchObject({
+      provider: "cloudflare",
+      required: true,
+      status: "ready",
+      public_hostname: "quotes.client.example"
+    });
+    expect(ready.required_steps).not.toContain("connect_cloudflare");
+    expect(JSON.stringify(ready)).not.toContain("TUNNEL_TOKEN");
+  });
+
+  it("marks an unreachable public tunnel probe safely without exposing response data", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "quoteops-tunnel-timeout-"));
+    tempDirs.push(dir);
+    const configPath = join(dir, "cloudflare.json");
+    await writeFile(
+      configPath,
+      JSON.stringify({
+        provider: "cloudflare",
+        public_hostname: "quotes.client.example",
+        origin_url: "http://caddy:80"
+      })
+    );
+    const probe: TunnelReadinessProbe = {
+      getHaConnections: async () => 1,
+      fetchPublic: vi.fn(
+        async (_url, init) =>
+          await new Promise<Response>((_resolve, reject) => {
+            init?.signal?.addEventListener("abort", () => reject(new Error("secret-body")), {
+              once: true
+            });
+          })
+      )
+    };
+    const state = await buildLocalSetupState({
+      env: {
+        QUOTEOPS_INSTALLATION_ID: "cliente-demo-prod-001",
+        QUOTEOPS_VERSION: "v0.2.0",
+        QUOTEOPS_CLOUDFLARE_CONFIG_PATH: configPath,
+        TUNNEL_TOKEN: "present"
+      },
+      manifest: workflowInput.manifest,
+      testRfqReady: true,
+      tunnelReadinessProbe: probe
+    });
+
+    expect(state.tunnel.status).toBe("unreachable");
+    expect(JSON.stringify(state)).not.toContain("secret-body");
+  }, 5_000);
 
   it("unlocks setup only when the signed license verifies for the local installation", async () => {
     const keyPair = generateLicenseKeyPair();
@@ -982,7 +1202,7 @@ describe("QuoteOps API", () => {
     );
   });
 
-  it("propagates the control plane rejection code instead of an opaque 500", async () => {
+  it("reuses a completed control-plane activation after response loss", async () => {
     const cloudBaseUrl = await startCloudTestServer("registration-token-reused");
     await fetch(`${cloudBaseUrl}/api/admin/clients`, {
       method: "POST",
@@ -1022,8 +1242,8 @@ describe("QuoteOps API", () => {
         });
         expect(first.status).toBe(200);
 
-        // the token was consumed by the first activation: the cloud answers
-        // 403 registration_token_used and the appliance must not mask it
+        // The first response can be lost. Retrying must recreate the current
+        // license response without consuming the token a second time.
         const reused = await fetch(`${baseUrl}/api/onboarding/activate`, {
           method: "POST",
           headers: { "content-type": "application/json" },
@@ -1031,9 +1251,12 @@ describe("QuoteOps API", () => {
         });
         const reusedBody = await reused.json();
 
-        expect(reused.status).toBe(403);
-        expect(reusedBody.error).toBe("registration_token_used");
-        expect(reusedBody.message).toContain("Generate install pack");
+        expect(reused.status).toBe(200);
+        expect(reusedBody).toMatchObject({
+          activated: true,
+          client_id: "cliente-demo",
+          installation_id: "cliente-demo-prod-001"
+        });
       }
     );
   });
