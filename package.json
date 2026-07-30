@@ -17,6 +17,7 @@
     "dev:control-plane-api": "tsx apps/control-plane-api/src/server.ts",
     "dev:web": "npm --workspace @quoteops/web run dev",
     "demo:nmx-control-plane": "bash deploy/control-plane/demo-nmx.sh",
+    "package:appliance": "node scripts/package-appliance-release.mjs",
     "test": "vitest run",
     "test:watch": "vitest",
     "typecheck": "npm run build:ts"
@@ -44,6 +45,7 @@
     "@types/react-dom": "^18.3.5",
     "@vitejs/plugin-react": "^4.3.4",
     "jsdom": "^25.0.1",
+    "tar-stream": "^3.2.0",
     "tsx": "^4.19.2",
     "typescript": "^5.7.2",
     "vite": "^6.0.7",
