@@ -74,6 +74,38 @@ Operational rules:
 - `backup.sh` does not include secret values. It writes only a `secrets.keys` inventory, so restore requires re-provisioning the client's secret file out of band.
 - If a required key is missing, the runtime must fail closed instead of inventing route, TMS, or pricing data.
 
+## Customer-owned Cloudflare exposure
+
+Production exposure requires resources that the client creates and owns in its
+Cloudflare account before guided onboarding:
+
+1. a remotely managed named tunnel;
+2. a public hostname on the client's zone routed to `http://caddy:80`;
+3. a Cloudflare Access application protecting that hostname;
+4. an Access policy allowing only the client's approved users or domain;
+5. an Access Service Auth token and a policy that explicitly includes that
+   token for the acceptance request;
+6. the named-tunnel token, Service Auth client ID, and Service Auth client
+   secret to paste into local onboarding.
+
+The named-tunnel token is stored only in root-owned mode-`0600`
+`secrets/cloudflare.env` as `TUNNEL_TOKEN`. Only the `cloudflared` container
+receives that file. The public hostname is non-secret state in
+`settings/cloudflare.json` and `QUOTEOPS_PUBLIC_HOSTNAME` in the shared
+configuration.
+
+Service Auth values are transient. They are held only in root-owned mode-`0600`
+`secrets/cloudflare-access-validation.env`, used to prove that the protected
+public origin reports the exact release, client ID, and installation ID, and
+deleted after an atomic safe validation receipt is stored. They are never
+included in logs, evidence, or backups. If a resumed verification has neither
+a matching safe receipt nor the temporary file, onboarding requests the
+Service Auth values again.
+
+QuoteOps never requests a Cloudflare account API token and does not create or
+modify the client's account, zone, tunnel, hostname, Access application, or
+Access policies automatically.
+
 ## Council-Locked Secret Policy
 
 Secret values stay in the client appliance or customer-managed vault. Client packs and the Inducta Control Plane may contain env var names such as `TMS_API_KEY`, `INEGI_SAKBE_KEY`, `OPENROUTER_API_KEY`, and `QUOTEOPS_EMBEDDING_API_KEY`, but never their values.

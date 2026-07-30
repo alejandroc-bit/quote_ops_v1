@@ -106,7 +106,223 @@ validate_human_simulator_fixture() {
   fi
 }
 
+validate_cloudflare_gate() {
+  local gate_root
+  local gate_home
+  local mock_bin
+  local output
+  local result
+
+  gate_root="$(mktemp -d "${TMPDIR:-/tmp}/quoteops-cloudflare-gate.XXXXXX")"
+  TEMP_DIRS+=("$gate_root")
+  gate_home="$gate_root/home"
+  mock_bin="$gate_root/bin"
+  mkdir -p "$gate_home/current" "$gate_home/secrets" "$gate_home/settings" "$mock_bin"
+  cp "$APPLIANCE_DIR/docker-compose.yml" "$gate_home/current/docker-compose.yml"
+  cat > "$gate_home/current/release.env" <<'EOF'
+QUOTEOPS_VERSION=v0.2.0
+EOF
+  cat > "$gate_home/.env" <<EOF
+QUOTEOPS_CLIENT_ID=smoke-client
+QUOTEOPS_INSTALLATION_ID=smoke-installation
+QUOTEOPS_PUBLIC_HOSTNAME=quote.client.example
+EOF
+  cat > "$gate_home/settings/cloudflare.json" <<'EOF'
+{"public_hostname":"quote.client.example"}
+EOF
+
+  cat > "$mock_bin/docker" <<'SH'
+#!/usr/bin/env bash
+set -u
+if [[ " $* " == *" ps --status running --services "* ]]; then
+  printf '%s\n' postgres redis quoteops-agent quoteops-api quoteops-web caddy
+  exit 0
+fi
+url="${!#}"
+case "$url" in
+  http://127.0.0.1/api/health)
+    printf '{"ok":true,"product_version":"%s"}\n' "${MOCK_INTERNAL_VERSION:-v0.2.0}"
+    ;;
+  http://127.0.0.1/api/setup-state)
+    printf '{"activation":{"client_id":"smoke-client","installation_id":"smoke-installation"},"required_steps":[]}\n'
+    ;;
+  http://cloudflared:2000/metrics)
+    printf 'cloudflared_tunnel_ha_connections %s\n' "${MOCK_TUNNEL_CONNECTIONS:-1}"
+    ;;
+  *)
+    exit 1
+    ;;
+esac
+SH
+  chmod 755 "$mock_bin/docker"
+
+  cat > "$mock_bin/curl" <<'SH'
+#!/usr/bin/env bash
+set -u
+output=""
+headers=""
+config=""
+url=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --output|--dump-header|--config)
+      key="$1"
+      value="${2:-}"
+      case "$key" in
+        --output) output="$value" ;;
+        --dump-header) headers="$value" ;;
+        --config) config="$value" ;;
+      esac
+      shift 2
+      ;;
+    https://*) url="$1"; shift ;;
+    *) shift ;;
+  esac
+done
+if [[ "${MOCK_CURL_MODE:-}" == "unreachable" ]]; then
+  exit 28
+fi
+if [[ -z "$config" ]]; then
+  if [[ -n "$headers" ]]; then
+    cat > "$headers" <<'EOF'
+HTTP/2 302
+server: cloudflare
+cf-ray: smoke-ray
+location: https://smoke.cloudflareaccess.com/cdn-cgi/access/login/quote.client.example
+
+EOF
+  fi
+  if [[ "${MOCK_CURL_MODE:-}" == "public-200" ]]; then
+    printf '200'
+  else
+    printf '302'
+  fi
+  exit 0
+fi
+case "$url" in
+  */api/health)
+    printf '{"ok":true,"product_version":"%s"}\n' "${MOCK_AUTH_VERSION:-v0.2.0}" > "$output"
+    ;;
+  */api/setup-state)
+    if [[ "${MOCK_CURL_MODE:-}" == "setup-timeout" ]]; then
+      exec sleep 30
+    fi
+    printf '{"activation":{"client_id":"%s","installation_id":"%s"},"required_steps":[]}\n' \
+      "${MOCK_AUTH_CLIENT_ID:-smoke-client}" \
+      "${MOCK_AUTH_INSTALLATION_ID:-smoke-installation}" > "$output"
+    ;;
+  *)
+    exit 1
+    ;;
+esac
+printf '200'
+SH
+  chmod 755 "$mock_bin/curl"
+
+  reset_access_secret() {
+    rm -f "$gate_home/settings/cloudflare-public-validation.json"
+    cat > "$gate_home/secrets/cloudflare-access-validation.env" <<'EOF'
+CF_ACCESS_CLIENT_ID=smoke-service-id.access
+CF_ACCESS_CLIENT_SECRET=smoke-service-secret
+EOF
+    chmod 600 "$gate_home/secrets/cloudflare-access-validation.env"
+  }
+
+  reset_access_secret
+  output="$(
+    PATH="$mock_bin:$PATH" QUOTEOPS_HOME="$gate_home" \
+      bash "$APPLIANCE_DIR/verify-install.sh" --resume-guided
+  )" || fail "Cloudflare verifier rejected a matching protected origin"
+  jq -e '.status == "ready" and .checks.authenticated_origin == "ok"' <<<"$output" >/dev/null ||
+    fail "Cloudflare verifier did not emit the ready JSON contract"
+  [[ ! -e "$gate_home/secrets/cloudflare-access-validation.env" ]] ||
+    fail "Cloudflare verifier retained Service Auth credentials after success"
+  [[ -f "$gate_home/settings/cloudflare-public-validation.json" ]] ||
+    fail "Cloudflare verifier did not persist the safe validation receipt"
+  if grep -Eq 'smoke-service-id|smoke-service-secret|CF_ACCESS' \
+      "$gate_home/settings/cloudflare-public-validation.json" ||
+    grep -Eq 'smoke-service-id|smoke-service-secret|CF_ACCESS' <<<"$output"; then
+    fail "Cloudflare validation receipt or output contains Service Auth credentials"
+  fi
+
+  output="$(
+    PATH="$mock_bin:$PATH" QUOTEOPS_HOME="$gate_home" \
+      bash "$APPLIANCE_DIR/verify-install.sh" --resume-guided
+  )" || fail "Cloudflare verifier could not safely retry after response loss"
+  jq -e '.status == "ready"' <<<"$output" >/dev/null ||
+    fail "safe validation receipt retry did not remain ready"
+
+  reset_access_secret
+  set +e
+  output="$(
+    PATH="$mock_bin:$PATH" QUOTEOPS_HOME="$gate_home" \
+      MOCK_AUTH_CLIENT_ID=wrong-client \
+      bash "$APPLIANCE_DIR/verify-install.sh" --resume-guided
+  )"
+  result=$?
+  set -e
+  [[ "$result" -eq 18 && -e "$gate_home/secrets/cloudflare-access-validation.env" ]] ||
+    fail "wrong authenticated origin did not fail closed and retain resume credentials"
+
+  reset_access_secret
+  set +e
+  output="$(
+    PATH="$mock_bin:$PATH" QUOTEOPS_HOME="$gate_home" \
+      MOCK_AUTH_VERSION=v9.9.9 \
+      bash "$APPLIANCE_DIR/verify-install.sh" --resume-guided
+  )"
+  result=$?
+  set -e
+  [[ "$result" -eq 18 ]] || fail "wrong authenticated public version did not return 18"
+
+  reset_access_secret
+  set +e
+  output="$(
+    PATH="$mock_bin:$PATH" QUOTEOPS_HOME="$gate_home" \
+      MOCK_AUTH_INSTALLATION_ID=wrong-installation \
+      bash "$APPLIANCE_DIR/verify-install.sh" --resume-guided
+  )"
+  result=$?
+  set -e
+  [[ "$result" -eq 18 ]] || fail "wrong authenticated installation did not return 18"
+
+  reset_access_secret
+  set +e
+  output="$(
+    PATH="$mock_bin:$PATH" QUOTEOPS_HOME="$gate_home" \
+      MOCK_CURL_MODE=public-200 \
+      bash "$APPLIANCE_DIR/verify-install.sh" --resume-guided
+  )"
+  result=$?
+  set -e
+  [[ "$result" -eq 15 ]] || fail "anonymous public 200 was not treated as a security failure"
+
+  reset_access_secret
+  SECONDS=0
+  set +e
+  output="$(
+    PATH="$mock_bin:$PATH" QUOTEOPS_HOME="$gate_home" \
+      MOCK_CURL_MODE=setup-timeout \
+      bash "$APPLIANCE_DIR/verify-install.sh" --resume-guided
+  )"
+  result=$?
+  set -e
+  [[ "$result" -eq 18 && "$SECONDS" -le 8 ]] ||
+    fail "authenticated setup-state timeout was not bounded"
+
+  set +e
+  output="$(
+    PATH="$mock_bin:$PATH" QUOTEOPS_HOME="$gate_home" \
+      MOCK_CURL_MODE=unreachable \
+      bash "$APPLIANCE_DIR/verify-install.sh" --resume-guided
+  )"
+  result=$?
+  set -e
+  [[ "$result" -eq 14 ]] || fail "never-resolving public probe did not return 14"
+}
+
 validate_human_simulator_fixture
+validate_cloudflare_gate
 
 validate_schema_sql_with_postgres() {
   local schema_test_dir
@@ -698,8 +914,21 @@ if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; 
   WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/quoteops-appliance-smoke.XXXXXX")"
   TEMP_DIRS+=("$WORK_DIR")
 
+  TEST_HOME="$WORK_DIR/home"
   mkdir -p "$WORK_DIR/manifests" "$WORK_DIR/criteria" "$WORK_DIR/connectors" "$WORK_DIR/logs" "$WORK_DIR/backups" "$WORK_DIR/secrets"
+  mkdir -p \
+    "$TEST_HOME/current" \
+    "$TEST_HOME/manifests" \
+    "$TEST_HOME/criteria" \
+    "$TEST_HOME/connectors" \
+    "$TEST_HOME/logs" \
+    "$TEST_HOME/backups" \
+    "$TEST_HOME/settings" \
+    "$TEST_HOME/secrets"
+  printf '%s\n' 'TUNNEL_TOKEN=dummy-smoke-token' > "$TEST_HOME/secrets/cloudflare.env"
+  chmod 600 "$TEST_HOME/secrets/cloudflare.env"
   : > "$WORK_DIR/secrets/client.env"
+  : > "$TEST_HOME/secrets/client.env"
   cat > "$WORK_DIR/connectors/tms-adapter.yaml" <<'YAML'
 provider: file_import
 rfqs_path_env: QUOTEOPS_TMS_RFQS_PATH
@@ -711,6 +940,68 @@ unit_positions_path_env: QUOTEOPS_TMS_UNIT_POSITIONS_PATH
 quote_writebacks_path_env: QUOTEOPS_TMS_QUOTE_WRITEBACKS_PATH
 status_writebacks_path_env: QUOTEOPS_TMS_STATUS_WRITEBACKS_PATH
 YAML
+  cp "$WORK_DIR/connectors/tms-adapter.yaml" "$TEST_HOME/connectors/tms-adapter.yaml"
+  cat > "$TEST_HOME/.env" <<EOF
+COMPOSE_PROJECT_NAME=quoteops_smoke
+QUOTEOPS_CLIENT_ID=cliente-demo
+QUOTEOPS_INSTALLATION_ID=smoke-installation
+QUOTEOPS_CLIENT_ENV_FILE=$TEST_HOME/secrets/client.env
+QUOTEOPS_CLOUDFLARE_ENV_FILE=$TEST_HOME/secrets/cloudflare.env
+QUOTEOPS_MANIFEST_DIR=$TEST_HOME/manifests
+QUOTEOPS_CRITERIA_DIR=$TEST_HOME/criteria
+QUOTEOPS_CONNECTORS_DIR=$TEST_HOME/connectors
+QUOTEOPS_SECRETS_DIR=$TEST_HOME/secrets
+QUOTEOPS_LOG_DIR=$TEST_HOME/logs
+QUOTEOPS_BACKUP_DIR=$TEST_HOME/backups
+QUOTEOPS_SETTINGS_DIR=$TEST_HOME/settings
+CADDYFILE_PATH=$APPLIANCE_DIR/Caddyfile
+EOF
+  cat > "$TEST_HOME/current/release.env" <<'EOF'
+QUOTEOPS_VERSION=v0.2.0
+QUOTEOPS_PLATFORM=linux/amd64
+QUOTEOPS_AGENT_IMAGE=ghcr.io/alejandroc-bit/quote-ops-agent:v0.2.0@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+QUOTEOPS_API_IMAGE=ghcr.io/alejandroc-bit/quote-ops-api:v0.2.0@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+QUOTEOPS_WEB_IMAGE=ghcr.io/alejandroc-bit/quote-ops-web:v0.2.0@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+QUOTEOPS_POSTGRES_IMAGE=postgres:16-alpine@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+QUOTEOPS_REDIS_IMAGE=redis:7-alpine@sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+QUOTEOPS_CADDY_IMAGE=caddy:2-alpine@sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+QUOTEOPS_CLOUDFLARED_IMAGE=cloudflare/cloudflared:2026.7.3@sha256:e39ee8da81ad5e05d77f38d2f51c60ca51bf2a8450ac3abab50c17fdb91d91bf
+EOF
+
+  rendered="$(
+    docker compose \
+      --env-file "$TEST_HOME/.env" \
+      --env-file "$TEST_HOME/current/release.env" \
+      -f "$APPLIANCE_DIR/docker-compose.yml" \
+      --profile tunnel \
+      config --no-env-resolution
+  )"
+  grep -q 'cloudflare/cloudflared:2026.7.3@sha256:e39ee8da81ad5e05d77f38d2f51c60ca51bf2a8450ac3abab50c17fdb91d91bf' <<<"$rendered" ||
+    fail "production compose is missing the pinned cloudflared image"
+  grep -q 'TUNNEL_METRICS: 0.0.0.0:2000' <<<"$rendered" ||
+    fail "production compose is missing internal cloudflared metrics"
+  ! grep -qE 'published: "(80|443)"' <<<"$rendered" ||
+    fail "production compose publishes Caddy ports"
+  ! grep -q 'TUNNEL_TOKEN:' <<<"$rendered" ||
+    fail "production compose interpolates TUNNEL_TOKEN"
+  cloudflared_block="$(sed -n '/^  cloudflared:/,/^  [a-zA-Z0-9_-][a-zA-Z0-9_-]*:/p' <<<"$rendered")"
+  ! grep -qE 'OPENROUTER|GEMINI|TMS_API_KEY|RESEND|SAKBE' <<<"$cloudflared_block" ||
+    fail "cloudflared receives client application secrets"
+
+  direct_rendered="$(
+    docker compose \
+      --env-file "$TEST_HOME/.env" \
+      --env-file "$TEST_HOME/current/release.env" \
+      -f "$APPLIANCE_DIR/docker-compose.yml" \
+      -f "$APPLIANCE_DIR/docker-compose.direct.yml" \
+      --profile tunnel \
+      config --no-env-resolution
+  )"
+  grep -q 'host_ip: 127.0.0.1' <<<"$direct_rendered" ||
+    fail "direct compose override is not loopback-only"
+  ! grep -q 'host_ip: 0.0.0.0' <<<"$direct_rendered" ||
+    fail "direct compose override publishes on all interfaces"
+
   compose_config() {
     QUOTEOPS_CLIENT_ID=cliente-demo \
     QUOTEOPS_VERSION=v2.0.0 \

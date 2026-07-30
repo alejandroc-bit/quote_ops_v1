@@ -8,6 +8,9 @@ QUOTEOPS_HOME="${QUOTEOPS_HOME:-/opt/quoteops-v1}"
 ENV_FILE="${QUOTEOPS_ENV_FILE:-$QUOTEOPS_HOME/.env}"
 SECRETS_ENV_FILE="${QUOTEOPS_SECRETS_ENV_FILE:-$QUOTEOPS_HOME/secrets/client.env}"
 CLOUDFLARE_ENV_FILE="$QUOTEOPS_HOME/secrets/cloudflare.env"
+CLOUDFLARE_ACCESS_ENV_FILE="$QUOTEOPS_HOME/secrets/cloudflare-access-validation.env"
+CLOUDFLARE_SETTINGS_FILE="$QUOTEOPS_HOME/settings/cloudflare.json"
+CLOUDFLARE_VALIDATION_RECEIPT_FILE="$QUOTEOPS_HOME/settings/cloudflare-public-validation.json"
 CLIENT_ID=""
 MANIFEST_PATH=""
 CONNECTORS_PATH=""
@@ -25,6 +28,7 @@ QUOTEOPS_CONTROL_PLANE_URL="${QUOTEOPS_CONTROL_PLANE_URL:-}"
 QUOTEOPS_REGISTRATION_TOKEN="${QUOTEOPS_REGISTRATION_TOKEN:-}"
 QUOTEOPS_REGISTRATION_TOKEN_FILE=""
 QUOTEOPS_INSTALLATION_ID="${QUOTEOPS_INSTALLATION_ID:-}"
+QUOTEOPS_PUBLIC_HOSTNAME="${QUOTEOPS_PUBLIC_HOSTNAME:-}"
 INEGI_SAKBE_KEY="${INEGI_SAKBE_KEY:-}"
 GEMINI_API_KEY="${GEMINI_API_KEY:-}"
 OPENROUTER_API_KEY="${OPENROUTER_API_KEY:-}"
@@ -39,6 +43,7 @@ ENV_FILE_SET=0
 SECRETS_ENV_FILE_SET=0
 VERSION_SET=0
 GUIDED=0
+RESUME_GUIDED=0
 EXISTING_INSTALL=0
 POSTGRES_PASSWORD_FLAG_SET=0
 
@@ -71,6 +76,7 @@ Options:
   --registration-token-file PATH Read registration token from a protected 0600 file
   --installation-id ID     Stable appliance installation id
   --guided                 Require checksum-verified release-local runtime assets
+  --resume-guided          Resume guided verification using protected local state
   --force                  Replace existing env file and manifest copy
   --skip-start             Prepare files without running docker compose up
   --no-pull                Skip docker compose pull; validate config and start pre-loaded images
@@ -188,6 +194,56 @@ ensure_secret_key() {
   chmod 600 "$temporary"
   mv "$temporary" "$file"
   printf '%s\n' "$value"
+}
+
+cloudflare_validation_receipt_matches() {
+  command -v jq >/dev/null 2>&1 || return 1
+  [[ -f "$CLOUDFLARE_VALIDATION_RECEIPT_FILE" &&
+     ! -L "$CLOUDFLARE_VALIDATION_RECEIPT_FILE" ]] || return 1
+  jq -e \
+    --arg hostname "$QUOTEOPS_PUBLIC_HOSTNAME" \
+    --arg version "$QUOTEOPS_VERSION" \
+    --arg client "$CLIENT_ID" \
+    --arg installation "$QUOTEOPS_INSTALLATION_ID" \
+    '.public_hostname == $hostname and
+     .version == $version and
+     .client_id == $client and
+     .installation_id == $installation and
+     .authenticated_origin == true' \
+    "$CLOUDFLARE_VALIDATION_RECEIPT_FILE" >/dev/null 2>&1
+}
+
+load_cloudflare_gate_settings() {
+  local tunnel_token
+  local access_client_id
+  local access_client_secret
+
+  need_command jq
+  [[ -f "$CLOUDFLARE_SETTINGS_FILE" && ! -L "$CLOUDFLARE_SETTINGS_FILE" ]] ||
+    die "guided onboarding must create settings/cloudflare.json"
+  QUOTEOPS_PUBLIC_HOSTNAME="$(
+    jq -er '.public_hostname | strings' "$CLOUDFLARE_SETTINGS_FILE" 2>/dev/null
+  )" || die "Cloudflare settings must contain public_hostname"
+  [[ "$QUOTEOPS_PUBLIC_HOSTNAME" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] ||
+    die "public hostname is invalid"
+
+  validate_secret_file "$CLOUDFLARE_ENV_FILE"
+  tunnel_token="$(read_env_value TUNNEL_TOKEN "$CLOUDFLARE_ENV_FILE")"
+  [[ -n "$tunnel_token" ]] || die "Cloudflare named-tunnel token is missing"
+  unset tunnel_token
+
+  if cloudflare_validation_receipt_matches; then
+    return
+  fi
+  if [[ ! -e "$CLOUDFLARE_ACCESS_ENV_FILE" && "$RESUME_GUIDED" -eq 1 ]]; then
+    die "Cloudflare Service Auth credentials must be collected again before resumed verification"
+  fi
+  validate_secret_file "$CLOUDFLARE_ACCESS_ENV_FILE"
+  access_client_id="$(read_env_value CF_ACCESS_CLIENT_ID "$CLOUDFLARE_ACCESS_ENV_FILE")"
+  access_client_secret="$(read_env_value CF_ACCESS_CLIENT_SECRET "$CLOUDFLARE_ACCESS_ENV_FILE")"
+  [[ -n "$access_client_id" && -n "$access_client_secret" ]] ||
+    die "Cloudflare Service Auth credentials are incomplete"
+  unset access_client_id access_client_secret
 }
 
 validate_release_env() {
@@ -448,6 +504,9 @@ while [[ $# -gt 0 ]]; do
         SECRETS_ENV_FILE="$QUOTEOPS_HOME/secrets/client.env"
       fi
       CLOUDFLARE_ENV_FILE="$QUOTEOPS_HOME/secrets/cloudflare.env"
+      CLOUDFLARE_ACCESS_ENV_FILE="$QUOTEOPS_HOME/secrets/cloudflare-access-validation.env"
+      CLOUDFLARE_SETTINGS_FILE="$QUOTEOPS_HOME/settings/cloudflare.json"
+      CLOUDFLARE_VALIDATION_RECEIPT_FILE="$QUOTEOPS_HOME/settings/cloudflare-public-validation.json"
       shift 2
       ;;
     --env-file)
@@ -580,6 +639,11 @@ while [[ $# -gt 0 ]]; do
       GUIDED=1
       shift
       ;;
+    --resume-guided)
+      GUIDED=1
+      RESUME_GUIDED=1
+      shift
+      ;;
     -h|--help)
       usage
       exit 0
@@ -687,6 +751,9 @@ fi
 ENV_FILE="$(absolute_new_path "$ENV_FILE")"
 SECRETS_ENV_FILE="$(absolute_new_path "$SECRETS_ENV_FILE")"
 CLOUDFLARE_ENV_FILE="$(absolute_new_path "$CLOUDFLARE_ENV_FILE")"
+CLOUDFLARE_ACCESS_ENV_FILE="$QUOTEOPS_HOME/secrets/cloudflare-access-validation.env"
+CLOUDFLARE_SETTINGS_FILE="$QUOTEOPS_HOME/settings/cloudflare.json"
+CLOUDFLARE_VALIDATION_RECEIPT_FILE="$QUOTEOPS_HOME/settings/cloudflare-public-validation.json"
 if [[ "$GUIDED" -eq 1 ]]; then
   [[ "$ENV_FILE" == "$QUOTEOPS_HOME/.env" ]] ||
     die "guided install requires the shared env under QUOTEOPS_HOME"
@@ -777,6 +844,9 @@ if [[ ! -e "$CLOUDFLARE_ENV_FILE" ]]; then
 fi
 validate_secret_file "$SECRETS_ENV_FILE"
 validate_secret_file "$CLOUDFLARE_ENV_FILE"
+if [[ "$GUIDED" -eq 1 && "$START_STACK" -eq 1 ]]; then
+  load_cloudflare_gate_settings
+fi
 
 EXISTING_POSTGRES_PASSWORD="$(read_env_value POSTGRES_PASSWORD "$SECRETS_ENV_FILE")"
 if [[ -n "$EXISTING_POSTGRES_PASSWORD" ]]; then
@@ -832,6 +902,9 @@ trap cleanup EXIT
   write_env_line QUOTEOPS_SECRETS_DIR "$QUOTEOPS_SECRETS_DIR"
   write_env_line QUOTEOPS_CLIENT_ENV_FILE "$SECRETS_ENV_FILE"
   write_env_line QUOTEOPS_CLOUDFLARE_ENV_FILE "$CLOUDFLARE_ENV_FILE"
+  if [[ -n "$QUOTEOPS_PUBLIC_HOSTNAME" ]]; then
+    write_env_line QUOTEOPS_PUBLIC_HOSTNAME "$QUOTEOPS_PUBLIC_HOSTNAME"
+  fi
   write_env_line QUOTEOPS_AGENT_CONFIG_PATH "/opt/quoteops-v1/connectors/agent/agent-config.yaml"
   write_env_line QUOTEOPS_TMS_ADAPTER_CONFIG_PATH "/opt/quoteops-v1/connectors/tms-adapter.yaml"
   if [[ -n "$TMS_MAPPING_CONFIG_PATH" || ( -n "$CONNECTORS_PATH" && -e "$CONNECTORS_PATH/tms-mapping.json" ) ]]; then
@@ -936,11 +1009,20 @@ COMPOSE_FILE="$RELEASE_DIR/docker-compose.yml"
 RELEASE_ENV_FILE="$RELEASE_DIR/release.env"
 unset POSTGRES_PASSWORD QUOTEOPS_REGISTRATION_TOKEN INEGI_SAKBE_KEY GEMINI_API_KEY OPENROUTER_API_KEY
 if [[ "$START_STACK" -eq 1 ]]; then
-  docker compose --env-file "$ENV_FILE" --env-file "$RELEASE_ENV_FILE" -f "$COMPOSE_FILE" config >/dev/null
+  docker compose --env-file "$ENV_FILE" --env-file "$RELEASE_ENV_FILE" \
+    -f "$COMPOSE_FILE" --profile tunnel config >/dev/null
   if [[ "$PULL_IMAGES" -eq 1 ]]; then
-    docker compose --env-file "$ENV_FILE" --env-file "$RELEASE_ENV_FILE" -f "$COMPOSE_FILE" pull
+    docker compose --env-file "$ENV_FILE" --env-file "$RELEASE_ENV_FILE" \
+      -f "$COMPOSE_FILE" --profile tunnel pull
   fi
-  docker compose --env-file "$ENV_FILE" --env-file "$RELEASE_ENV_FILE" -f "$COMPOSE_FILE" up -d
+  docker compose --env-file "$ENV_FILE" --env-file "$RELEASE_ENV_FILE" \
+    -f "$COMPOSE_FILE" --profile tunnel up -d
+  if [[ "$GUIDED" -eq 1 ]]; then
+    if ! QUOTEOPS_HOME="$QUOTEOPS_HOME" \
+      bash "$RELEASE_DIR/verify-install.sh" --resume-guided; then
+      die "Cloudflare public readiness verification failed"
+    fi
+  fi
 fi
 
 echo "QuoteOps appliance prepared for client: $CLIENT_ID"
