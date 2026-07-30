@@ -53,6 +53,7 @@ const CLIENT_OVERLAY_FILES = new Set([
   "client-manifest.yaml",
   "criteria-template.yaml",
   "connectors/agent/agent-config.yaml",
+  "connectors/knowledge/README.md",
   "connectors/tms-adapter.yaml",
   "connectors/tms/rfqs.csv",
   "connectors/tms/historical-quotes.csv",

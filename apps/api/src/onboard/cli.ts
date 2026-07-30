@@ -1,4 +1,5 @@
 import { readFile, writeFile } from "node:fs/promises";
+import { dirname, join, resolve } from "node:path";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 import { createTmsAdapterFromConfig } from "@quoteops/connectors";
 import type { QuoteManifest } from "@quoteops/quote-core";
@@ -42,6 +43,24 @@ import {
   validateMarginParams,
   type OnboardManifest
 } from "./wizardSteps.js";
+import {
+  createFileOnboardingStateStore,
+  parseOnboardingAnswers,
+  parseOnboardingSelection,
+  runOnboarding,
+  OnboardingError,
+  type OnboardPaths as FlowOnboardPaths,
+  type OnboardingAnswers,
+  type OnboardingContext,
+  type OnboardingPhase
+} from "./onboardingFlow.js";
+import { aiProviderPhase } from "./aiProviderStep.js";
+import {
+  applianceSecretsPhase,
+  knowledgePhase,
+  runKnowledgeIngestion
+} from "./applianceSecretsStep.js";
+import { cloudflarePhase } from "./cloudflareStep.js";
 
 type OnboardPaths = {
   secretsFile: string;
@@ -49,33 +68,143 @@ type OnboardPaths = {
   tmsAdapterConfigPath: string;
   agentConfigPath: string;
   apiBaseUrl: string;
+  flow: FlowOnboardPaths;
 };
 
 function resolvePaths(env: NodeJS.ProcessEnv): OnboardPaths {
+  const secretsFile =
+    env.QUOTEOPS_SECRETS_ENV_FILE ??
+    "/opt/quoteops-v1/secrets/client.env";
+  const home = env.QUOTEOPS_HOME ?? dirname(dirname(secretsFile));
+  const settingsDir = env.QUOTEOPS_SETTINGS_DIR ?? join(home, "settings");
+  const agentConfigPath =
+    env.QUOTEOPS_AGENT_CONFIG_PATH ??
+    join(home, "connectors/agent/agent-config.yaml");
+  const tmsAdapterConfigPath =
+    env.QUOTEOPS_TMS_ADAPTER_CONFIG_PATH ??
+    join(home, "connectors/tms-adapter.yaml");
+  const apiBaseUrl =
+    env.QUOTEOPS_ONBOARD_API_URL ?? "http://quoteops-api:8080";
   return {
-    secretsFile: env.QUOTEOPS_SECRETS_ENV_FILE ?? "/opt/quoteops-v1/secrets/client.env",
-    manifestPath: env.QUOTEOPS_MANIFEST_PATH ?? "/opt/quoteops-v1/manifests/client-manifest.yaml",
-    tmsAdapterConfigPath:
-      env.QUOTEOPS_TMS_ADAPTER_CONFIG_PATH ?? "/opt/quoteops-v1/connectors/tms-adapter.yaml",
-    agentConfigPath:
-      env.QUOTEOPS_AGENT_CONFIG_PATH ?? "/opt/quoteops-v1/connectors/agent/agent-config.yaml",
-    apiBaseUrl: env.QUOTEOPS_ONBOARD_API_URL ?? "http://quoteops-api:8080"
+    secretsFile,
+    manifestPath:
+      env.QUOTEOPS_MANIFEST_PATH ??
+      join(home, "manifests/client-manifest.yaml"),
+    tmsAdapterConfigPath,
+    agentConfigPath,
+    apiBaseUrl,
+    flow: {
+      apiBaseUrl,
+      agentConfigFile: agentConfigPath,
+      clientSecretsFile: secretsFile,
+      cloudflareSecretsFile:
+        env.QUOTEOPS_CLOUDFLARE_ENV_FILE ??
+        join(home, "secrets/cloudflare.env"),
+      aiValidationReceiptFile:
+        env.QUOTEOPS_AI_VALIDATION_RECEIPT_PATH ??
+        join(settingsDir, "ai-provider-validation.json"),
+      mailboxProbeReceiptFile:
+        env.QUOTEOPS_MAILBOX_PROBE_RECEIPT_PATH ??
+        join(settingsDir, "mailbox-probe.json"),
+      knowledgeReceiptFile:
+        env.QUOTEOPS_KNOWLEDGE_RECEIPT_PATH ??
+        join(settingsDir, "knowledge-ingest.json"),
+      settingsDir,
+      onboardingStateFile:
+        env.QUOTEOPS_ONBOARDING_STATE_PATH ??
+        join(settingsDir, "onboarding-state.json"),
+      tmsAdapterConfigFile: tmsAdapterConfigPath,
+      tmsProbeFile:
+        env.QUOTEOPS_TMS_PROBE_PATH ?? join(settingsDir, "tms-probe.json"),
+      testRfqReceiptFile:
+        env.QUOTEOPS_TEST_RFQ_RECEIPT_PATH ??
+        join(settingsDir, "test-rfq.json")
+    }
   };
 }
 
 async function main(argv: string[]): Promise<void> {
   const paths = resolvePaths(process.env);
-  const flag = argv.find((arg) => arg.startsWith("--"));
+  const flag = argv.find((arg) =>
+    ["--sync-units", "--map-tms"].includes(arg)
+  );
 
   // subcommands re-run a single step (unit alta / re-mapping / re-ingest anytime)
   if (flag === "--sync-units") return void (await stepSyncUnits(paths, null));
   if (flag === "--map-tms") return void (await stepTms(paths, null));
-  if (flag === "--ingest") return void (await stepIngest(paths, null));
 
   await bootAnimation();
   line(renderBanner());
   line(`\n${paint(ansi.cyan + ansi.bold, "Bienvenido.")} Voy a guiarte por la puesta en marcha del appliance.`);
 
+  if (argv.includes("--allow-static-guidance")) {
+    await runLegacyOnboarding(paths);
+    return;
+  }
+
+  const answersFile = argumentValue(argv, "--answers-file");
+  let answers: OnboardingAnswers | null = null;
+  if (answersFile) {
+    try {
+      answers = parseOnboardingAnswers(
+        JSON.parse(await readFile(resolve(answersFile), "utf8"))
+      );
+    } catch (error) {
+      if (
+        error instanceof OnboardingError &&
+        error.code === "onboarding_answers_invalid"
+      ) {
+        throw error;
+      }
+      throw new OnboardingError("onboarding_answers_invalid", {
+        exitCode: 2
+      });
+    }
+  }
+  const context: OnboardingContext = {
+    io: {
+      ask,
+      askMasked,
+      confirm,
+      select: async <T extends string>(
+        prompt: string,
+        options: Array<{ value: T; label: string }>
+      ) => (await select(prompt, options)) as T,
+      info,
+      warn
+    },
+    env: process.env,
+    paths: paths.flow,
+    guided: answers === null,
+    answers,
+    fetch,
+    stateStore: createFileOnboardingStateStore(
+      paths.flow.onboardingStateFile
+    ),
+    ...(answersFile ? { answersRoot: dirname(resolve(answersFile)) } : {})
+  };
+  if (argv.includes("--ingest")) {
+    await runKnowledgeIngestion(context);
+    return;
+  }
+
+  const selection = parseOnboardingSelection(argv);
+  const result = await runOnboarding({
+    phases: onboardingPhases(paths),
+    context,
+    selection
+  });
+  line(section("Onboarding completo"));
+  ok(
+    `Fases listas: ${result.completed_phases.join(", ") || "ninguna"}.`
+  );
+  if (result.public_url) info(`URL pública: ${result.public_url}`);
+  info(
+    "Si capturaste secretos nuevos, reinicia el stack para aplicarlos: docker compose up -d"
+  );
+}
+
+async function runLegacyOnboarding(paths: OnboardPaths): Promise<void> {
   const copilot = await stepAiKey(paths);
   await stepSecrets(paths, copilot);
   await stepTms(paths, copilot);
@@ -89,10 +218,98 @@ async function main(argv: string[]): Promise<void> {
   info("Si capturaste secretos nuevos, reinicia el stack para aplicarlos: docker compose up -d");
 }
 
+function onboardingPhases(paths: OnboardPaths): OnboardingPhase[] {
+  const tmsPhase: OnboardingPhase = {
+    id: "tms",
+    async isComplete(context) {
+      return (
+        (await exists(context.paths.tmsAdapterConfigFile)) &&
+        (await exists(context.paths.tmsProbeFile))
+      );
+    },
+    async run(context) {
+      await stepTms(paths, context.copilot ?? null);
+    }
+  };
+  const unitsPhase: OnboardingPhase = {
+    id: "units",
+    async isComplete() {
+      const manifest = await readManifest(paths.manifestPath);
+      return Boolean(
+        manifest?.vehicle_profiles?.some(
+          (profile) => profile.performance_source === "tms"
+        )
+      );
+    },
+    async run(context) {
+      await stepSyncUnits(paths, context.copilot ?? null);
+    }
+  };
+  const authorizationPhase: OnboardingPhase = {
+    id: "authorization",
+    async isComplete() {
+      try {
+        const config = parseYaml(
+          await readFile(paths.agentConfigPath, "utf8")
+        ) as {
+          authorization?: {
+            approver_email?: unknown;
+            allowed_domains?: unknown;
+          };
+        };
+        return (
+          typeof config.authorization?.approver_email === "string" &&
+          Array.isArray(config.authorization.allowed_domains)
+        );
+      } catch {
+        return false;
+      }
+    },
+    async run(context) {
+      await stepAuthorization(paths, context.copilot ?? null);
+    }
+  };
+  const pricingPhase: OnboardingPhase = {
+    id: "pricing",
+    async isComplete() {
+      const manifest = await readManifest(paths.manifestPath);
+      return Boolean(
+        manifest?.vehicle_profiles?.length &&
+          manifest.vehicle_profiles.every(
+            (profile) =>
+              Number.isFinite(profile.margin_target_pct) &&
+              Number.isFinite(profile.minimum_margin_pct)
+          )
+      );
+    },
+    async run(context) {
+      await stepValidatePricing(
+        paths,
+        context.copilot ?? null,
+        (await readManifest(paths.manifestPath))?.vehicle_profiles?.map(
+          (profile) => profile.vehicle_profile_id
+        ) ?? []
+      );
+    }
+  };
+  return [
+    aiProviderPhase,
+    cloudflarePhase,
+    applianceSecretsPhase,
+    tmsPhase,
+    unitsPhase,
+    authorizationPhase,
+    pricingPhase,
+    knowledgePhase
+  ];
+}
+
 async function stepAiKey(paths: OnboardPaths): Promise<Copilot | null> {
   line(section("Paso 1 · Inteligencia Artificial"));
   info("Tu clave de IA enciende el copiloto que guía este onboarding.");
-  info("Se guarda cifrada localmente; el copiloto nunca ve tus otros secretos.");
+  info(
+    "Se guarda localmente en un archivo accesible sólo por root (`0600`); el copiloto nunca ve tus otros secretos."
+  );
 
   const provider = (await select("¿Qué proveedor de IA usarás?", [
     { value: "openrouter", label: "OpenRouter (recomendado)" },
@@ -489,10 +706,14 @@ async function stepIngest(paths: OnboardPaths, copilot: Copilot | null): Promise
   line(section("Paso 7 · Cerebro vectorial (criterio comercial)"));
   await guide(
     copilot,
-    "Cargo los documentos de criterio comercial al almacén vectorial local.",
-    "Explica que este paso ingiere los documentos de criterio comercial del cliente al cerebro vectorial local y que los embeddings nunca salen del appliance."
+    "El texto se envía al proveedor de embeddings configurado; los vectores y la base de QuoteOps permanecen locales.",
+    "Explica que el texto de los documentos se envía al proveedor de embeddings configurado, mientras los vectores y la base de QuoteOps permanecen locales."
   );
-  if (!(await confirm("¿Ingerir los documentos de conocimiento ahora?"))) {
+  if (
+    !(await confirm(
+      "¿Aceptas transferir el texto al proveedor de embeddings e ingerirlo ahora?"
+    ))
+  ) {
     info("Puedes hacerlo luego con: onboard --ingest");
     return;
   }
@@ -500,11 +721,20 @@ async function stepIngest(paths: OnboardPaths, copilot: Copilot | null): Promise
   const response = await postJson(`${paths.apiBaseUrl}/api/knowledge/ingest`, {});
   spin.stop();
   if (!response.ok) {
-    warn(`Ingesta no disponible (${response.status}): ${JSON.stringify(response.body)}`);
-    return;
+    throw new OnboardingError("knowledge_ingest_failed");
   }
-  const body = response.body as { document_count?: number };
-  ok(`Ingeridos ${body.document_count ?? 0} documento(s) al cerebro vectorial.`);
+  const body = response.body as {
+    document_count?: number;
+    ingested?: Array<{ chunk_count?: number }>;
+  };
+  const chunks = (body.ingested ?? []).reduce(
+    (sum, item) => sum + (item.chunk_count ?? 0),
+    0
+  );
+  if ((body.document_count ?? 0) <= 0 || chunks <= 0) {
+    throw new OnboardingError("knowledge_ingest_empty");
+  }
+  ok(`Ingeridos ${body.document_count} documento(s) al cerebro vectorial.`);
 }
 
 async function guide(copilot: Copilot | null, fallback: string, context: string): Promise<void> {
@@ -545,7 +775,30 @@ async function postJson(
   }
 }
 
+function argumentValue(argv: string[], flag: string): string | null {
+  const index = argv.indexOf(flag);
+  if (index < 0) return null;
+  const value = argv[index + 1];
+  if (!value || value.startsWith("--")) {
+    throw new OnboardingError("onboarding_argument_missing", {
+      exitCode: 2
+    });
+  }
+  return value;
+}
+
+async function exists(path: string): Promise<boolean> {
+  try {
+    await readFile(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 main(process.argv.slice(2)).catch((error) => {
-  fail((error as Error).message);
-  process.exit(1);
+  const onboardingError =
+    error instanceof OnboardingError ? error : null;
+  fail(onboardingError?.code ?? (error as Error).message);
+  process.exitCode = onboardingError?.exitCode ?? 1;
 });

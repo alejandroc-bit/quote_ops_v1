@@ -75,6 +75,7 @@ export function createInstallPack(input: {
       "client-manifest.yaml": renderClientManifest(client),
       "criteria-template.yaml": renderCriteriaTemplate(client),
       "connectors/agent/agent-config.yaml": renderAgentConfigTemplate(),
+      "connectors/knowledge/README.md": renderKnowledgeReadme(),
       "connectors/tms-adapter.yaml": renderTmsAdapterTemplate(),
       "connectors/tms/rfqs.csv": renderRfqCsvTemplate(),
       "connectors/tms/historical-quotes.csv": renderHistoricalQuotesCsvTemplate(),
@@ -214,9 +215,14 @@ function renderAgentConfigTemplate(): string {
   return [
     "model:",
     "  provider: openrouter",
-    "  model_name: nvidia/nemotron-3-ultra-550b-a55b:free",
+    "  model_name: openai/gpt-4o-mini",
     "  temperature: 0",
     "  api_key_env: OPENROUTER_API_KEY",
+    "embeddings:",
+    "  provider: gemini",
+    "  model: text-embedding-004",
+    "  api_key_env: QUOTEOPS_EMBEDDING_API_KEY",
+    "  base_url: null",
     "authorization:",
     "  tools:",
     "    email.intake:",
@@ -247,6 +253,22 @@ function renderAgentConfigTemplate(): string {
     "#   poll_interval_ms: 60000",
     "#   imap_host: null        # imap provider only",
     "#   imap_port: null"
+  ].join("\n");
+}
+
+function renderKnowledgeReadme(): string {
+  return [
+    "# Documentos de conocimiento de QuoteOps",
+    "",
+    "Coloca aquí hasta 20 archivos `.md`, `.txt` o `.json`, de máximo 5 MiB",
+    "cada uno. El onboarding los copiará con permisos `0600` y nombres seguros.",
+    "",
+    "Antes de crear embeddings se solicitará consentimiento explícito: el texto",
+    "de los documentos se envía al proveedor de embeddings configurado. Los",
+    "vectores resultantes y la base de datos de QuoteOps permanecen locales.",
+    "",
+    "Este README es sólo una guía y nunca se ingiere como fuente.",
+    ""
   ].join("\n");
 }
 

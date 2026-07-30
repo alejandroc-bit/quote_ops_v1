@@ -681,7 +681,7 @@ describe("QuoteOps API", () => {
         expect(syncBody.heartbeat).toEqual({
           client_id: "cliente-demo",
           ai_key_status: "configured",
-          onboarding_status: "ready",
+          onboarding_status: "licensed",
           version: "v1.0.0"
         });
         expect(syncBody.counters).toEqual({
@@ -702,7 +702,7 @@ describe("QuoteOps API", () => {
         });
         const cloudBody = await cloudClients.json();
         expect(cloudBody.items[0].installation.ai_key_status).toBe("configured");
-        expect(cloudBody.items[0].installation.onboarding_status).toBe("ready");
+        expect(cloudBody.items[0].installation.onboarding_status).toBe("licensed");
         expect(cloudBody.items[0].counters).toEqual({
           total: 1,
           validated: 1,
@@ -1107,6 +1107,29 @@ describe("QuoteOps API", () => {
       "utf8"
     );
     await writeFile(malformedAgentConfigPath, "model: not-an-object\n", "utf8");
+    const providerMailboxReceiptPath = join(dir, "mailbox-probe.json");
+    const providerCredentialRevisionPath = join(
+      dir,
+      "appliance-secrets-credential.json"
+    );
+    await writeFile(
+      providerCredentialRevisionPath,
+      JSON.stringify({ schema_version: 1, credential_revision: 1 })
+    );
+    await writeFile(
+      providerMailboxReceiptPath,
+      JSON.stringify({
+        schema_version: 1,
+        provider: "resend",
+        status: "ok",
+        agent_config_sha256: createHash("sha256")
+          .update(await readFile(agentConfigPath))
+          .digest("hex"),
+        credential_revision: 1,
+        validated_at: "2026-07-01T00:00:00.000Z",
+        code: "message_accepted"
+      })
+    );
     const cloudBaseUrl = await startCloudTestServer("provider-ready-token");
     await fetch(`${cloudBaseUrl}/api/admin/clients`, {
       method: "POST",
@@ -1140,13 +1163,17 @@ describe("QuoteOps API", () => {
       QUOTEOPS_VERSION: "v1.0.0",
       NVIDIA_NIM_API_KEY: "nim-present",
       RESEND_API_KEY: "resend-present",
+      MAILBOX_FROM: "quotes@example.com",
       MAILBOX_PASSWORD: "",
       MAILBOX_OAUTH_CLIENT_ID: "",
       MAILBOX_OAUTH_CLIENT_SECRET: "",
       MAILBOX_OAUTH_REFRESH_TOKEN: "",
       OPENROUTER_API_KEY: "",
       QUOTEOPS_EMBEDDING_API_KEY: "",
-      TMS_API_KEY: ""
+      TMS_API_KEY: "",
+      QUOTEOPS_MAILBOX_PROBE_RECEIPT_PATH: providerMailboxReceiptPath,
+      QUOTEOPS_APPLIANCE_CREDENTIAL_REVISION_PATH:
+        providerCredentialRevisionPath
     });
 
     await withEnv(providerReadyEnv, async () => {
@@ -1334,6 +1361,38 @@ describe("QuoteOps API", () => {
 
         expect(response.status).toBe(200);
         expect(setup.required_steps).not.toContain("connect_tms");
+      }
+    );
+  });
+
+  it("does not treat staged knowledge or mailbox env keys as completed receipts", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "quoteops-receipt-gates-"));
+    tempDirs.push(dir);
+    await mkdir(join(dir, "knowledge"), { recursive: true });
+    await writeFile(join(dir, "knowledge", "staged.md"), "# staged only\n");
+
+    await withEnv(
+      await setupReadyEnv({
+        QUOTEOPS_KNOWLEDGE_DIR: join(dir, "knowledge"),
+        QUOTEOPS_KNOWLEDGE_RECEIPT_PATH: join(
+          dir,
+          "missing-knowledge-receipt.json"
+        ),
+        QUOTEOPS_MAILBOX_PROBE_RECEIPT_PATH: join(
+          dir,
+          "missing-mailbox-receipt.json"
+        )
+      }),
+      async () => {
+        const baseUrl = await startApi({
+          defaultManifest: Promise.resolve(workflowInput.manifest)
+        });
+        const response = await fetch(`${baseUrl}/api/setup-state`);
+        const setup = await response.json();
+
+        expect(response.status).toBe(200);
+        expect(setup.required_steps).toContain("connect_knowledge_base");
+        expect(setup.required_steps).toContain("connect_mailbox");
       }
     );
   });
@@ -1719,6 +1778,24 @@ async function setupReadyEnv(
       ].join("\n"),
       "utf8"
     );
+    await writeFile(
+      join(readyEnvDir, "appliance-secrets-credential.json"),
+      JSON.stringify({ schema_version: 1, credential_revision: 1 })
+    );
+    await writeFile(
+      join(readyEnvDir, "mailbox-probe.json"),
+      JSON.stringify({
+        schema_version: 1,
+        provider: "imap",
+        status: "ok",
+        agent_config_sha256: createHash("sha256")
+          .update(await readFile(join(readyEnvDir, "agent-config.yaml")))
+          .digest("hex"),
+        credential_revision: 1,
+        validated_at: "2026-07-01T00:00:00.000Z",
+        code: "authenticated_read_only"
+      })
+    );
     await mkdir(join(readyEnvDir, "knowledge"), { recursive: true });
     await writeFile(join(readyEnvDir, "knowledge", "criterios.md"), "# criterios\n");
   }
@@ -1734,9 +1811,19 @@ async function setupReadyEnv(
     TMS_API_KEY: "tms-present",
     MAILBOX_USER: "agente@cliente.com",
     MAILBOX_PASSWORD: "mailbox-present",
+    MAILBOX_FROM: "",
+    RESEND_API_KEY: "",
     QUOTEOPS_AGENT_CONFIG_PATH: join(readyEnvDir, "agent-config.yaml"),
     QUOTEOPS_TMS_ADAPTER_CONFIG_PATH: join(readyEnvDir, "tms-adapter.yaml"),
     QUOTEOPS_KNOWLEDGE_DIR: join(readyEnvDir, "knowledge"),
+    QUOTEOPS_MAILBOX_PROBE_RECEIPT_PATH: join(
+      readyEnvDir,
+      "mailbox-probe.json"
+    ),
+    QUOTEOPS_APPLIANCE_CREDENTIAL_REVISION_PATH: join(
+      readyEnvDir,
+      "appliance-secrets-credential.json"
+    ),
     ...overrides
   };
 }

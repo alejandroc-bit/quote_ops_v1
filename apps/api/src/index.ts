@@ -1,4 +1,5 @@
 import { access, mkdir, readFile, readdir, rename, unlink, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import { dirname, join } from "node:path";
 import express, { type Express, type Request, type Response } from "express";
 import cors from "cors";
@@ -52,6 +53,59 @@ export { createApplianceWorkflowTools, loadApplianceManifest } from "./runtimeTo
 export { createInMemoryQuoteOpsStore } from "./storage/InMemoryQuoteOpsStore.js";
 export { createQuoteOpsStore } from "./storage/createQuoteOpsStore.js";
 export { PostgresQuoteOpsStore } from "./storage/PostgresQuoteOpsStore.js";
+export {
+  createFileOnboardingStateStore,
+  onboardingAnswersSchema,
+  parseOnboardingAnswers,
+  parseOnboardingSelection,
+  runOnboarding,
+  OnboardingError
+} from "./onboard/onboardingFlow.js";
+export type {
+  OnboardPaths,
+  OnboardingAnswers,
+  OnboardingAuditState,
+  OnboardingContext,
+  OnboardingFileRef,
+  OnboardingIo,
+  OnboardingPhase,
+  OnboardingPhaseId,
+  OnboardingPhaseSelection,
+  OnboardingResult,
+  OnboardingStateStore,
+  RunOnboardingInput,
+  SecretFileRef
+} from "./onboard/onboardingFlow.js";
+export {
+  aiProviderPhase,
+  configureAiProvider,
+  isAiProviderComplete,
+  validateAiProviderCredential
+} from "./onboard/aiProviderStep.js";
+export type {
+  AiProviderValidationReceipt,
+  ConfigureAiProviderInput,
+  OnboardingAiConfig
+} from "./onboard/aiProviderStep.js";
+export {
+  cloudflarePhase,
+  configureCloudflareTunnel,
+  readCloudflareConfig,
+  validatePublicHostname
+} from "./onboard/cloudflareStep.js";
+export type {
+  CloudflareTunnelConfig,
+  ConfigureCloudflareTunnelInput
+} from "./onboard/cloudflareStep.js";
+export {
+  applianceSecretsPhase,
+  configureApplianceSecrets,
+  isApplianceSecretsComplete,
+  knowledgePhase,
+  listKnowledgeSourceFiles,
+  runKnowledgeIngestion,
+  stageKnowledgeSources
+} from "./onboard/applianceSecretsStep.js";
 export type {
   ApplianceHeartbeat,
   ApprovalDecision,
@@ -650,7 +704,7 @@ async function buildLocalSetupState({
   if (!(await hasKnowledgeBase(env))) {
     requiredSteps.push("connect_knowledge_base");
   }
-  if (!hasAgentMailbox(resolvedProviderReadiness, env)) {
+  if (!(await hasAgentMailbox(resolvedProviderReadiness, env))) {
     requiredSteps.push("connect_mailbox");
   }
   if (!hasSakbeRouteEvidence(resolvedProviderReadiness, env)) {
@@ -1050,6 +1104,7 @@ export async function assertApplianceLicenseForClient({
 
 type ProviderReadiness = {
   agentConfig: AgentRuntimeConfig | null;
+  agentConfigPath: string;
   secretFileKeys: Set<string>;
 };
 
@@ -1059,7 +1114,7 @@ async function loadProviderReadiness(env: NodeJS.ProcessEnv): Promise<ProviderRe
     loadAgentRuntimeConfig(agentConfigPath).catch(() => null),
     readSecretKeysFromEnvFile(optionalEnv(env.QUOTEOPS_SECRETS_ENV_FILE) ?? "")
   ]);
-  return { agentConfig, secretFileKeys };
+  return { agentConfig, agentConfigPath, secretFileKeys };
 }
 
 async function hasConfiguredSecrets(
@@ -1187,22 +1242,32 @@ async function hasTmsMapping(env: NodeJS.ProcessEnv): Promise<boolean> {
 }
 
 async function hasKnowledgeBase(env: NodeJS.ProcessEnv): Promise<boolean> {
-  // ready if the vector store already has chunks, OR source files are staged
-  // for ingestion (the transition window before the first ingest runs)
   try {
     const service = await getKnowledgeService(env);
-    if (service && (await service.repo.countStatus()).knowledge_chunks_count > 0) return true;
-  } catch {
-    // fall through to the file-staging check
-  }
-  const connectorsDir = optionalEnv(env.QUOTEOPS_CONNECTORS_DIR);
-  const knowledgeDir =
-    optionalEnv(env.QUOTEOPS_KNOWLEDGE_DIR) ??
-    (connectorsDir ? join(connectorsDir, "knowledge") : null);
-  if (!knowledgeDir) return false;
-  try {
-    const entries = await readdir(knowledgeDir);
-    return entries.some((entry) => !entry.startsWith("."));
+    if (!service) return false;
+    const status = await service.repo.countStatus();
+    if (status.knowledge_chunks_count <= 0) return false;
+    const agentConfigPath =
+      optionalEnv(env.QUOTEOPS_AGENT_CONFIG_PATH) ??
+      DEFAULT_AGENT_CONFIG_PATH;
+    const receiptPath =
+      optionalEnv(env.QUOTEOPS_KNOWLEDGE_RECEIPT_PATH) ??
+      defaultSettingsFile(env, "knowledge-ingest.json");
+    if (!receiptPath) return false;
+    const receipt = JSON.parse(await readFile(receiptPath, "utf8")) as {
+      schema_version?: unknown;
+      provider_config_sha256?: unknown;
+      document_count?: unknown;
+      chunk_count?: unknown;
+      consent_external_embedding_transfer?: unknown;
+    };
+    return (
+      receipt.schema_version === 1 &&
+      receipt.consent_external_embedding_transfer === true &&
+      Number(receipt.document_count) > 0 &&
+      Number(receipt.chunk_count) > 0 &&
+      receipt.provider_config_sha256 === (await sha256Path(agentConfigPath))
+    );
   } catch {
     return false;
   }
@@ -1218,8 +1283,18 @@ function knowledgeSourceDir(env: NodeJS.ProcessEnv): string | null {
 
 async function listKnowledgeFiles(dir: string): Promise<string[]> {
   try {
-    const entries = await readdir(dir);
-    return entries.filter((entry) => !entry.startsWith("."));
+    const entries = await readdir(dir, { withFileTypes: true });
+    return entries
+      .filter(
+        (entry) =>
+          entry.isFile() &&
+          entry.name !== "README.md" &&
+          !entry.name.startsWith(".") &&
+          [".md", ".txt", ".json"].some((extension) =>
+            entry.name.toLowerCase().endsWith(extension)
+          )
+      )
+      .map((entry) => entry.name);
   } catch {
     return [];
   }
@@ -1250,12 +1325,81 @@ async function fileExists(path: string): Promise<boolean> {
   }
 }
 
-function hasAgentMailbox(readiness: ProviderReadiness, env: NodeJS.ProcessEnv): boolean {
-  if (!readiness.agentConfig?.mailbox) return false;
-  return mailboxCredentialsPresent(
-    readiness.agentConfig.mailbox,
-    envWithSecretFilePresence(readiness, env)
-  );
+async function hasAgentMailbox(
+  readiness: ProviderReadiness,
+  env: NodeJS.ProcessEnv
+): Promise<boolean> {
+  const mailbox = readiness.agentConfig?.mailbox;
+  if (!mailbox) return false;
+  const effectiveEnv = envWithSecretFilePresence(readiness, env);
+  if (!mailboxCredentialsPresent(mailbox, effectiveEnv)) return false;
+  const provider = mailbox.provider;
+  const exactKeys =
+    provider === "resend"
+      ? Boolean(
+          optionalEnv(effectiveEnv.RESEND_API_KEY) &&
+            optionalEnv(effectiveEnv.MAILBOX_USER) &&
+            optionalEnv(effectiveEnv.MAILBOX_FROM) &&
+            !optionalEnv(effectiveEnv.MAILBOX_PASSWORD)
+        )
+      : provider === "imap"
+        ? Boolean(
+            optionalEnv(effectiveEnv.MAILBOX_USER) &&
+              optionalEnv(effectiveEnv.MAILBOX_PASSWORD) &&
+              !optionalEnv(effectiveEnv.RESEND_API_KEY) &&
+              !optionalEnv(effectiveEnv.MAILBOX_FROM)
+          )
+        : false;
+  if (!exactKeys) return false;
+  const receiptPath =
+    optionalEnv(env.QUOTEOPS_MAILBOX_PROBE_RECEIPT_PATH) ??
+    defaultSettingsFile(env, "mailbox-probe.json");
+  const revisionPath =
+    optionalEnv(env.QUOTEOPS_APPLIANCE_CREDENTIAL_REVISION_PATH) ??
+    defaultSettingsFile(env, "appliance-secrets-credential.json");
+  if (!receiptPath || !revisionPath) return false;
+  try {
+    const [receipt, revision] = await Promise.all([
+      readFile(receiptPath, "utf8").then((raw) => JSON.parse(raw)) as Promise<{
+        schema_version?: unknown;
+        provider?: unknown;
+        status?: unknown;
+        agent_config_sha256?: unknown;
+        credential_revision?: unknown;
+      }>,
+      readFile(revisionPath, "utf8").then((raw) => JSON.parse(raw)) as Promise<{
+        schema_version?: unknown;
+        credential_revision?: unknown;
+      }>
+    ]);
+    return (
+      receipt.schema_version === 1 &&
+      receipt.provider === provider &&
+      receipt.status === "ok" &&
+      revision.schema_version === 1 &&
+      Number(receipt.credential_revision) ===
+        Number(revision.credential_revision) &&
+      Number(revision.credential_revision) >= 1 &&
+      receipt.agent_config_sha256 ===
+        (await sha256Path(readiness.agentConfigPath))
+    );
+  } catch {
+    return false;
+  }
+}
+
+function defaultSettingsFile(
+  env: NodeJS.ProcessEnv,
+  filename: string
+): string | null {
+  const explicit = optionalEnv(env.QUOTEOPS_SETTINGS_DIR);
+  if (explicit) return join(explicit, filename);
+  const home = optionalEnv(env.QUOTEOPS_HOME);
+  return home ? join(home, "settings", filename) : null;
+}
+
+async function sha256Path(path: string): Promise<string> {
+  return createHash("sha256").update(await readFile(path)).digest("hex");
 }
 
 function envWithSecretFilePresence(

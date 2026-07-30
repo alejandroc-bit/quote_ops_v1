@@ -1,4 +1,16 @@
-import { chmod, readFile, writeFile } from "node:fs/promises";
+import {
+  chmod,
+  lstat,
+  mkdir,
+  readFile,
+  realpath,
+  rename,
+  stat,
+  writeFile
+} from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
+import { TextDecoder } from "node:util";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 import type {
   ProfitabilityRbBracket,
@@ -7,6 +19,11 @@ import type {
 } from "@quoteops/quote-core";
 import type { TmsCanonicalPerformance } from "@quoteops/contracts";
 import type { ManifestAuthorization } from "./wizardSteps.js";
+import {
+  OnboardingError,
+  type OnboardingContext,
+  type SecretFileRef
+} from "./onboardingFlow.js";
 
 // Pure config builders for the onboarding CLI. Kept side-effect free (except the
 // thin file wrappers) so the risky logic — secret escaping, TMS yaml, profile
@@ -19,7 +36,7 @@ import type { ManifestAuthorization } from "./wizardSteps.js";
  */
 export function upsertEnvLine(contents: string, key: string, value: string): string {
   if (!/^[A-Z_][A-Z0-9_]*$/.test(key)) throw new Error(`invalid secret key: ${key}`);
-  if (value.includes("\n")) throw new Error("secret values cannot contain newlines");
+  if (/[\r\n]/.test(value)) throw new Error("secret values cannot contain newlines");
   const escaped = value
     .replace(/\\/g, "\\\\")
     .replace(/"/g, '\\"')
@@ -33,9 +50,208 @@ export function upsertEnvLine(contents: string, key: string, value: string): str
 }
 
 export async function writeSecret(file: string, key: string, value: string): Promise<void> {
+  await updateAllowedEnv(file, { [key]: value }, [key]);
+}
+
+const MAX_SECRET_BYTES = 16 * 1024;
+const SECRET_CONTROL_CHARACTERS = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/;
+
+/**
+ * Load a credential without ever copying it back into the parsed answer object.
+ * File inputs are deliberately stricter than normal config files: a regular,
+ * non-symlink 0600 file, owned by root or the invoking uid, under answersRoot.
+ */
+export async function readSingleLineSecret(
+  input: string | SecretFileRef,
+  context?: Pick<OnboardingContext, "answersRoot">
+): Promise<string> {
+  if (typeof input === "string") return validateSingleLineSecret(input);
+  const requested = resolve(input.file);
+  if (context?.answersRoot) {
+    let root: string;
+    let canonicalRequested: string;
+    try {
+      [root, canonicalRequested] = await Promise.all([
+        realpath(resolve(context.answersRoot)),
+        realpath(requested)
+      ]);
+    } catch {
+      throw new OnboardingError("secret_file_unsafe");
+    }
+    const pathFromRoot = relative(root, canonicalRequested);
+    if (
+      pathFromRoot === ".." ||
+      pathFromRoot.startsWith(`..${sep}`) ||
+      isAbsolute(pathFromRoot)
+    ) {
+      throw new OnboardingError("secret_file_unsafe");
+    }
+  }
+
+  let metadata;
+  try {
+    metadata = await lstat(requested);
+  } catch {
+    throw new OnboardingError("secret_file_unsafe");
+  }
+  const invokingUid = typeof process.getuid === "function" ? process.getuid() : metadata.uid;
+  if (
+    metadata.isSymbolicLink() ||
+    !metadata.isFile() ||
+    (metadata.mode & 0o777) !== 0o600 ||
+    (metadata.uid !== 0 && metadata.uid !== invokingUid)
+  ) {
+    throw new OnboardingError("secret_file_unsafe");
+  }
+  if (metadata.size > MAX_SECRET_BYTES) {
+    throw new OnboardingError("secret_invalid");
+  }
+  const bytes = await readFile(requested);
+  let decoded: string;
+  try {
+    decoded = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch {
+    throw new OnboardingError("secret_invalid");
+  }
+  return validateSingleLineSecret(decoded);
+}
+
+export function validateSingleLineSecret(value: string): string {
+  if (Buffer.byteLength(value, "utf8") > MAX_SECRET_BYTES) {
+    throw new OnboardingError("secret_invalid");
+  }
+  const normalized = value.endsWith("\n") ? value.slice(0, -1) : value;
+  if (
+    normalized.length === 0 ||
+    normalized.includes("\n") ||
+    normalized.includes("\r") ||
+    SECRET_CONTROL_CHARACTERS.test(normalized) ||
+    normalized.trim() !== normalized
+  ) {
+    throw new OnboardingError("secret_invalid");
+  }
+  return normalized;
+}
+
+/**
+ * Atomically merge a bounded set of env keys. All values are validated before
+ * the original file is read, so a rejected value cannot cause a partial write.
+ * null removes a key, which is used to guarantee exact active-provider keys.
+ */
+export async function updateAllowedEnv(
+  file: string,
+  updates: Record<string, string | null | undefined>,
+  allowlist: readonly string[],
+  afterRename?: () => void | Promise<void>
+): Promise<void> {
+  const allowed = new Set(allowlist);
+  const validated = new Map<string, string | null>();
+  for (const [key, value] of Object.entries(updates)) {
+    if (!allowed.has(key) || !/^[A-Z_][A-Z0-9_]*$/.test(key)) {
+      throw new OnboardingError("secret_env_key_invalid");
+    }
+    validated.set(
+      key,
+      value === null || value === undefined
+        ? null
+        : validateSingleLineSecret(value)
+    );
+  }
+
   const current = await readFile(file, "utf8").catch(() => "");
-  await writeFile(file, upsertEnvLine(current, key, value), "utf8");
-  await chmod(file, 0o600);
+  const retained = current.split(/\r?\n/).filter((line) => {
+    const match =
+      /^\s*export\s+([A-Z_][A-Z0-9_]*)=/.exec(line) ??
+      /^\s*([A-Z_][A-Z0-9_]*)=/.exec(line);
+    return !match?.[1] || !validated.has(match[1]);
+  });
+  while (retained.at(-1) === "") retained.pop();
+  for (const [key, value] of validated) {
+    if (value !== null) retained.push(serializeEnvLine(key, value));
+  }
+  await atomicWriteText(file, `${retained.join("\n")}${retained.length ? "\n" : ""}`, {
+    mode: 0o600,
+    afterRename
+  });
+}
+
+export async function readEnvFileValues(
+  file: string
+): Promise<Map<string, string>> {
+  const values = new Map<string, string>();
+  const contents = await readFile(file, "utf8").catch(() => "");
+  for (const line of contents.split(/\r?\n/)) {
+    const match =
+      /^\s*export\s+([A-Z_][A-Z0-9_]*)=(.*)$/.exec(line) ??
+      /^\s*([A-Z_][A-Z0-9_]*)=(.*)$/.exec(line);
+    if (!match?.[1]) continue;
+    values.set(match[1], parseEnvValue(match[2] ?? ""));
+  }
+  return values;
+}
+
+export async function atomicWriteJson(
+  file: string,
+  value: unknown,
+  options: {
+    mode?: number;
+    afterRename?: () => void | Promise<void>;
+  } = {}
+): Promise<void> {
+  await atomicWriteText(file, `${JSON.stringify(value, null, 2)}\n`, options);
+}
+
+export async function atomicWriteText(
+  file: string,
+  contents: string,
+  options: {
+    mode?: number;
+    afterRename?: () => void | Promise<void>;
+  } = {}
+): Promise<void> {
+  const mode = options.mode ?? 0o600;
+  await mkdir(dirname(file), { recursive: true, mode: 0o700 });
+  const temporary = `${file}.tmp-${process.pid}-${Math.random()
+    .toString(16)
+    .slice(2)}`;
+  await writeFile(temporary, contents, { encoding: "utf8", mode });
+  await chmod(temporary, mode);
+  await rename(temporary, file);
+  await chmod(file, mode);
+  if (!(await stat(file)).isFile()) {
+    throw new OnboardingError("atomic_write_failed");
+  }
+  await options.afterRename?.();
+}
+
+export async function sha256File(file: string): Promise<string> {
+  return createHash("sha256").update(await readFile(file)).digest("hex");
+}
+
+function serializeEnvLine(key: string, value: string): string {
+  const escaped = value
+    .replace(/\\/g, "\\\\")
+    .replace(/"/g, '\\"')
+    .replace(/\$/g, "\\$")
+    .replace(/`/g, "\\`");
+  return `${key}="${escaped}"`;
+}
+
+function parseEnvValue(value: string): string {
+  const trimmed = value.trim();
+  if (trimmed.startsWith('"') && trimmed.endsWith('"')) {
+    return trimmed
+      .slice(1, -1)
+      .replace(/\\\\/g, "\u0000")
+      .replace(/\\"/g, '"')
+      .replace(/\\\$/g, "$")
+      .replace(/\\`/g, "`")
+      .replace(/\u0000/g, "\\");
+  }
+  if (trimmed.startsWith("'") && trimmed.endsWith("'")) {
+    return trimmed.slice(1, -1);
+  }
+  return trimmed;
 }
 
 /** Preserve the tool policy while persisting the onboarding approver identity. */

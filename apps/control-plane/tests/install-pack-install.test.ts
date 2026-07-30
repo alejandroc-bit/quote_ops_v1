@@ -61,6 +61,12 @@ describe("generated install pack", () => {
     const packDir = join(workDir, "pack");
     const homeDir = join(workDir, "home");
 
+    expect(pack.files["connectors/knowledge/README.md"]).toContain(
+      "documentos de conocimiento"
+    );
+    expect(pack.files["connectors/knowledge/README.md"]).toContain(
+      "consentimiento"
+    );
     await materializeFiles(packDir, pack.files);
     const result = spawnSync(
       "bash",
