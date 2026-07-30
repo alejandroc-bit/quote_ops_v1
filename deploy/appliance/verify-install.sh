@@ -79,6 +79,11 @@ cloudflare_access_owner_is_valid() {
   [[ "$(file_owner_id "$ACCESS_ENV_FILE")" == "$expected_owner" ]]
 }
 
+delete_access_file() {
+  rm -f -- "$ACCESS_ENV_FILE" >/dev/null 2>&1 || true
+  [[ ! -e "$ACCESS_ENV_FILE" && ! -L "$ACCESS_ENV_FILE" ]]
+}
+
 json_result() {
   local status="$1"
   printf '{\n'
@@ -106,8 +111,9 @@ cleanup() {
   if [[ -n "$TMP_DIR" && -d "$TMP_DIR" ]]; then
     rm -rf "$TMP_DIR"
   fi
-  if [[ "$KEEP_ACCESS_ENV" -eq 0 && -e "$ACCESS_ENV_FILE" ]]; then
-    rm -f "$ACCESS_ENV_FILE"
+  if [[ "$KEEP_ACCESS_ENV" -eq 0 &&
+        ( -e "$ACCESS_ENV_FILE" || -L "$ACCESS_ENV_FILE" ) ]]; then
+    delete_access_file || true
   fi
 }
 trap cleanup EXIT HUP INT TERM
@@ -162,6 +168,17 @@ public_request() {
       --write-out '%{http_code}' \
       "$@"
 }
+
+if [[ -e "$ACCESS_ENV_FILE" || -L "$ACCESS_ENV_FILE" ]]; then
+  if [[ ! -f "$ACCESS_ENV_FILE" ||
+        -L "$ACCESS_ENV_FILE" ||
+        "$(file_mode "$ACCESS_ENV_FILE")" != "600" ]] ||
+     ! cloudflare_access_owner_is_valid; then
+    KEEP_ACCESS_ENV=0
+    delete_access_file || true
+    finish 18 failed
+  fi
+fi
 
 [[ -f "$ENV_FILE" && -f "$RELEASE_ENV_FILE" && -f "$COMPOSE_FILE" ]] ||
   finish 10 failed
@@ -290,16 +307,6 @@ receipt_matches() {
       "$VALIDATION_RECEIPT_FILE" >/dev/null 2>&1
 }
 
-if [[ -e "$ACCESS_ENV_FILE" || -L "$ACCESS_ENV_FILE" ]]; then
-  if [[ ! -f "$ACCESS_ENV_FILE" ||
-        -L "$ACCESS_ENV_FILE" ||
-        "$(file_mode "$ACCESS_ENV_FILE")" != "600" ]] ||
-     ! cloudflare_access_owner_is_valid; then
-    KEEP_ACCESS_ENV=0
-    finish 18 failed
-  fi
-fi
-
 if receipt_matches; then
   ORIGIN_CHECK="ok"
   KEEP_ACCESS_ENV=0
@@ -365,7 +372,8 @@ RECEIPT_TMP="$QUOTEOPS_HOME/settings/.cloudflare-public-validation.json.tmp.$$"
 chmod 600 "$RECEIPT_TMP"
 mv "$RECEIPT_TMP" "$VALIDATION_RECEIPT_FILE" || finish 18 failed
 
-rm -f "$CURL_CONFIG" "$ACCESS_ENV_FILE"
+rm -f "$CURL_CONFIG"
 KEEP_ACCESS_ENV=0
+delete_access_file || finish 18 failed
 ORIGIN_CHECK="ok"
 finish 0 ready

@@ -136,6 +136,9 @@ EOF
 #!/usr/bin/env bash
 set -u
 if [[ " $* " == *" ps --status running --services "* ]]; then
+  if [[ "${MOCK_DOCKER_MODE:-}" == "core-fail" ]]; then
+    exit 1
+  fi
   printf '%s\n' postgres redis quoteops-agent quoteops-api quoteops-web caddy
   exit 0
 fi
@@ -313,6 +316,20 @@ EOF
   [[ "$result" -eq 18 &&
      ! -e "$gate_home/secrets/cloudflare-access-validation.env" ]] ||
     fail "unbounded Access ownership test exception did not fail closed"
+
+  reset_access_secret
+  chmod 644 "$gate_home/secrets/cloudflare-access-validation.env"
+  set +e
+  output="$(
+    PATH="$mock_bin:$PATH" QUOTEOPS_HOME="$gate_home" \
+      MOCK_DOCKER_MODE=core-fail \
+      bash "$APPLIANCE_DIR/verify-install.sh" --resume-guided
+  )"
+  result=$?
+  set -e
+  [[ "$result" -eq 18 &&
+     ! -e "$gate_home/secrets/cloudflare-access-validation.env" ]] ||
+    fail "unsafe Access file survived verifier preflight before an early core failure"
 
   reset_access_secret
   set +e
@@ -1004,6 +1021,21 @@ printf '%s\n' \
   'TUNNEL_TOKEN=smoke-tunnel-token' \
   'OPENROUTER_API_KEY=must-not-reach-cloudflared' > "$NO_PULL_HOME/secrets/cloudflare.env"
 assert_tunnel_env_rejected extra-assignment
+
+printf '%s\n' 'TUNNEL_TOKEN=smoke-tunnel-token' > "$NO_PULL_HOME/secrets/cloudflare.env"
+cat > "$NO_PULL_HOME/secrets/cloudflare-access-validation.env" <<'EOF'
+CF_ACCESS_CLIENT_ID=unsafe-installer-fixture.access
+CF_ACCESS_CLIENT_SECRET=unsafe-installer-fixture-secret
+EOF
+chmod 644 "$NO_PULL_HOME/secrets/cloudflare-access-validation.env"
+if run_no_pull_install >"$INSTALL_GUARD_DIR/unsafe-access-installer.log" 2>&1; then
+  fail "install accepted an unsafe Cloudflare Access validation file"
+fi
+[[ ! -e "$NO_PULL_HOME/secrets/cloudflare-access-validation.env" ]] ||
+  fail "install did not delete an unsafe Cloudflare Access validation file"
+if grep -Eq 'unsafe-installer-fixture' "$INSTALL_GUARD_DIR/unsafe-access-installer.log"; then
+  fail "install logged transient Cloudflare Access credentials"
+fi
 
 if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
   WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/quoteops-appliance-smoke.XXXXXX")"

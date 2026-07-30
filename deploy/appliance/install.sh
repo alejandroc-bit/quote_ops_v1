@@ -170,19 +170,31 @@ validate_secret_file() {
 validate_cloudflare_access_file() {
   local expected_owner=0
   [[ -f "$CLOUDFLARE_ACCESS_ENV_FILE" && ! -L "$CLOUDFLARE_ACCESS_ENV_FILE" ]] ||
-    die "Cloudflare Access validation file must be a regular non-symlink file"
+    remove_unsafe_cloudflare_access_file \
+      "Cloudflare Access validation file must be a regular non-symlink file"
   [[ "$(file_mode "$CLOUDFLARE_ACCESS_ENV_FILE")" == "600" ]] ||
-    die "Cloudflare Access validation file must have mode 0600"
+    remove_unsafe_cloudflare_access_file \
+      "Cloudflare Access validation file must have mode 0600"
   if [[ "${QUOTEOPS_BOOTSTRAP_TEST_MODE:-}" == "macbook" ]]; then
     case "$QUOTEOPS_HOME" in
       "$(cd "${TMPDIR:-/tmp}" && pwd -P)"/quoteops-mac-e2e.*/quoteops-v1)
         expected_owner="$(id -u)"
         ;;
-      *) die "Cloudflare Access test ownership exception requires a bounded temporary QUOTEOPS_HOME" ;;
+      *) remove_unsafe_cloudflare_access_file \
+           "Cloudflare Access test ownership exception requires a bounded temporary QUOTEOPS_HOME" ;;
     esac
   fi
   [[ "$(file_owner_id "$CLOUDFLARE_ACCESS_ENV_FILE")" == "$expected_owner" ]] ||
-    die "Cloudflare Access validation file must be owned by root"
+    remove_unsafe_cloudflare_access_file \
+      "Cloudflare Access validation file must be owned by root"
+}
+
+remove_unsafe_cloudflare_access_file() {
+  local message="$1"
+  rm -f -- "$CLOUDFLARE_ACCESS_ENV_FILE" >/dev/null 2>&1 || true
+  [[ ! -e "$CLOUDFLARE_ACCESS_ENV_FILE" && ! -L "$CLOUDFLARE_ACCESS_ENV_FILE" ]] ||
+    die "unsafe Cloudflare Access validation path could not be removed"
+  die "$message"
 }
 
 validate_cloudflare_tunnel_env() {
@@ -875,6 +887,9 @@ fi
 validate_secret_file "$SECRETS_ENV_FILE"
 validate_secret_file "$CLOUDFLARE_ENV_FILE"
 if [[ "$START_STACK" -eq 1 ]]; then
+  if [[ -e "$CLOUDFLARE_ACCESS_ENV_FILE" || -L "$CLOUDFLARE_ACCESS_ENV_FILE" ]]; then
+    validate_cloudflare_access_file
+  fi
   validate_cloudflare_tunnel_env
   if [[ "$GUIDED" -eq 1 ]]; then
     load_cloudflare_gate_settings
