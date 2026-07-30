@@ -1,5 +1,4 @@
 import { createHash } from "node:crypto";
-import { spawn } from "node:child_process";
 import {
   mkdir,
   mkdtemp,
@@ -256,6 +255,23 @@ function canonicalFixtureFetch(): typeof fetch {
 }
 
 describe("probeTmsHttpV1", () => {
+  it("exports no generic fetch or transport injection surface", async () => {
+    const source = await readFile(
+      join(
+        process.cwd(),
+        "apps/api/src/onboard/tmsProbe.ts"
+      ),
+      "utf8"
+    );
+    const inputBlock =
+      source.match(
+        /export type TmsProbeInput = \{([\s\S]*?)\n\};/
+      )?.[1] ?? "";
+
+    expect(inputBlock).not.toMatch(/\bfetch\??\s*:/);
+    expect(inputBlock).not.toMatch(/\btransport\??\s*:/);
+  });
+
   it("constructs its pinned transport when no fetch or transport is supplied", async () => {
     const files = await fixtureFiles();
     const requests: PinnedTmsRequest[] = [];
@@ -773,7 +789,7 @@ describe("configureTmsHttpV1", () => {
     ).toBe(false);
   });
 
-  it("atomically resumes past an abandoned owner and serializes two writers", async () => {
+  it("recovers a reused PID incarnation while protecting the matching live owner", async () => {
     const directory = await mkdtemp(join(tmpdir(), "quoteops-tms-writers-"));
     temporaryDirectories.push(directory);
     const paths = {
@@ -787,20 +803,15 @@ describe("configureTmsHttpV1", () => {
       paths.settingsDir,
       "tms-config-locks"
     );
-    const abandonedOwner = spawn(process.execPath, [
-      "-e",
-      "process.exit(0)"
-    ]);
-    const deadPid = abandonedOwner.pid;
-    if (!deadPid) throw new Error("abandoned_owner_pid_unavailable");
-    await new Promise<void>((resolve, reject) => {
-      abandonedOwner.once("error", reject);
-      abandonedOwner.once("exit", () => resolve());
-    });
+    const staleBootIdentity = "0".repeat(32);
+    const staleStartIdentity = "1".repeat(32);
     const abandonedChoosing =
-      `choosing-${deadPid}-dead-owner-token`;
+      `choosing-${process.pid}-${staleBootIdentity}` +
+      `-${staleStartIdentity}-old-incarnation-token`;
     const abandonedTicket =
-      `ticket-0000000000000041-${deadPid}-dead-owner-token`;
+      `ticket-0000000000000041-${process.pid}` +
+      `-${staleBootIdentity}-${staleStartIdentity}` +
+      `-old-incarnation-token`;
     await mkdir(join(lockDirectory, abandonedChoosing), {
       recursive: true
     });
@@ -813,6 +824,7 @@ describe("configureTmsHttpV1", () => {
       testPinnedRequest: pinnedRequestFromFetch(fetchFn),
       paths,
       resolveHostname: publicResolver,
+      httpProbeTimeoutMs: 500,
       async afterAtomicRename(label: string) {
         if (label === "tms_credential_revision") {
           activeTransitions += 1;
@@ -903,9 +915,13 @@ describe("configureTmsHttpV1", () => {
     expect(remainingLocks).toContain(abandonedChoosing);
     expect(remainingLocks).toContain(abandonedTicket);
     expect(
-      remainingLocks.some((entry) =>
-        entry.includes(`-${process.pid}-`)
-      )
+      remainingLocks
+        .filter(
+          (entry) =>
+            entry !== abandonedChoosing &&
+            entry !== abandonedTicket
+        )
+        .some((entry) => entry.includes(`-${process.pid}-`))
     ).toBe(false);
   });
 });

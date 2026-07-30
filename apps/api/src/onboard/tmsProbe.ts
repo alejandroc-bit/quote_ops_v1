@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { execFile } from "node:child_process";
 import {
   mkdir,
   readdir,
@@ -89,7 +90,6 @@ export type TmsProbeInput = {
   credentialRevision: number;
   receiptPath: string;
   sampleQuery: HistoricalSearchQuery;
-  transport?: PinnedTmsTransport;
   testPinnedRequest?: PinnedTmsRequestExecutor;
   now?: () => Date;
   resolveHostname?: (hostname: string) => Promise<string[]>;
@@ -99,6 +99,12 @@ export type TmsProbeInput = {
   deadline?: TmsAbsoluteDeadline;
   afterReceiptRename?: () => void | Promise<void>;
 };
+
+const TMS_PROBE_INPUT_NETWORK_BOUNDARY: Record<
+  Extract<keyof TmsProbeInput, "fetch" | "transport">,
+  never
+> = {};
+void TMS_PROBE_INPUT_NETWORK_BOUNDARY;
 
 export type ConfigureTmsHttpV1Input = {
   baseUrl: string;
@@ -297,8 +303,8 @@ async function configureTmsHttpGeneration<
       credentialRevision,
       receiptPath: context.paths.tmsProbeFile,
       sampleQuery: input.sampleQuery,
-      transport,
       resolveHostname: context.resolveHostname,
+      testPinnedRequest: context.testPinnedRequest,
       now: context.now,
       timeoutMs: context.httpProbeTimeoutMs,
       acceptanceMode,
@@ -390,17 +396,15 @@ async function probeTmsHttpV1WithinDeadline(
 ): Promise<TmsHttpV1ProbeReceipt> {
   const prepared = await prepareProbe(input);
   assertCanonicalV1Config(prepared.config);
-  const transport =
-    input.transport ??
-    createPinnedTmsTransport({
-      baseUrlOrigin: prepared.baseUrlOrigin,
-      resolveHostname: input.resolveHostname,
-      request: selectTestPinnedRequest(input.testPinnedRequest),
-      maximumBodyBytes:
-        input.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES,
-      acceptanceMode: input.acceptanceMode,
-      deadline
-    });
+  const transport = createPinnedTmsTransport({
+    baseUrlOrigin: prepared.baseUrlOrigin,
+    resolveHostname: input.resolveHostname,
+    request: selectTestPinnedRequest(input.testPinnedRequest),
+    maximumBodyBytes:
+      input.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES,
+    acceptanceMode: input.acceptanceMode,
+    deadline
+  });
   const response = await fetchHealth(
     input,
     transport,
@@ -863,7 +867,12 @@ async function acquireTmsConfigLock(
   const lockDirectory = join(settingsDir, "tms-config-locks");
   await mkdir(lockDirectory, { recursive: true, mode: 0o700 });
   const token = randomUUID();
-  const choosingName = `choosing-${process.pid}-${token}`;
+  deadline.signal.throwIfAborted();
+  const processIdentity = await readCurrentProcessIdentity();
+  deadline.signal.throwIfAborted();
+  const choosingName =
+    `choosing-${process.pid}-${processIdentity.bootIdentity}` +
+    `-${processIdentity.startIdentity}-${token}`;
   const choosingPath = join(lockDirectory, choosingName);
   let ticketPath: string | undefined;
   await mkdir(choosingPath, { mode: 0o700 });
@@ -879,7 +888,8 @@ async function acquireTmsConfigLock(
     const ticketNumber = maximumTicket + 1;
     const ticketName =
       `ticket-${String(ticketNumber).padStart(16, "0")}` +
-      `-${process.pid}-${token}`;
+      `-${process.pid}-${processIdentity.bootIdentity}` +
+      `-${processIdentity.startIdentity}-${token}`;
     ticketPath = join(lockDirectory, ticketName);
     await mkdir(ticketPath, { mode: 0o700 });
     await rmdir(choosingPath);
@@ -887,19 +897,38 @@ async function acquireTmsConfigLock(
     while (true) {
       deadline.signal.throwIfAborted();
       const entries = await readTmsLockEntries(lockDirectory);
-      const anotherOwnerChoosing = entries.choosing.some(
-        (entry) =>
-          entry.token !== token && isLockProcessAlive(entry.pid)
-      );
-      const earlierLiveTicket = entries.tickets.some(
-        (entry) =>
-          entry.token !== token &&
-          isLockProcessAlive(entry.pid) &&
-          compareLockTickets(
-            entry,
-            { number: ticketNumber, pid: process.pid, token }
-          ) < 0
-      );
+      const anotherOwnerChoosing = (
+        await Promise.all(
+          entries.choosing.map(
+            async (entry) =>
+              entry.token !== token &&
+              (await isMatchingProcessIncarnation(
+                entry,
+                processIdentity
+              ))
+          )
+        )
+      ).some(Boolean);
+      const earlierLiveTicket = (
+        await Promise.all(
+          entries.tickets.map(
+            async (entry) =>
+              entry.token !== token &&
+              (await isMatchingProcessIncarnation(
+                entry,
+                processIdentity
+              )) &&
+              compareLockTickets(entry, {
+                number: ticketNumber,
+                pid: process.pid,
+                bootIdentity: processIdentity.bootIdentity,
+                startIdentity: processIdentity.startIdentity,
+                token
+              }) < 0
+          )
+        )
+      ).some(Boolean);
+      deadline.signal.throwIfAborted();
       if (!anotherOwnerChoosing && !earlierLiveTicket) {
         const ownedTicketPath = ticketPath;
         let released = false;
@@ -924,6 +953,8 @@ async function acquireTmsConfigLock(
 
 type TmsChoosingEntry = {
   pid: number;
+  bootIdentity: string;
+  startIdentity: string;
   token: string;
 };
 
@@ -943,23 +974,29 @@ async function readTmsLockEntries(lockDirectory: string): Promise<{
   for (const entry of entries) {
     if (!entry.isDirectory()) continue;
     const choosingMatch =
-      /^choosing-(\d+)-([A-Za-z0-9-]+)$/.exec(entry.name);
+      /^choosing-(\d+)-([a-f0-9]{32})-([a-f0-9]{32})-([A-Za-z0-9-]+)$/.exec(
+        entry.name
+      );
     if (choosingMatch) {
       choosing.push({
         pid: Number(choosingMatch[1]),
-        token: choosingMatch[2] ?? ""
+        bootIdentity: choosingMatch[2] ?? "",
+        startIdentity: choosingMatch[3] ?? "",
+        token: choosingMatch[4] ?? ""
       });
       continue;
     }
     const ticketMatch =
-      /^ticket-(\d{16})-(\d+)-([A-Za-z0-9-]+)$/.exec(
+      /^ticket-(\d{16})-(\d+)-([a-f0-9]{32})-([a-f0-9]{32})-([A-Za-z0-9-]+)$/.exec(
         entry.name
       );
     if (ticketMatch) {
       tickets.push({
         number: Number(ticketMatch[1]),
         pid: Number(ticketMatch[2]),
-        token: ticketMatch[3] ?? ""
+        bootIdentity: ticketMatch[3] ?? "",
+        startIdentity: ticketMatch[4] ?? "",
+        token: ticketMatch[5] ?? ""
       });
     }
   }
@@ -976,7 +1013,148 @@ function compareLockTickets(
   return left.token.localeCompare(right.token);
 }
 
-function isLockProcessAlive(pid: number): boolean {
+type TmsProcessIdentity = {
+  bootIdentity: string;
+  startIdentity: string;
+};
+
+const PORTABLE_CURRENT_PROCESS_IDENTITY: TmsProcessIdentity = {
+  bootIdentity: hashProcessIdentity(`portable-boot-${randomUUID()}`),
+  startIdentity: hashProcessIdentity(
+    `portable-start-${process.pid}-${randomUUID()}`
+  )
+};
+
+let currentProcessIdentity:
+  | Promise<TmsProcessIdentity>
+  | undefined;
+
+async function readCurrentProcessIdentity(): Promise<TmsProcessIdentity> {
+  currentProcessIdentity ??= (async () =>
+    (await readPlatformProcessIdentity(process.pid)) ??
+    PORTABLE_CURRENT_PROCESS_IDENTITY)();
+  return await currentProcessIdentity;
+}
+
+async function isMatchingProcessIncarnation(
+  entry: TmsChoosingEntry,
+  ownIdentity: TmsProcessIdentity
+): Promise<boolean> {
+  if (!isProcessIdLive(entry.pid)) return false;
+  const actualIdentity =
+    entry.pid === process.pid
+      ? ownIdentity
+      : await readPlatformProcessIdentity(entry.pid);
+  if (!actualIdentity) {
+    // If the platform cannot expose a stable incarnation identity for another
+    // live process, fail closed rather than steal its ticket.
+    return isProcessIdLive(entry.pid);
+  }
+  return (
+    entry.bootIdentity === actualIdentity.bootIdentity &&
+    entry.startIdentity === actualIdentity.startIdentity
+  );
+}
+
+async function readPlatformProcessIdentity(
+  pid: number
+): Promise<TmsProcessIdentity | null> {
+  if (!Number.isSafeInteger(pid) || pid < 1) return null;
+  if (process.platform === "linux") {
+    const identity = await readLinuxProcessIdentity(pid);
+    if (identity) return identity;
+  }
+  if (process.platform === "darwin") {
+    const [boot, start] = await Promise.all([
+      executeIdentityCommand("/usr/sbin/sysctl", [
+        "-n",
+        "kern.boottime"
+      ]),
+      executeIdentityCommand("/bin/ps", [
+        "-o",
+        "lstart=",
+        "-p",
+        String(pid)
+      ])
+    ]);
+    return buildProcessIdentity(boot, start);
+  }
+  if (process.platform === "win32") {
+    const [boot, start] = await Promise.all([
+      executeIdentityCommand("powershell.exe", [
+        "-NoProfile",
+        "-Command",
+        "(Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToFileTimeUtc()"
+      ]),
+      executeIdentityCommand("powershell.exe", [
+        "-NoProfile",
+        "-Command",
+        `(Get-Process -Id ${pid}).StartTime.ToUniversalTime().Ticks`
+      ])
+    ]);
+    return buildProcessIdentity(boot, start);
+  }
+  return null;
+}
+
+async function readLinuxProcessIdentity(
+  pid: number
+): Promise<TmsProcessIdentity | null> {
+  const [boot, stat] = await Promise.all([
+    readFile("/proc/sys/kernel/random/boot_id", "utf8").catch(
+      () => ""
+    ),
+    readFile(`/proc/${pid}/stat`, "utf8").catch(() => "")
+  ]);
+  const closeParenthesis = stat.lastIndexOf(")");
+  if (!boot.trim() || closeParenthesis < 0) return null;
+  const fields = stat
+    .slice(closeParenthesis + 1)
+    .trim()
+    .split(/\s+/);
+  // The first field after "(comm)" is proc field 3 (state), so field 22
+  // (starttime, measured since boot) is index 19 here.
+  return buildProcessIdentity(boot, fields[19] ?? "");
+}
+
+function buildProcessIdentity(
+  boot: string,
+  start: string
+): TmsProcessIdentity | null {
+  const normalizedBoot = boot.trim();
+  const normalizedStart = start.trim();
+  if (!normalizedBoot || !normalizedStart) return null;
+  return {
+    bootIdentity: hashProcessIdentity(normalizedBoot),
+    startIdentity: hashProcessIdentity(normalizedStart)
+  };
+}
+
+function hashProcessIdentity(value: string): string {
+  return sha256(Buffer.from(value, "utf8")).slice(0, 32);
+}
+
+async function executeIdentityCommand(
+  executable: string,
+  args: string[]
+): Promise<string> {
+  return await new Promise<string>((resolve) => {
+    execFile(
+      executable,
+      args,
+      {
+        encoding: "utf8",
+        timeout: 1_000,
+        maxBuffer: 64 * 1024
+      },
+      (error, stdout) => {
+        resolve(error ? "" : String(stdout));
+      }
+    );
+  });
+}
+
+function isProcessIdLive(pid: number): boolean {
   if (!Number.isSafeInteger(pid) || pid < 1) return false;
   try {
     process.kill(pid, 0);
