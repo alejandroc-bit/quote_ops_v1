@@ -19,8 +19,11 @@
     "demo:nmx-control-plane": "bash deploy/control-plane/demo-nmx.sh",
     "package:appliance": "node scripts/package-appliance-release.mjs",
     "dev:install": "bash scripts/dev-install-quoteops.sh",
+    "evidence:browser:validate": "node scripts/validate-browser-evidence.mjs",
     "test": "vitest run",
     "test:watch": "vitest",
+    "test:appliance:ubuntu-vm": "bash deploy/appliance/tests/ubuntu-vm-bootstrap-acceptance.sh",
+    "test:appliance:mac": "bash deploy/appliance/tests/macbook-acceptance.sh",
     "typecheck": "npm run build:ts"
   },
   "dependencies": {
