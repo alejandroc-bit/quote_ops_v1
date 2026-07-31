@@ -1593,8 +1593,8 @@ EOF
     fail "production compose is missing internal cloudflared metrics"
   ! grep -qE 'published: "(80|443)"' <<<"$rendered" ||
     fail "production compose publishes Caddy ports"
-  ! grep -q 'TUNNEL_TOKEN:' <<<"$rendered" ||
-    fail "production compose interpolates TUNNEL_TOKEN"
+  ! grep -q 'TUNNEL_TOKEN' "$APPLIANCE_DIR/docker-compose.yml" ||
+    fail "production compose hardcodes TUNNEL_TOKEN"
   cloudflared_block="$(sed -n '/^  cloudflared:/,/^  [a-zA-Z0-9_-][a-zA-Z0-9_-]*:/p' <<<"$rendered")"
   ! grep -qE 'OPENROUTER|GEMINI|TMS_API_KEY|RESEND|SAKBE' <<<"$cloudflared_block" ||
     fail "cloudflared receives client application secrets"
