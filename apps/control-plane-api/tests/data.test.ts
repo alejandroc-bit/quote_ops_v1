@@ -233,6 +233,22 @@ describe("unified control-plane data", () => {
     expect(output).toContain(
       "FILECLI | onboarding | filecli-prod-001 | pending | ops@cliente.mx | Razón Social"
     );
+
+    dependencies.env = {
+      ...dependencies.env,
+      QUOTEOPS_CONTROL_PLANE_URL: "https://control.quoteops.example",
+      QUOTEOPS_ALLOW_LOCAL_ORIGIN: "1"
+    };
+    await runAdminCli(["install-pack", "FILECLI"], dependencies);
+
+    expect(output).toContain("Registration token: file-store-token");
+    const saved = await fileData.getRegistrationToken(sha256("file-store-token"));
+    expect(saved).toMatchObject({
+      client_id: "FILECLI",
+      installation_id: "filecli-prod-001",
+      release_version: "v0.2.0",
+      used_at: null
+    });
   });
 
   it("runs the vendor create-client, list and install-pack workflow", async () => {
