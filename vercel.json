@@ -5,12 +5,7 @@
   "functions": {
     "api/index.ts": {
       "maxDuration": 10,
-      "includeFiles": [
-        "deploy/appliance/**",
-        "dist/appliance/**",
-        "docs/integrations/tms-http-v1.openapi.yaml",
-        "docs/integrations/tms-http-v1.md"
-      ]
+      "includeFiles": "{deploy/appliance/**,dist/appliance/**,docs/integrations/tms-http-v1.openapi.yaml,docs/integrations/tms-http-v1.md}"
     }
   },
   "rewrites": [
