@@ -273,17 +273,21 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      packages: read
     steps:
       - uses: actions/download-artifact@v4
         with:
           name: appliance-release
           path: dist/appliance
-      - name: Pull every candidate reference without registry login
+      - name: Pull every candidate reference without any registry login
         env:
           VERSION: ${{ github.ref_name }}
         run: |
           set -euo pipefail
+          # Ensure no ghcr.io credentials remain from the runner setup so this
+          # is a true anonymous pull. A private package MUST fail here and block
+          # the release. Package visibility must be set to "public" once per
+          # GHCR package (ghcr.io/alejandroc-bit/quote-ops-{api,agent,web}).
+          docker logout ghcr.io >/dev/null 2>&1 || true
           manifest="dist/appliance/$VERSION/release.json"
           for key in agent api web; do
             reference="$(jq -er --arg key "$key" '.images[$key]' "$manifest")"
