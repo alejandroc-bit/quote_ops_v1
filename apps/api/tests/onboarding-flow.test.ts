@@ -3,9 +3,11 @@ import {
   mkdir,
   mkdtemp,
   readFile,
+  realpath,
   rename,
   stat,
   symlink,
+  unlink,
   writeFile
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -15,8 +17,10 @@ import { parse as parseYaml } from "yaml";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   OnboardingError,
+  assertAcceptanceAnswersInvocation,
   createFileOnboardingStateStore,
   parseOnboardingSelection,
+  readValidatedAcceptanceAnswersFile,
   runOnboarding,
   type OnboardingContext,
   type OnboardingPhase,
@@ -932,6 +936,184 @@ describe("resumable onboarding flow", () => {
 
     await expect(module.readOnboardingAnswersFile(file)).rejects.toMatchObject({
       code: "onboarding_answers_invalid",
+      exitCode: 2
+    });
+  });
+
+  it("allows --answers-file only for the exact explicit acceptance invocation", () => {
+    expect(() =>
+      assertAcceptanceAnswersInvocation(
+        "/run/quoteops-onboard-input/answers.json",
+        undefined
+      )
+    ).toThrow(
+      expect.objectContaining({
+        code: "onboarding_answers_acceptance_required",
+        exitCode: 2
+      })
+    );
+    expect(() =>
+      assertAcceptanceAnswersInvocation(
+        "/tmp/answers.json",
+        "macbook"
+      )
+    ).toThrow(
+      expect.objectContaining({
+        code: "onboarding_answers_path_invalid",
+        exitCode: 2
+      })
+    );
+    expect(() =>
+      assertAcceptanceAnswersInvocation(
+        "/run/quoteops-onboard-input/answers.json",
+        "macbook"
+      )
+    ).not.toThrow();
+  });
+
+  it("preflights a physical acceptance root and every file reference", async () => {
+    const root = await realpath(
+      await mkdtemp(join(tmpdir(), "quoteops-onboard-input-"))
+    );
+    tempDirs.push(root);
+    const secret = join(root, "provider-secret");
+    const answersFile = join(root, "answers.json");
+    await writeFile(secret, "secret-value", { mode: 0o600 });
+    await writeFile(
+      answersFile,
+      JSON.stringify({
+        schema_version: 1,
+        ai_provider: {
+          provider: "openrouter",
+          api_key: { file: secret }
+        }
+      }),
+      { mode: 0o600 }
+    );
+    await chmod(root, 0o700);
+    await chmod(secret, 0o600);
+    await chmod(answersFile, 0o600);
+
+    await expect(
+      readValidatedAcceptanceAnswersFile(answersFile, root)
+    ).resolves.toMatchObject({
+      schema_version: 1,
+      ai_provider: { provider: "openrouter" }
+    });
+  });
+
+  it("rejects an acceptance root that is not private to a safe container owner", async () => {
+    const root = await realpath(
+      await mkdtemp(join(tmpdir(), "quoteops-onboard-input-"))
+    );
+    tempDirs.push(root);
+    const answersFile = join(root, "answers.json");
+    await writeFile(answersFile, JSON.stringify({ schema_version: 1 }), {
+      mode: 0o600
+    });
+    await chmod(root, 0o755);
+    await chmod(answersFile, 0o600);
+
+    await expect(
+      readValidatedAcceptanceAnswersFile(answersFile, root)
+    ).rejects.toMatchObject({
+      code: "onboarding_answers_unsafe",
+      exitCode: 2
+    });
+  });
+
+  it.each([
+    {
+      label: "world-readable input",
+      prepare: async (root: string, secret: string) => {
+        await chmod(secret, 0o644);
+        return join(root, "answers.json");
+      }
+    },
+    {
+      label: "symlinked input",
+      prepare: async (root: string, secret: string) => {
+        const linked = join(root, "linked-secret");
+        await symlink(secret, linked);
+        const answersFile = join(root, "answers.json");
+        await writeFile(
+          answersFile,
+          JSON.stringify({
+            schema_version: 1,
+            ai_provider: {
+              provider: "openrouter",
+              api_key: { file: linked }
+            }
+          }),
+          { mode: 0o600 }
+        );
+        return answersFile;
+      }
+    },
+    {
+      label: "reference outside the mount",
+      prepare: async (root: string) => {
+        const outsideRoot = await realpath(
+          await mkdtemp(join(tmpdir(), "quoteops-onboard-outside-"))
+        );
+        tempDirs.push(outsideRoot);
+        const outside = join(outsideRoot, "outside-secret");
+        await writeFile(outside, "secret-value", { mode: 0o600 });
+        const answersFile = join(root, "answers.json");
+        await writeFile(
+          answersFile,
+          JSON.stringify({
+            schema_version: 1,
+            ai_provider: {
+              provider: "openrouter",
+              api_key: { file: outside }
+            }
+          }),
+          { mode: 0o600 }
+        );
+        return answersFile;
+      }
+    },
+    {
+      label: "symlinked answers file",
+      prepare: async (root: string) => {
+        const realAnswers = join(root, "real-answers.json");
+        const answersFile = join(root, "answers.json");
+        await writeFile(realAnswers, JSON.stringify({ schema_version: 1 }), {
+          mode: 0o600
+        });
+        await unlink(answersFile);
+        await symlink(realAnswers, answersFile);
+        return answersFile;
+      }
+    }
+  ])("rejects a $label before onboarding starts", async ({ prepare }) => {
+    const root = await realpath(
+      await mkdtemp(join(tmpdir(), "quoteops-onboard-input-"))
+    );
+    tempDirs.push(root);
+    const secret = join(root, "provider-secret");
+    await writeFile(secret, "secret-value", { mode: 0o600 });
+    await chmod(root, 0o700);
+    await chmod(secret, 0o600);
+    const defaultAnswers = join(root, "answers.json");
+    await writeFile(
+      defaultAnswers,
+      JSON.stringify({
+        schema_version: 1,
+        ai_provider: {
+          provider: "openrouter",
+          api_key: { file: secret }
+        }
+      }),
+      { mode: 0o600 }
+    );
+    const answersFile = await prepare(root, secret);
+
+    await expect(
+      readValidatedAcceptanceAnswersFile(answersFile, root)
+    ).rejects.toMatchObject({
+      code: "onboarding_answers_unsafe",
       exitCode: 2
     });
   });

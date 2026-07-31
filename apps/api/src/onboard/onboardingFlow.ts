@@ -1,13 +1,16 @@
 import {
   chmod,
+  lstat,
   mkdir,
   open,
   readFile,
+  realpath,
   rename,
   stat,
   writeFile
 } from "node:fs/promises";
-import { dirname, join, resolve } from "node:path";
+import { constants } from "node:fs";
+import { basename, dirname, join, resolve } from "node:path";
 import type { HistoricalSearchQuery } from "@quoteops/connectors";
 import { tmsHttpV1HistoricalSearchRequestSchema } from "@quoteops/contracts";
 import { z } from "zod";
@@ -231,6 +234,187 @@ export function parseOnboardingAnswers(value: unknown): OnboardingAnswers {
 }
 
 const MAX_ANSWERS_FILE_BYTES = 64 * 1024;
+export const ACCEPTANCE_ANSWERS_ROOT = "/run/quoteops-onboard-input";
+export const ACCEPTANCE_ANSWERS_FILE =
+  "/run/quoteops-onboard-input/answers.json";
+
+export function assertAcceptanceAnswersInvocation(
+  file: string,
+  acceptanceMode: string | undefined
+): void {
+  if (acceptanceMode !== "macbook") {
+    throw new OnboardingError("onboarding_answers_acceptance_required", {
+      exitCode: 2
+    });
+  }
+  if (file !== ACCEPTANCE_ANSWERS_FILE) {
+    throw new OnboardingError("onboarding_answers_path_invalid", {
+      exitCode: 2
+    });
+  }
+}
+
+/**
+ * Acceptance-only preflight. The CLI first locks the invocation to the fixed
+ * container path, then this function validates the bind and every referenced
+ * file before any phase can read credential or document contents.
+ */
+export async function readValidatedAcceptanceAnswersFile(
+  file: string,
+  root: string
+): Promise<OnboardingAnswers> {
+  const resolvedRoot = resolve(root);
+  const resolvedFile = resolve(file);
+  if (
+    root !== resolvedRoot ||
+    file !== resolvedFile ||
+    dirname(resolvedFile) !== resolvedRoot ||
+    basename(resolvedFile) !== "answers.json"
+  ) {
+    throw unsafeAnswersError();
+  }
+
+  try {
+    const [rootMetadata, canonicalRoot] = await Promise.all([
+      lstat(resolvedRoot),
+      realpath(resolvedRoot)
+    ]);
+    const invokingUid =
+      typeof process.getuid === "function" ? process.getuid() : rootMetadata.uid;
+    if (
+      !rootMetadata.isDirectory() ||
+      rootMetadata.isSymbolicLink() ||
+      canonicalRoot !== resolvedRoot ||
+      (rootMetadata.mode & 0o777) !== 0o700 ||
+      (rootMetadata.uid !== 0 && rootMetadata.uid !== invokingUid)
+    ) {
+      throw unsafeAnswersError();
+    }
+  } catch (error) {
+    if (isUnsafeAnswersError(error)) throw error;
+    throw unsafeAnswersError();
+  }
+
+  const bytes = await readAcceptanceFile(resolvedFile, resolvedRoot, true);
+  let answers: OnboardingAnswers;
+  try {
+    answers = parseOnboardingAnswers(JSON.parse(bytes!.toString("utf8")));
+  } catch (error) {
+    if (
+      error instanceof OnboardingError &&
+      error.code === "onboarding_answers_invalid"
+    ) {
+      throw error;
+    }
+    throw new OnboardingError("onboarding_answers_invalid", { exitCode: 2 });
+  }
+
+  const references = new Set<string>();
+  collectOnboardingFileReferences(answers, references);
+  for (const reference of references) {
+    if (
+      reference !== resolve(reference) ||
+      dirname(reference) !== resolvedRoot ||
+      basename(reference) === "answers.json"
+    ) {
+      throw unsafeAnswersError();
+    }
+    await readAcceptanceFile(reference, resolvedRoot, false);
+  }
+  return answers;
+}
+
+async function readAcceptanceFile(
+  file: string,
+  root: string,
+  readContents: boolean
+): Promise<Buffer | null> {
+  let handle;
+  try {
+    handle = await open(file, constants.O_RDONLY | constants.O_NOFOLLOW);
+    const metadata = await handle.stat();
+    const invokingUid =
+      typeof process.getuid === "function" ? process.getuid() : metadata.uid;
+    if (
+      !metadata.isFile() ||
+      (metadata.mode & 0o777) !== 0o600 ||
+      (metadata.uid !== 0 && metadata.uid !== invokingUid) ||
+      (readContents &&
+        (metadata.size < 1 || metadata.size > MAX_ANSWERS_FILE_BYTES))
+    ) {
+      throw unsafeAnswersError();
+    }
+
+    const [pathMetadata, canonicalFile, canonicalParent] = await Promise.all([
+      lstat(file),
+      realpath(file),
+      realpath(dirname(file))
+    ]);
+    if (
+      pathMetadata.isSymbolicLink() ||
+      !pathMetadata.isFile() ||
+      pathMetadata.dev !== metadata.dev ||
+      pathMetadata.ino !== metadata.ino ||
+      canonicalParent !== root ||
+      canonicalFile !== join(root, basename(file))
+    ) {
+      throw unsafeAnswersError();
+    }
+    if (!readContents) return null;
+
+    const bytes = Buffer.alloc(MAX_ANSWERS_FILE_BYTES + 1);
+    let offset = 0;
+    while (offset < bytes.length) {
+      const { bytesRead } = await handle.read(
+        bytes,
+        offset,
+        bytes.length - offset,
+        offset
+      );
+      if (bytesRead === 0) break;
+      offset += bytesRead;
+    }
+    if (offset === 0 || offset > MAX_ANSWERS_FILE_BYTES) {
+      throw unsafeAnswersError();
+    }
+    return bytes.subarray(0, offset);
+  } catch (error) {
+    if (isUnsafeAnswersError(error)) throw error;
+    throw unsafeAnswersError();
+  } finally {
+    await handle?.close().catch(() => undefined);
+  }
+}
+
+function collectOnboardingFileReferences(
+  value: unknown,
+  references: Set<string>
+): void {
+  if (Array.isArray(value)) {
+    for (const item of value) collectOnboardingFileReferences(item, references);
+    return;
+  }
+  if (!value || typeof value !== "object") return;
+  const record = value as Record<string, unknown>;
+  if (typeof record.file === "string") {
+    references.add(record.file);
+    return;
+  }
+  for (const item of Object.values(record)) {
+    collectOnboardingFileReferences(item, references);
+  }
+}
+
+function unsafeAnswersError(): OnboardingError {
+  return new OnboardingError("onboarding_answers_unsafe", { exitCode: 2 });
+}
+
+function isUnsafeAnswersError(error: unknown): error is OnboardingError {
+  return (
+    error instanceof OnboardingError &&
+    error.code === "onboarding_answers_unsafe"
+  );
+}
 
 export async function readOnboardingAnswersFile(
   file: string

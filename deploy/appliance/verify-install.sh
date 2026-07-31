@@ -288,14 +288,21 @@ RUNNING_VERSION="$(jq -er '.product_version | strings' "$INTERNAL_HEALTH" 2>/dev
 INTERNAL_SETUP="$TMP_DIR/internal-setup.json"
 fetch_internal "/api/setup-state" "$INTERNAL_SETUP" ||
   finish 17 pending
-if ! jq -e '.required_steps | type == "array"' "$INTERNAL_SETUP" >/dev/null 2>&1; then
+if ! jq -e \
+  --arg client "$CLIENT_ID" \
+  --arg installation "$INSTALLATION_ID" \
+  '.activation.client_id == $client and
+   .activation.installation_id == $installation and
+   (.required_steps | type == "array") and
+   (.required_steps | all(.[]; . == "connect_cloudflare"))' \
+  "$INTERNAL_SETUP" >/dev/null 2>&1; then
   finish 17 pending
 fi
-if [[ "$(jq '.required_steps | length' "$INTERNAL_SETUP" 2>/dev/null)" != "0" ]]; then
+if [[ "$(jq '.required_steps | length' "$INTERNAL_SETUP" 2>/dev/null)" == "0" ]]; then
+  SETUP_CHECK="ok"
+else
   SETUP_CHECK="pending"
-  finish 17 pending
 fi
-SETUP_CHECK="ok"
 
 receipt_matches() {
   [[ -f "$VALIDATION_RECEIPT_FILE" && ! -L "$VALIDATION_RECEIPT_FILE" ]] &&
@@ -313,6 +320,7 @@ receipt_matches() {
 }
 
 if receipt_matches; then
+  [[ "$SETUP_CHECK" == "ok" ]] || finish 17 pending
   KEEP_ACCESS_ENV=0
   delete_access_file || finish 18 failed
   ORIGIN_CHECK="ok"
@@ -360,8 +368,9 @@ jq -e \
   --arg client "$CLIENT_ID" \
   --arg installation "$INSTALLATION_ID" \
   '.activation.client_id == $client and
-   .activation.installation_id == $installation and
-   (.required_steps | type == "array" and length == 0)' \
+    .activation.installation_id == $installation and
+   (.required_steps | type == "array") and
+   (.required_steps | all(.[]; . == "connect_cloudflare"))' \
   "$AUTH_SETUP" >/dev/null 2>&1 ||
   finish 18 failed
 
@@ -380,6 +389,20 @@ mv "$RECEIPT_TMP" "$VALIDATION_RECEIPT_FILE" || finish 18 failed
 
 rm -f "$CURL_CONFIG"
 KEEP_ACCESS_ENV=0
-delete_access_file || finish 18 failed
 ORIGIN_CHECK="ok"
+FINAL_SETUP="$TMP_DIR/final-internal-setup.json"
+fetch_internal "/api/setup-state" "$FINAL_SETUP" ||
+  finish 17 pending
+jq -e \
+  --arg client "$CLIENT_ID" \
+  --arg installation "$INSTALLATION_ID" \
+  '.activation.client_id == $client and
+   .activation.installation_id == $installation and
+   (.required_steps | type == "array" and length == 0)' \
+  "$FINAL_SETUP" >/dev/null 2>&1 || {
+    SETUP_CHECK="pending"
+    finish 17 pending
+  }
+SETUP_CHECK="ok"
+delete_access_file || finish 18 failed
 finish 0 ready

@@ -48,6 +48,8 @@ EXISTING_INSTALL=0
 POSTGRES_PASSWORD_FLAG_SET=0
 ANSWERS_DIR=""
 ANSWERS_OVERRIDE_FILE=""
+TMP_ENV=""
+TMP_MANIFEST=""
 
 usage() {
   cat <<USAGE
@@ -454,6 +456,16 @@ cleanup_answers_override() {
   fi
 }
 
+cleanup() {
+  if [[ -n "$TMP_ENV" ]]; then
+    rm -f -- "$TMP_ENV"
+  fi
+  if [[ -n "$TMP_MANIFEST" ]]; then
+    rm -f -- "$TMP_MANIFEST"
+  fi
+  cleanup_answers_override
+}
+
 validate_acceptance_answers_dir() {
   local requested="$1"
   local physical_tmp
@@ -669,11 +681,11 @@ resume_guided_install() {
   CLOUDFLARE_SETTINGS_FILE="$QUOTEOPS_HOME/settings/cloudflare.json"
   need_command docker
   require_compose_224
+  trap cleanup_answers_override EXIT
   if [[ -n "$ANSWERS_DIR" ]]; then
     validate_acceptance_answers_dir "$ANSWERS_DIR"
     create_acceptance_override
   fi
-  trap cleanup_answers_override EXIT
   local status
   if run_guided_sequence; then
     cleanup_answers_override
@@ -1136,6 +1148,7 @@ mkdir -p "$QUOTEOPS_CONNECTORS_DIR/agent" "$QUOTEOPS_CONNECTORS_DIR/sakbe" "$QUO
 chmod 700 "$QUOTEOPS_HOME" "$QUOTEOPS_SECRETS_DIR" "$QUOTEOPS_MANIFEST_DIR" \
   "$QUOTEOPS_CRITERIA_DIR" "$QUOTEOPS_CONNECTORS_DIR" "$QUOTEOPS_LOG_DIR" \
   "$QUOTEOPS_BACKUP_DIR" "$QUOTEOPS_SETTINGS_DIR" "$QUOTEOPS_HOME/state"
+trap cleanup EXIT
 if [[ -n "$ANSWERS_DIR" ]]; then
   create_acceptance_override
 fi
@@ -1198,11 +1211,6 @@ fi
 
 TMP_ENV="$ENV_FILE.tmp.$$"
 TMP_MANIFEST="$TARGET_MANIFEST.tmp.$$"
-cleanup() {
-  rm -f "$TMP_ENV" "$TMP_MANIFEST"
-  cleanup_answers_override
-}
-trap cleanup EXIT
 
 {
   write_env_line COMPOSE_PROJECT_NAME "$COMPOSE_PROJECT_NAME"

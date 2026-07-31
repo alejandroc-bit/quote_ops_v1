@@ -118,6 +118,7 @@ validate_cloudflare_gate() {
   gate_home="$gate_root/home"
   mock_bin="$gate_root/bin"
   export QUOTEOPS_VERIFY_TEST_MODE=smoke
+  export MOCK_SETUP_LOG="$gate_root/setup-state.log"
   mkdir -p "$gate_home/current" "$gate_home/secrets" "$gate_home/settings" "$mock_bin"
   cp "$APPLIANCE_DIR/docker-compose.yml" "$gate_home/current/docker-compose.yml"
   cat > "$gate_home/current/release.env" <<'EOF'
@@ -148,7 +149,24 @@ case "$url" in
     printf '{"ok":true,"product_version":"%s"}\n' "${MOCK_INTERNAL_VERSION:-v0.2.0}"
     ;;
   http://127.0.0.1/api/setup-state)
-    printf '{"activation":{"client_id":"smoke-client","installation_id":"smoke-installation"},"required_steps":[]}\n'
+    if [[ -n "${MOCK_INTERNAL_REQUIRED_STEPS:-}" ]]; then
+      required_steps="$MOCK_INTERNAL_REQUIRED_STEPS"
+    elif [[ -f "$QUOTEOPS_HOME/settings/cloudflare-public-validation.json" ]]; then
+      required_steps='[]'
+    else
+      required_steps='["connect_cloudflare"]'
+    fi
+    if [[ -n "${MOCK_SETUP_LOG:-}" ]]; then
+      if [[ -f "$QUOTEOPS_HOME/settings/cloudflare-public-validation.json" ]]; then
+        receipt_state=present
+      else
+        receipt_state=absent
+      fi
+      printf 'internal receipt=%s required_steps=%s\n' \
+        "$receipt_state" "$required_steps" >> "$MOCK_SETUP_LOG"
+    fi
+    printf '{"activation":{"client_id":"smoke-client","installation_id":"smoke-installation"},"required_steps":%s}\n' \
+      "$required_steps"
     ;;
   http://cloudflared:2000/metrics)
     printf 'cloudflared_tunnel_ha_connections %s\n' "${MOCK_TUNNEL_CONNECTIONS:-1}"
@@ -225,9 +243,17 @@ case "$url" in
     if [[ "${MOCK_CURL_MODE:-}" == "setup-timeout" ]]; then
       exec sleep 30
     fi
-    printf '{"activation":{"client_id":"%s","installation_id":"%s"},"required_steps":[]}\n' \
+    if [[ -n "${MOCK_AUTH_REQUIRED_STEPS:-}" ]]; then
+      required_steps="$MOCK_AUTH_REQUIRED_STEPS"
+    elif [[ -f "$QUOTEOPS_HOME/settings/cloudflare-public-validation.json" ]]; then
+      required_steps='[]'
+    else
+      required_steps='["connect_cloudflare"]'
+    fi
+    printf '{"activation":{"client_id":"%s","installation_id":"%s"},"required_steps":%s}\n' \
       "${MOCK_AUTH_CLIENT_ID:-smoke-client}" \
-      "${MOCK_AUTH_INSTALLATION_ID:-smoke-installation}" > "$output"
+      "${MOCK_AUTH_INSTALLATION_ID:-smoke-installation}" \
+      "$required_steps" > "$output"
     ;;
   *)
     exit 1
@@ -251,6 +277,7 @@ EOF
   }
 
   reset_access_secret
+  : > "$MOCK_SETUP_LOG"
   output="$(
     PATH="$mock_bin:$PATH" QUOTEOPS_HOME="$gate_home" \
       bash "$APPLIANCE_DIR/verify-install.sh" --resume-guided
@@ -261,10 +288,31 @@ EOF
     fail "Cloudflare verifier retained Service Auth credentials after success"
   [[ -f "$gate_home/settings/cloudflare-public-validation.json" ]] ||
     fail "Cloudflare verifier did not persist the safe validation receipt"
+  grep -q 'internal receipt=absent required_steps=\["connect_cloudflare"\]' \
+    "$MOCK_SETUP_LOG" ||
+    fail "fresh verifier did not observe the expected receipt-only setup gate"
+  grep -q 'internal receipt=present required_steps=\[\]' "$MOCK_SETUP_LOG" ||
+    fail "fresh verifier did not re-fetch setup state after receipt creation"
   if grep -Eq 'smoke-service-id|smoke-service-secret|CF_ACCESS' \
       "$gate_home/settings/cloudflare-public-validation.json" ||
     grep -Eq 'smoke-service-id|smoke-service-secret|CF_ACCESS' <<<"$output"; then
     fail "Cloudflare validation receipt or output contains Service Auth credentials"
+  fi
+
+  reset_access_secret
+  set +e
+  output="$(
+    PATH="$mock_bin:$PATH" QUOTEOPS_HOME="$gate_home" \
+      MOCK_INTERNAL_REQUIRED_STEPS='["connect_tms","connect_cloudflare"]' \
+      bash "$APPLIANCE_DIR/verify-install.sh" --resume-guided
+  )"
+  result=$?
+  set -e
+  [[ "$result" -eq 17 &&
+     ! -e "$gate_home/settings/cloudflare-public-validation.json" ]] ||
+    fail "verifier did not fail closed for a non-Cloudflare setup gate"
+  if grep -q 'https://quote.client.example' <<<"$output"; then
+    fail "pending setup verification printed the public URL"
   fi
 
   output="$(
@@ -947,11 +995,25 @@ for argument in "$@"; do
 done
 if [[ "$*" == "compose version --short" ]]; then
   printf '%s\n' "2.24.0"
+elif [[ "${ACCEPTANCE_FAIL_EARLY:-0}" == "1" &&
+        "$*" == *" up -d postgres redis quoteops-agent quoteops-api quoteops-web caddy"* ]]; then
+  exit 1
 elif [[ "$*" == *"exec -T caddy wget"*"/api/health"* ]]; then
   printf '%s\n' '{"ok":true}'
 fi
 SH
   chmod +x "$BOOTSTRAP_MOCK_DIR/docker"
+  ACCEPTANCE_REAL_JQ="$(command -v jq)"
+  cat > "$BOOTSTRAP_MOCK_DIR/jq" <<'SH'
+#!/usr/bin/env bash
+if [[ "${ACCEPTANCE_OVERRIDE_CREATE_FAIL:-0}" == "1" &&
+      "${1:-}" == "-n" ]]; then
+  printf '{"services":'
+  exit 1
+fi
+exec "$ACCEPTANCE_REAL_JQ" "$@"
+SH
+  chmod +x "$BOOTSTRAP_MOCK_DIR/jq"
 
   : > "$ACCEPTANCE_DOCKER_LOG"
   PATH="$BOOTSTRAP_MOCK_DIR:$PATH" \
@@ -960,6 +1022,7 @@ SH
     QUOTEOPS_HOME="$TEST_HOME" \
     ACCEPTANCE_DOCKER_LOG="$ACCEPTANCE_DOCKER_LOG" \
     ACCEPTANCE_OVERRIDE_CAPTURE="$ACCEPTANCE_OVERRIDE_CAPTURE" \
+    ACCEPTANCE_REAL_JQ="$ACCEPTANCE_REAL_JQ" \
     bash "$TEST_HOME/current/quoteops.sh" onboard --resume \
       --answers-dir "$ACCEPTANCE_ANSWERS_DIR" \
       >"$E2E_ROOT/acceptance-guided.log" 2>&1 ||
@@ -991,6 +1054,75 @@ SH
   if compgen -G "$TEST_HOME/settings/.onboard-acceptance.*.json" >/dev/null; then
     fail "Mac acceptance temporary compose override was not removed"
   fi
+
+  set +e
+  PATH="$BOOTSTRAP_MOCK_DIR:$PATH" \
+    QUOTEOPS_BOOTSTRAP_TEST_MODE=macbook \
+    QUOTEOPS_AUTOMATION_MODE=1 \
+    QUOTEOPS_HOME="$TEST_HOME" \
+    ACCEPTANCE_DOCKER_LOG="$ACCEPTANCE_DOCKER_LOG" \
+    ACCEPTANCE_OVERRIDE_CAPTURE="$ACCEPTANCE_OVERRIDE_CAPTURE" \
+    ACCEPTANCE_OVERRIDE_CREATE_FAIL=1 \
+    ACCEPTANCE_REAL_JQ="$ACCEPTANCE_REAL_JQ" \
+    bash "$TEST_HOME/current/quoteops.sh" onboard --resume \
+      --answers-dir "$ACCEPTANCE_ANSWERS_DIR" \
+      >"$E2E_ROOT/acceptance-override-create-failure.log" 2>&1
+  acceptance_create_status=$?
+  set -e
+  [[ "$acceptance_create_status" -ne 0 ]] ||
+    fail "acceptance override creation failure unexpectedly succeeded"
+  if compgen -G "$TEST_HOME/settings/.onboard-acceptance.*.json" >/dev/null; then
+    fail "early acceptance override creation failure left a temporary override"
+  fi
+  test -f "$ACCEPTANCE_ANSWERS_DIR/answers.json" ||
+    fail "installer removed host-owned acceptance inputs after create failure"
+
+  set +e
+  PATH="$BOOTSTRAP_MOCK_DIR:$PATH" \
+    QUOTEOPS_BOOTSTRAP_TEST_MODE=macbook \
+    QUOTEOPS_AUTOMATION_MODE=1 \
+    QUOTEOPS_HOME="$TEST_HOME" \
+    ACCEPTANCE_DOCKER_LOG="$ACCEPTANCE_DOCKER_LOG" \
+    ACCEPTANCE_OVERRIDE_CAPTURE="$ACCEPTANCE_OVERRIDE_CAPTURE" \
+    ACCEPTANCE_FAIL_EARLY=1 \
+    ACCEPTANCE_REAL_JQ="$ACCEPTANCE_REAL_JQ" \
+    bash "$TEST_HOME/current/quoteops.sh" onboard --resume \
+      --answers-dir "$ACCEPTANCE_ANSWERS_DIR" \
+      >"$E2E_ROOT/acceptance-start-failure.log" 2>&1
+  acceptance_start_status=$?
+  set -e
+  [[ "$acceptance_start_status" -eq 20 ]] ||
+    fail "acceptance start failure did not preserve the guided exit-20 contract"
+  if compgen -G "$TEST_HOME/settings/.onboard-acceptance.*.json" >/dev/null; then
+    fail "acceptance start failure left a temporary override"
+  fi
+  test -f "$ACCEPTANCE_ANSWERS_DIR/answers.json" ||
+    fail "installer removed host-owned acceptance inputs after start failure"
+
+  resume_override_create_line="$(
+    grep -n '^[[:space:]]*create_acceptance_override$' \
+      "$TEST_HOME/current/install.sh" | sed -n '1s/:.*//p'
+  )"
+  main_override_create_line="$(
+    grep -n '^[[:space:]]*create_acceptance_override$' \
+      "$TEST_HOME/current/install.sh" | sed -n '2s/:.*//p'
+  )"
+  resume_cleanup_trap_line="$(
+    grep -n '^[[:space:]]*trap cleanup_answers_override EXIT$' \
+      "$TEST_HOME/current/install.sh" | sed -n '1s/:.*//p'
+  )"
+  main_cleanup_trap_line="$(
+    grep -n '^[[:space:]]*trap cleanup EXIT$' \
+      "$TEST_HOME/current/install.sh" | sed -n '1s/:.*//p'
+  )"
+  [[ -n "$resume_override_create_line" &&
+     -n "$main_override_create_line" &&
+     -n "$resume_cleanup_trap_line" &&
+     -n "$main_cleanup_trap_line" &&
+     "$resume_cleanup_trap_line" -lt "$resume_override_create_line" &&
+     "$main_cleanup_trap_line" -lt "$main_override_create_line" ]] ||
+    fail "acceptance cleanup traps are not installed before override creation"
+
   if grep -Eq 'QUOTEOPS_ACCEPTANCE_MODE|/run/quoteops-onboard-input' \
     "$TEST_HOME/.env" \
     "$TEST_HOME/secrets/client.env" \

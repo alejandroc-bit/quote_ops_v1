@@ -157,3 +157,81 @@ not execute in this worktree because the Docker daemon and local
 `alpine:3.20` image were unavailable. Smoke reported that skip explicitly.
 All host-side path, ownership, mode, symlink, fixed-mount, read-only override,
 non-TTY, cleanup, and secret-redaction checks executed and passed.
+
+## Fix Round 1
+
+### Status
+
+All three Important review findings are fixed with regression coverage.
+
+### Findings addressed
+
+- Broke the first-install Cloudflare readiness deadlock without weakening the
+  gate. The verifier temporarily tolerates only `connect_cloudflare`, validates
+  the authenticated public origin, writes the identity-bound receipt, then
+  re-fetches internal setup state and requires an empty `required_steps` array.
+  Every other pending step and every anonymous public 200 remain fail-closed.
+- Restricted container-side `--answers-file` to explicit Mac acceptance mode
+  and the exact `/run/quoteops-onboard-input/answers.json` path. Before any
+  credential or input contents are read, the container now requires the fixed
+  physical 0700 mount and direct 0600 regular files owned by root or the
+  invoking container user, rejects symlinks, and verifies canonical
+  containment plus open-path inode identity for the answers file and every
+  referenced input. The ordinary Task 5 parser remains unchanged, and the host
+  preflight checks remain intact.
+- Installed EXIT cleanup traps before either acceptance override creation path.
+  Cleanup removes only the override created by the current installer process
+  and guarded installer temp files; it never removes the host-owned answers
+  directory or its inputs.
+
+### TDD evidence
+
+#### RED
+
+- Fresh Cloudflare verification failed while setup reported only
+  `connect_cloudflare`.
+- A non-acceptance invocation and unsafe acceptance paths/files reached the
+  ordinary answers parser because no container preflight existed.
+- A 0755 acceptance root was accepted by the initial container preflight.
+- An injected `jq` failure after partially creating the Compose override left
+  `.onboard-acceptance.*.json` behind.
+
+#### GREEN
+
+- Fresh Cloudflare verification observes
+  `receipt=absent / required_steps=["connect_cloudflare"]`, validates the
+  protected origin, writes the receipt, then observes
+  `receipt=present / required_steps=[]`. A non-Cloudflare pending step exits 17
+  without writing a receipt or contacting the public origin.
+- Acceptance tests reject missing acceptance mode, alternate paths, widened
+  mount permissions, world-readable files, symlinked answers/references, and
+  references outside the fixed mount.
+- Smoke injects failures during override creation and core startup; both remove
+  the process-owned override, preserve host inputs, and preserve the guided
+  exit-20 contract where applicable.
+
+### Verification
+
+- Exact focused Task 8 command: 4 files passed, 155 tests passed.
+- Appliance smoke: `smoke.sh: ok`.
+- Production build: TypeScript project build and both Vite builds passed.
+- Full repository: 50 files passed, 543 tests passed.
+- Installer, verifier, wrapper, and smoke shell syntax passed.
+- `git diff --check` passed.
+
+### Files changed
+
+- `apps/api/src/onboard/cli.ts`
+- `apps/api/src/onboard/onboardingFlow.ts`
+- `apps/api/tests/onboarding-flow.test.ts`
+- `deploy/appliance/install.sh`
+- `deploy/appliance/verify-install.sh`
+- `deploy/appliance/tests/smoke.sh`
+
+### Concern
+
+The real Docker Desktop bind/UID observation branch still could not run because
+the Docker daemon and local `alpine:3.20` image were unavailable. Smoke reported
+the skip explicitly. The host-side acceptance boundary, container preflight,
+fixed read-only override shape, failure cleanup, verifier state transition, and
+all repository tests executed and passed.

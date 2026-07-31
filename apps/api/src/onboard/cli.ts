@@ -57,9 +57,11 @@ import {
   type OnboardManifest
 } from "./wizardSteps.js";
 import {
+  ACCEPTANCE_ANSWERS_ROOT,
+  assertAcceptanceAnswersInvocation,
   createFileOnboardingStateStore,
   parseOnboardingSelection,
-  readOnboardingAnswersFile,
+  readValidatedAcceptanceAnswersFile,
   runOnboarding,
   OnboardingError,
   type OnboardPaths as FlowOnboardPaths,
@@ -164,7 +166,14 @@ async function main(argv: string[]): Promise<void> {
   }
   let answers: OnboardingAnswers | null = null;
   if (answersFile) {
-    answers = await readOnboardingAnswersFile(resolve(answersFile));
+    assertAcceptanceAnswersInvocation(
+      answersFile,
+      process.env.QUOTEOPS_ACCEPTANCE_MODE
+    );
+    answers = await readValidatedAcceptanceAnswersFile(
+      answersFile,
+      ACCEPTANCE_ANSWERS_ROOT
+    );
   }
   const context: OnboardingContext = {
     io: {
@@ -186,7 +195,7 @@ async function main(argv: string[]): Promise<void> {
     stateStore: createFileOnboardingStateStore(
       paths.flow.onboardingStateFile
     ),
-    ...(answersFile ? { answersRoot: dirname(resolve(answersFile)) } : {})
+    ...(answersFile ? { answersRoot: ACCEPTANCE_ANSWERS_ROOT } : {})
   };
   if (argv.includes("--ingest")) {
     await runKnowledgeIngestion(context);
