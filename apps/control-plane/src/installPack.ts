@@ -77,7 +77,9 @@ export function createInstallPack(input: {
   expires_at: string;
   release: PublishedApplianceRelease;
 }): IssuedInstallPack {
-  const controlPlaneUrl = normalizeControlPlaneOrigin(input.control_plane_url);
+  const controlPlaneUrl = normalizeControlPlaneOrigin(input.control_plane_url, {
+    allowLocal: process.env.QUOTEOPS_ALLOW_LOCAL_ORIGIN === "1"
+  });
   const { client } = input;
   const installationId = client.installation.installation_id;
 
@@ -117,10 +119,17 @@ export function createInstallPack(input: {
   };
 }
 
-export function normalizeControlPlaneOrigin(value: string): string {
+export function normalizeControlPlaneOrigin(
+  value: string,
+  options: { allowLocal?: boolean } = {}
+): string {
   const url = new URL(value);
+  const isLocalHttp =
+    options.allowLocal === true &&
+    url.protocol === "http:" &&
+    (url.hostname === "127.0.0.1" || url.hostname === "localhost");
   if (
-    url.protocol !== "https:" ||
+    !(url.protocol === "https:" || isLocalHttp) ||
     url.username ||
     url.password ||
     url.pathname !== "/" ||

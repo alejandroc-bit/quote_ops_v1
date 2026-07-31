@@ -8,7 +8,8 @@ import { parse as parseYaml } from "yaml";
 import type { PublishedApplianceRelease } from "@quoteops/shared";
 import {
   createInstallPack,
-  createMinimalClientRecord
+  createMinimalClientRecord,
+  normalizeControlPlaneOrigin
 } from "../src/index";
 
 const tempDirs: string[] = [];
@@ -241,3 +242,29 @@ async function materializeFiles(rootDir: string, files: Record<string, string>):
     await writeFile(target, contents, "utf8");
   }
 }
+
+describe("control plane origin normalization", () => {
+  it("rejects http://localhost without the opt-in flag", () => {
+    expect(() =>
+      normalizeControlPlaneOrigin("http://localhost:19083/")
+    ).toThrow("control_plane_origin_invalid");
+  });
+
+  it("accepts http://127.0.0.1 only with allowLocal", () => {
+    expect(normalizeControlPlaneOrigin("http://127.0.0.1:19083/", { allowLocal: true })).toBe(
+      "http://127.0.0.1:19083"
+    );
+    expect(() =>
+      normalizeControlPlaneOrigin("http://127.0.0.1:19083/")
+    ).toThrow("control_plane_origin_invalid");
+  });
+
+  it("still normalizes https origins regardless of the flag", () => {
+    expect(normalizeControlPlaneOrigin("https://quoteops-control-plane.vercel.app/")).toBe(
+      "https://quoteops-control-plane.vercel.app"
+    );
+    expect(
+      normalizeControlPlaneOrigin("https://quoteops-control-plane.vercel.app/", { allowLocal: true })
+    ).toBe("https://quoteops-control-plane.vercel.app");
+  });
+});
