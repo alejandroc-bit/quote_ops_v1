@@ -6,7 +6,6 @@ QUOTEOPS_HOME="${QUOTEOPS_HOME:-/opt/quoteops-v1}"
 ENV_FILE="${QUOTEOPS_ENV_FILE:-$QUOTEOPS_HOME/.env}"
 TO_VERSION=""
 ROLLBACK=0
-SKIP_BACKUP=0
 ENV_FILE_SET=0
 ACCESS_SOURCE_FILE=""
 WORK_DIR=""
@@ -24,7 +23,6 @@ Options:
   --home PATH                       Appliance data root
   --env-file PATH                   Shared env file (default: <home>/.env)
   --cloudflare-access-file PATH     Caller-owned regular mode-0600 Service Auth file
-  --skip-backup                     Skip the pre-update backup
   --rollback                        Switch to deployment.json.previous_version
   -h, --help                        Show this help
 USAGE
@@ -85,6 +83,28 @@ mode_of() {
   else
     stat -c '%a' "$1"
   fi
+}
+
+lifecycle_event() {
+  local event="$1"
+  local physical_home
+  local physical_tmp
+  local fixture_root
+  local log_directory
+  [[ "${QUOTEOPS_LIFECYCLE_TEST_MODE:-}" == 1 &&
+     -n "${LIFECYCLE_LOG:-}" ]] || return 0
+  [[ -d "$QUOTEOPS_HOME" && ! -L "$QUOTEOPS_HOME" ]] || return 0
+  physical_home="$(cd "$QUOTEOPS_HOME" && pwd -P)" || return 0
+  physical_tmp="$(cd "${TMPDIR:-/tmp}" && pwd -P)" || return 0
+  case "$physical_home" in
+    "$physical_tmp"/quoteops-cloudflare-gate.lifecycle.*/home) ;;
+    *) return 0 ;;
+  esac
+  fixture_root="$(cd "$physical_home/.." && pwd -P)" || return 0
+  log_directory="$(cd "$(dirname "$LIFECYCLE_LOG")" && pwd -P)" || return 0
+  [[ "$log_directory/$(basename "$LIFECYCLE_LOG")" == "$fixture_root/commands.log" &&
+     ! -L "$LIFECYCLE_LOG" ]] || return 0
+  printf '%s\n' "$event" >>"$LIFECYCLE_LOG"
 }
 
 validate_deployment_json() {
@@ -257,6 +277,7 @@ switch_current() {
   else
     mv -fT "$temporary" "$QUOTEOPS_HOME/current"
   fi
+  lifecycle_event "switch:$version"
 }
 
 compose_release() {
@@ -372,10 +393,6 @@ while [[ $# -gt 0 ]]; do
       require_value "$1" "${2:-}"
       ACCESS_SOURCE_FILE="$2"
       shift 2
-      ;;
-    --skip-backup)
-      SKIP_BACKUP=1
-      shift
       ;;
     -h|--help)
       usage
@@ -506,6 +523,7 @@ if [[ "$ROLLBACK" -eq 0 ]]; then
   [[ "$RESPONSE_SHA" =~ ^[a-f0-9]{64}$ &&
      "$(sha256_file "$ARCHIVE_FILE")" == "$RESPONSE_SHA" ]] ||
     die "release response checksum mismatch"
+  lifecycle_event checksum
   validate_archive_and_extract "$ARCHIVE_FILE" "$WORK_DIR/payload" "$TO_VERSION"
   if [[ -e "$TARGET_RELEASE" ]]; then
     validate_release_directory "$TARGET_RELEASE" "$TO_VERSION" ||
@@ -519,16 +537,19 @@ else
   validate_release_directory "$TARGET_RELEASE" "$TO_VERSION" ||
     die "rollback target failed local release verification"
 fi
+lifecycle_event staging
 
 if [[ "$TUNNEL_ENABLED" -eq 1 ]]; then
   copy_access_credentials
+  lifecycle_event access-preflight
 fi
 
-if [[ "$ROLLBACK" -eq 0 && "$SKIP_BACKUP" -eq 0 ]]; then
+if [[ "$ROLLBACK" -eq 0 ]]; then
   "$CURRENT_RELEASE/backup.sh" \
     --home "$QUOTEOPS_HOME" \
     --env-file "$ENV_FILE" \
     --output "${QUOTEOPS_BACKUP_DIR:-$QUOTEOPS_HOME/backups}" >/dev/null
+  lifecycle_event backup-complete
 fi
 
 if [[ "$ROLLBACK" -eq 0 ]]; then
@@ -555,6 +576,8 @@ if [[ "$TARGET_OK" -ne 1 ]]; then
   if [[ "$RESTORED_OK" -eq 1 ]]; then
     rm -f "$ACCESS_ENV_FILE"
     ACCESS_COPIED=0
+    lifecycle_event access-cleanup
+    lifecycle_event "rollback-restored:$ACTIVE_VERSION"
     die "target $TO_VERSION failed verification; restored and verified $ACTIVE_VERSION"
   fi
   KEEP_ACCESS=1
@@ -563,7 +586,9 @@ fi
 
 rm -f "$ACCESS_ENV_FILE"
 ACCESS_COPIED=0
+lifecycle_event access-cleanup
 write_deployment_state "$TO_VERSION" "$ACTIVE_VERSION"
+lifecycle_event deployment-state
 if [[ "$ROLLBACK" -eq 1 ]]; then
   printf 'QuoteOps appliance rolled back to: %s\n' "$TO_VERSION"
 else

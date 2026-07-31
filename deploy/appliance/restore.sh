@@ -6,7 +6,6 @@ ENV_FILE="${QUOTEOPS_ENV_FILE:-$QUOTEOPS_HOME/.env}"
 BACKUP_FILE=""
 ACCESS_SOURCE_FILE=""
 ENV_FILE_SET=0
-SKIP_PRE_RESTORE_BACKUP=0
 WORK_DIR=""
 ACCESS_ENV_FILE=""
 ACCESS_COPIED=0
@@ -20,7 +19,6 @@ Options:
   --home PATH                       Appliance data root
   --env-file PATH                   Shared env file (default: <home>/.env)
   --cloudflare-access-file PATH     Fresh caller-owned mode-0600 Service Auth file
-  --skip-pre-restore-backup         Skip the pre-restore safety backup
   --compose-file PATH               Deprecated; the active release compose file is used
   -h, --help                        Show this help
 USAGE
@@ -115,19 +113,33 @@ validate_cloudflare_json() {
 }
 
 copy_access_credentials() {
-  local source
+  local source="$ACCESS_SOURCE_FILE"
   local keys
   local client_id
   local client_secret
   local temporary
-  [[ -n "$ACCESS_SOURCE_FILE" ]] || return 0
-  [[ "$ACCESS_SOURCE_FILE" == /* ]] ||
-    die "--cloudflare-access-file must be absolute"
-  source="$(absolute_existing_file "$ACCESS_SOURCE_FILE")"
-  [[ -f "$source" && ! -L "$source" && -O "$source" ]] ||
-    die "Cloudflare Access source must be caller-owned regular file"
-  [[ "$(mode_of "$source")" == 600 ]] ||
-    die "Cloudflare Access source must be mode 0600"
+  if [[ -z "$source" ]]; then
+    [[ -t 0 && -r /dev/tty ]] ||
+      die "Cloudflare Access credentials required; resume with --cloudflare-access-file /absolute/mode-0600-file"
+    temporary="$WORK_DIR/prompted-cloudflare-access.env"
+    umask 077
+    printf 'Cloudflare Access Client ID: ' >/dev/tty
+    IFS= read -r client_id </dev/tty
+    printf 'Cloudflare Access Client Secret: ' >/dev/tty
+    IFS= read -r -s client_secret </dev/tty
+    printf '\n' >/dev/tty
+    printf 'CF_ACCESS_CLIENT_ID=%s\nCF_ACCESS_CLIENT_SECRET=%s\n' \
+      "$client_id" "$client_secret" >"$temporary"
+    source="$temporary"
+  else
+    [[ "$source" == /* ]] ||
+      die "--cloudflare-access-file must be absolute"
+    source="$(absolute_existing_file "$source")"
+    [[ -f "$source" && ! -L "$source" && -O "$source" ]] ||
+      die "Cloudflare Access source must be caller-owned regular file"
+    [[ "$(mode_of "$source")" == 600 ]] ||
+      die "Cloudflare Access source must be mode 0600"
+  fi
   keys="$(
     awk -F= '/^[A-Z_][A-Z0-9_]*=/ {print $1}' "$source" |
       LC_ALL=C sort |
@@ -142,6 +154,7 @@ copy_access_credentials() {
   [[ "$client_id" =~ ^[A-Za-z0-9._~-]+$ &&
      "$client_secret" =~ ^[A-Za-z0-9._~-]+$ ]] ||
     die "Cloudflare Access values must be single-line safe values"
+  mkdir -p "$QUOTEOPS_HOME/secrets"
   temporary="$QUOTEOPS_HOME/secrets/.cloudflare-access-validation.env.tmp.$$"
   umask 077
   printf 'CF_ACCESS_CLIENT_ID=%s\nCF_ACCESS_CLIENT_SECRET=%s\n' \
@@ -189,10 +202,6 @@ while [[ $# -gt 0 ]]; do
       require_value "$1" "${2:-}"
       ACCESS_SOURCE_FILE="$2"
       shift 2
-      ;;
-    --skip-pre-restore-backup)
-      SKIP_PRE_RESTORE_BACKUP=1
-      shift
       ;;
     --compose-file)
       require_value "$1" "${2:-}"
@@ -245,20 +254,17 @@ ACTIVE_VERSION="$(read_env_value QUOTEOPS_VERSION "$RELEASE_ENV_FILE")" ||
   die "active release identity is invalid"
 
 DEPLOYMENT_FILE="$QUOTEOPS_HOME/state/deployment.json"
-if [[ ! -e "$DEPLOYMENT_FILE" ]]; then
-  mkdir -p "$QUOTEOPS_HOME/state"
-  deployment_tmp="$QUOTEOPS_HOME/state/.deployment.json.tmp.$$"
-  jq -n --arg active "$ACTIVE_VERSION" \
-    '{active_version:$active,previous_version:$active}' >"$deployment_tmp"
-  chmod 600 "$deployment_tmp"
-  mv -f "$deployment_tmp" "$DEPLOYMENT_FILE"
+DEPLOYMENT_MISSING=0
+if [[ -e "$DEPLOYMENT_FILE" ]]; then
+  [[ -f "$DEPLOYMENT_FILE" && ! -L "$DEPLOYMENT_FILE" ]] ||
+    die "deployment state must be a regular file"
+  validate_deployment_json "$DEPLOYMENT_FILE" ||
+    die "deployment state failed exact-schema validation"
+  [[ "$(jq -er '.active_version' "$DEPLOYMENT_FILE")" == "$ACTIVE_VERSION" ]] ||
+    die "deployment state does not match current"
+else
+  DEPLOYMENT_MISSING=1
 fi
-[[ -f "$DEPLOYMENT_FILE" && ! -L "$DEPLOYMENT_FILE" ]] ||
-  die "deployment state must be a regular file"
-validate_deployment_json "$DEPLOYMENT_FILE" ||
-  die "deployment state failed exact-schema validation"
-[[ "$(jq -er '.active_version' "$DEPLOYMENT_FILE")" == "$ACTIVE_VERSION" ]] ||
-  die "deployment state does not match current"
 
 # shellcheck disable=SC1090
 set -a
@@ -274,7 +280,6 @@ CLOUDFLARE_ENV_FILE="${QUOTEOPS_CLOUDFLARE_ENV_FILE:-$QUOTEOPS_HOME/secrets/clou
 [[ "$POSTGRES_DB" =~ ^[A-Za-z_][A-Za-z0-9_]*$ &&
    "$POSTGRES_USER" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] ||
   die "PostgreSQL identifiers are invalid"
-mkdir -p "$QUOTEOPS_BACKUP_DIR"
 
 WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/quoteops-restore.XXXXXX")"
 chmod 700 "$WORK_DIR"
@@ -386,7 +391,9 @@ if [[ -e "$EXTRACTED/settings/cloudflare.json" ]]; then
   RESTORE_TUNNEL_ENABLED=1
 fi
 ACCESS_ENV_FILE="$QUOTEOPS_HOME/secrets/cloudflare-access-validation.env"
-copy_access_credentials
+if [[ "$ORIGINAL_TUNNEL_ENABLED" -eq 1 || "$RESTORE_TUNNEL_ENABLED" -eq 1 ]]; then
+  copy_access_credentials
+fi
 
 compose() {
   local profile=()
@@ -432,11 +439,18 @@ replace_directory() {
   cp -R "$source/." "$target/"
 }
 
-if [[ "$SKIP_PRE_RESTORE_BACKUP" -eq 0 ]]; then
-  "$ACTIVE_RELEASE/backup.sh" \
-    --home "$QUOTEOPS_HOME" \
-    --env-file "$ENV_FILE" \
-    --output "$QUOTEOPS_BACKUP_DIR" >/dev/null
+"$ACTIVE_RELEASE/backup.sh" \
+  --home "$QUOTEOPS_HOME" \
+  --env-file "$ENV_FILE" \
+  --output "$QUOTEOPS_BACKUP_DIR" >/dev/null
+
+if [[ "$DEPLOYMENT_MISSING" -eq 1 ]]; then
+  mkdir -p "$QUOTEOPS_HOME/state"
+  deployment_tmp="$QUOTEOPS_HOME/state/.deployment.json.tmp.$$"
+  jq -n --arg active "$ACTIVE_VERSION" \
+    '{active_version:$active,previous_version:$active}' >"$deployment_tmp"
+  chmod 600 "$deployment_tmp"
+  mv -f "$deployment_tmp" "$DEPLOYMENT_FILE"
 fi
 
 PREVIOUS_FILES="$WORK_DIR/previous-files"

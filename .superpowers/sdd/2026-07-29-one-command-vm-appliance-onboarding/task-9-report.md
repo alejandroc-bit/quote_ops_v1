@@ -76,3 +76,60 @@ GREEN:
 The real Docker N-1 gate could not be executed locally because the Docker daemon
 was unavailable. It is implemented as a mandatory release-workflow gate before
 publication and is not configured to skip in CI.
+
+## Fix R1 — Important Findings
+
+Status: GREEN
+
+### Corrections
+
+1. Removed the production `--skip-backup` and
+   `--skip-pre-restore-backup` arguments. Update and restore safety backups are
+   mandatory. The only new test seam records lifecycle events when
+   `QUOTEOPS_LIFECYCLE_TEST_MODE=1` is combined with the bounded
+   `quoteops-cloudflare-gate.lifecycle.*/home` fixture root and its exact
+   `commands.log`; it cannot bypass a backup and is not exposed by `quoteops`.
+2. Restore now validates both current and restored Cloudflare settings before
+   the safety backup or deployment mutation. If either enables the tunnel, it
+   requires a caller-owned regular mode-0600 Access file or secure `/dev/tty`
+   entry, copies a transient credential, retains it through target/recovery
+   verification, and removes it only after verified success.
+3. Backup now derives `required_secret_keys` from strict active agent and TMS
+   schemas plus tunnel and SAKBE state. The fixture covers OpenRouter, OAuth
+   mailbox, embeddings, an HTTP TMS auth-header reference, tunnel, and live
+   SAKBE. Provider/auth aliases and unrelated stale keys are excluded, and a
+   missing active key fails before PostgreSQL is read.
+4. Lifecycle integration uses the real `verify-install.sh`. Exact success and
+   automatic-rollback order covers response checksum, staging, Access
+   preflight, mandatory backup, physical release env compose, tunnel start,
+   internal health, tunnel connections, anonymous Access denial,
+   authenticated origin/setup, transient cleanup, and deployment state.
+
+### RED Evidence
+
+- `bash deploy/appliance/tests/lifecycle.sh` first failed with
+  `production update did not reject --skip-backup at argument parsing`.
+- After removing bypasses, it failed because the old manifest did not derive
+  the exact active secret list.
+- With active derivation added, it failed because restore accepted missing
+  Access credentials when only the restored settings enabled the tunnel.
+- With the real verifier enabled, the exact order assertion exposed that the
+  old fixture lacked checksum, staging, Access, switch, state, and cleanup
+  evidence.
+
+### GREEN Evidence
+
+- `bash deploy/appliance/tests/lifecycle.sh`: passed with production bypass
+  rejection, real-verifier success and automatic rollback, exact active secret
+  derivation, unknown agent/TMS schema rejection, missing-active-key failure
+  before `pg_dump`, restored-tunnel Access failure before backup/mutation, and
+  partial-restore recovery.
+- `npx vitest run apps/control-plane-api/tests/control-plane-api.test.ts`:
+  44/44 passed.
+- `npx vitest run`: 50 files and 545/545 tests passed.
+- `npm run build`: TypeScript and both Vite builds passed.
+- `bash deploy/appliance/tests/smoke.sh`: passed; Docker-only checks reported
+  the local daemon unavailable.
+- Shell syntax, executable-mode, workflow YAML, Vercel JSON, production
+  backup-bypass absence, secret-output/insecure-curl/eval scans, and
+  `git diff --check` passed. `shellcheck` was not installed locally.
