@@ -88,273 +88,6 @@ validate_cloudflare_json() {
   ' "$file" >/dev/null
 }
 
-derive_agent_secret_keys() {
-  local file="$1"
-  awk '
-    function invalid() { bad=1; exit 1 }
-    function trim(value) {
-      sub(/^[[:space:]]+/, "", value)
-      sub(/[[:space:]]+$/, "", value)
-      return value
-    }
-    function scalar(value) {
-      value=trim(value)
-      if ((value ~ /^".*"$/) || (value ~ /^'\''.*'\''$/)) {
-        value=substr(value,2,length(value)-2)
-      }
-      return value
-    }
-    function env_name(value) {
-      return value ~ /^[A-Za-z_][A-Za-z0-9_]*$/
-    }
-    function remember(container, key) {
-      if (seen[container SUBSEP key]++) invalid()
-    }
-    BEGIN {
-      section=""
-      subsection=""
-      current_tool=""
-    }
-    {
-      sub(/\r$/, "")
-      if ($0 ~ /\t/) invalid()
-      line=$0
-      sub(/[[:space:]]+$/, "", line)
-      if (line ~ /^[[:space:]]*($|#)/) next
-      match(line,/^ */)
-      indent=RLENGTH
-      content=substr(line,indent+1)
-      colon=index(content,":")
-      if (colon == 0) {
-        if (section == "authorization" && subsection == "allowed_domains" &&
-            indent == 4 && content ~ /^-[ ]+[^ ].*$/) next
-        invalid()
-      }
-      key=substr(content,1,colon-1)
-      value=scalar(substr(content,colon+1))
-      if (key !~ /^[A-Za-z0-9_.-]+$/) invalid()
-      if (indent == 0) {
-        remember("top",key)
-        if (key !~ /^(model|authorization|mailbox|embeddings)$/) invalid()
-        if ((key == "model" || key == "authorization") && value != "") invalid()
-        if ((key == "mailbox" || key == "embeddings") &&
-            value != "" && value != "null") invalid()
-        section=key
-        subsection=""
-        current_tool=""
-        top[key]=value
-        next
-      }
-      if (indent == 2 && section == "model") {
-        if (key !~ /^(provider|model_name|temperature|api_key_env|base_url)$/) invalid()
-        remember("model",key)
-        model[key]=value
-        next
-      }
-      if (indent == 2 && section == "authorization") {
-        if (key !~ /^(approver_email|allowed_domains|whatsapp_approver_phone|tools)$/) invalid()
-        remember("authorization",key)
-        if ((key == "allowed_domains" || key == "tools") && value != "") invalid()
-        subsection=key
-        auth[key]=value
-        next
-      }
-      if (indent == 4 && section == "authorization" && subsection == "tools") {
-        if (value != "") invalid()
-        remember("tool",key)
-        current_tool=key
-        tool_declared[key]=1
-        next
-      }
-      if (indent == 6 && section == "authorization" &&
-          subsection == "tools" && current_tool != "") {
-        if (key !~ /^(effect|mode)$/ || value == "") invalid()
-        remember("tool-policy-" current_tool,key)
-        tool_policy[current_tool SUBSEP key]=value
-        tool_names[current_tool]=1
-        next
-      }
-      if (indent == 2 && section == "mailbox" && top["mailbox"] != "null") {
-        if (key !~ /^(provider|auth|processed_mailbox|poll_interval_ms|imap_host|imap_port)$/) invalid()
-        remember("mailbox",key)
-        mailbox[key]=value
-        next
-      }
-      if (indent == 2 && section == "embeddings" && top["embeddings"] != "null") {
-        if (key !~ /^(provider|model|api_key_env|base_url)$/) invalid()
-        remember("embeddings",key)
-        embeddings[key]=value
-        next
-      }
-      invalid()
-    }
-    END {
-      if (bad) exit 1
-      if (!("model" in top) || !("authorization" in top) ||
-          !("provider" in model) || !("model_name" in model) ||
-          !("tools" in auth)) exit 1
-      if (model["provider"] !~ /^(deterministic|gemini_sdk|openai|openrouter|claude_cli)$/ ||
-          model["model_name"] == "") exit 1
-      if (("temperature" in model) &&
-          model["temperature"] !~ /^-?[0-9]+([.][0-9]+)?$/) exit 1
-      if (("api_key_env" in model) &&
-          model["api_key_env"] != "null" &&
-          !env_name(model["api_key_env"])) exit 1
-      if (model["provider"] == "openrouter") {
-        key=(model["api_key_env"] == "" || model["api_key_env"] == "null" ? "OPENROUTER_API_KEY" : model["api_key_env"])
-        print key
-      } else if (model["provider"] == "gemini_sdk") {
-        key=(model["api_key_env"] == "" || model["api_key_env"] == "null" ? "GEMINI_API_KEY" : model["api_key_env"])
-        print key
-      } else if (model["provider"] == "openai") {
-        if (model["api_key_env"] == "" || model["api_key_env"] == "null") exit 1
-        print model["api_key_env"]
-      }
-      for (tool in tool_declared) {
-        effect=tool_policy[tool SUBSEP "effect"]
-        mode=tool_policy[tool SUBSEP "mode"]
-        if (effect !~ /^(read|write|send|approve)$/ ||
-            mode !~ /^(allowed|approval_required|disabled)$/) exit 1
-      }
-      if (("mailbox" in top) && top["mailbox"] == "") {
-        provider=("provider" in mailbox ? mailbox["provider"] : "gmail")
-        auth_type=("auth" in mailbox ? mailbox["auth"] : "oauth2")
-        if (provider !~ /^(gmail|outlook|imap|resend)$/ ||
-            auth_type !~ /^(oauth2|password)$/) exit 1
-        if (("poll_interval_ms" in mailbox) &&
-            mailbox["poll_interval_ms"] !~ /^[1-9][0-9]*$/) exit 1
-        if (("imap_port" in mailbox) &&
-            mailbox["imap_port"] != "null" &&
-            mailbox["imap_port"] !~ /^[1-9][0-9]*$/) exit 1
-        print "MAILBOX_USER"
-        if (provider == "resend") {
-          print "RESEND_API_KEY"
-        } else if (auth_type == "password") {
-          print "MAILBOX_PASSWORD"
-        } else {
-          print "MAILBOX_OAUTH_CLIENT_ID"
-          print "MAILBOX_OAUTH_CLIENT_SECRET"
-          print "MAILBOX_OAUTH_REFRESH_TOKEN"
-        }
-      }
-      if (("embeddings" in top) && top["embeddings"] == "") {
-        provider=("provider" in embeddings ? embeddings["provider"] : "gemini")
-        key=("api_key_env" in embeddings ? embeddings["api_key_env"] : "QUOTEOPS_EMBEDDING_API_KEY")
-        if (provider !~ /^(gemini|openai_compatible)$/ ||
-            key == "null" || !env_name(key)) exit 1
-        print key
-      }
-    }
-  ' "$file"
-}
-
-derive_tms_secret_keys() {
-  local file="$1"
-  awk '
-    function invalid() { bad=1; exit 1 }
-    function trim(value) {
-      sub(/^[[:space:]]+/, "", value)
-      sub(/[[:space:]]+$/, "", value)
-      return value
-    }
-    function scalar(value) {
-      value=trim(value)
-      if ((value ~ /^".*"$/) || (value ~ /^'\''.*'\''$/)) {
-        value=substr(value,2,length(value)-2)
-      }
-      return value
-    }
-    function env_name(value) {
-      return value ~ /^[A-Za-z_][A-Za-z0-9_]*$/
-    }
-    function remember(container,key) {
-      if (seen[container SUBSEP key]++) invalid()
-    }
-    {
-      sub(/\r$/, "")
-      if ($0 ~ /\t/) invalid()
-      line=$0
-      sub(/[[:space:]]+$/, "", line)
-      if (line ~ /^[[:space:]]*($|#)/) next
-      match(line,/^ */)
-      indent=RLENGTH
-      content=substr(line,indent+1)
-      colon=index(content,":")
-      if (colon == 0) invalid()
-      key=substr(content,1,colon-1)
-      value=scalar(substr(content,colon+1))
-      if (indent == 0) {
-        if (key !~ /^[a-z_]+$/) invalid()
-        remember("top",key)
-        top[key]=value
-        section=(value == "" ? key : "")
-        next
-      }
-      if (indent == 2 && section == "headers") {
-        if (key == "" || value == "") invalid()
-        remember("header",key)
-        headers[key]=value
-        next
-      }
-      if (indent == 2 && section == "queries") {
-        if (key !~ /^(get_rfq|new_rfqs|historical_quotes|historical_shipments|customers|agreements|unit_positions|units|performance|availability_zones)$/ ||
-            value == "") invalid()
-        remember("query",key)
-        next
-      }
-      if (indent == 2 && (section == "write_quote" || section == "write_status")) {
-        if (key != "statement" || value == "") invalid()
-        remember(section,key)
-        next
-      }
-      invalid()
-    }
-    END {
-      if (bad || !("provider" in top)) exit 1
-      provider=top["provider"]
-      if (provider == "file_import") {
-        allowed=" provider rfqs_path_env historical_quotes_path_env historical_shipments_path_env customers_path_env agreements_path_env unit_positions_path_env units_path_env performance_path_env availability_zones_path_env quote_writebacks_path_env status_writebacks_path_env "
-        for (key in top) {
-          if (index(allowed," " key " ") == 0 || top[key] == "") exit 1
-          if (key != "provider" && !env_name(top[key])) exit 1
-        }
-      } else if (provider == "http") {
-        allowed=" provider contract base_url_env headers health_endpoint_path get_rfq_endpoint_path list_new_rfqs_endpoint_path search_historical_quotes_endpoint_path search_historical_shipments_endpoint_path get_customer_endpoint_path get_customer_agreements_endpoint_path get_unit_positions_endpoint_path get_units_endpoint_path get_unit_performance_endpoint_path get_availability_zones_endpoint_path write_quote_endpoint_path write_status_endpoint_path "
-        for (key in top) {
-          if (index(allowed," " key " ") == 0) exit 1
-          if (key != "headers" && top[key] == "") exit 1
-        }
-        if (!("base_url_env" in top) || !env_name(top["base_url_env"])) exit 1
-        if (("contract" in top) && top["contract"] != "quoteops-tms-http-v1") exit 1
-        for (name in headers) {
-          value=headers[name]
-          lower=tolower(name)
-          if ((lower == "authorization" || lower ~ /api-key|apikey|token|secret/) &&
-              value !~ /\$\{[A-Za-z_][A-Za-z0-9_]*\}/) exit 1
-          rest=value
-          while (match(rest,/\$\{[A-Za-z_][A-Za-z0-9_]*\}/)) {
-            env_key=substr(rest,RSTART+2,RLENGTH-3)
-            print env_key
-            rest=substr(rest,RSTART+RLENGTH)
-          }
-          if (rest ~ /\$\{/) exit 1
-        }
-      } else if (provider == "sql") {
-        allowed=" provider dialect connection_url_env queries write_quote write_status "
-        for (key in top) {
-          if (index(allowed," " key " ") == 0) exit 1
-        }
-        if (top["dialect"] !~ /^(postgres|mysql|mssql)$/ ||
-            !env_name(top["connection_url_env"]) ||
-            !("queries" in top) || top["queries"] != "") exit 1
-        print top["connection_url_env"]
-      } else {
-        exit 1
-      }
-    }
-  ' "$file"
-}
-
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --output)
@@ -394,6 +127,7 @@ done
 need_command jq
 need_command tar
 need_command awk
+need_command cmp
 if ! command -v sha256sum >/dev/null 2>&1; then
   need_command shasum
 fi
@@ -504,6 +238,15 @@ find "$WORK_DIR" -type f -name '*.json' -print0 |
       die "backup source contains invalid JSON: ${json_file#"$WORK_DIR/"}"
   done
 
+compose() {
+  docker compose \
+    --env-file "$ENV_FILE" \
+    --env-file "$RELEASE_ENV_FILE" \
+    -f "$COMPOSE_FILE" \
+    "$@"
+}
+compose config >/dev/null
+
 AVAILABLE_KEYS_RAW="$WORK_DIR/.available-secret-keys.raw"
 AVAILABLE_KEYS_FILE="$WORK_DIR/.available-secret-keys"
 : >"$AVAILABLE_KEYS_RAW"
@@ -528,37 +271,39 @@ TMS_CONFIG_FILE="$QUOTEOPS_HOME/connectors/tms-adapter.yaml"
 [[ -f "$TMS_CONFIG_FILE" && ! -L "$TMS_CONFIG_FILE" ]] ||
   die "active TMS config must be a regular YAML file"
 
-REQUIRED_KEYS_FILE="$WORK_DIR/.required-secret-keys"
-{
-  printf '%s\n' POSTGRES_PASSWORD QUOTEOPS_REGISTRATION_TOKEN
-  derive_agent_secret_keys "$AGENT_CONFIG_FILE" ||
-    die "active agent config failed exact-schema validation"
-  derive_tms_secret_keys "$TMS_CONFIG_FILE" ||
-    die "active TMS config failed exact-schema validation"
-  if [[ -e "$CLOUDFLARE_SETTINGS_FILE" ]]; then
-    printf '%s\n' TUNNEL_TOKEN
-  fi
-  case "${QUOTEOPS_SAKBE_LIVE_ENABLED:-true}" in
-    true|1|yes|on)
-      if grep -Fxq INEGI_SAKBE_KEY "$AVAILABLE_KEYS_FILE"; then
-        printf '%s\n' INEGI_SAKBE_KEY
-      elif grep -Fxq QUOTEOPS_SAKBE_API_KEY "$AVAILABLE_KEYS_FILE"; then
-        printf '%s\n' QUOTEOPS_SAKBE_API_KEY
-      else
-        die "required active secret key is missing: INEGI_SAKBE_KEY"
-      fi
-      ;;
-    false|0|no|off) ;;
-    *) die "QUOTEOPS_SAKBE_LIVE_ENABLED is invalid" ;;
-  esac
-} | LC_ALL=C sort -u >"$REQUIRED_KEYS_FILE"
+AVAILABLE_KEY_ARGS=()
+while IFS= read -r available_key; do
+  AVAILABLE_KEY_ARGS+=(--available-key "$available_key")
+done <"$AVAILABLE_KEYS_FILE"
+CLOUDFLARE_ARGS=()
+if [[ -e "$CLOUDFLARE_SETTINGS_FILE" ]]; then
+  CLOUDFLARE_ARGS=(--cloudflare-settings /opt/quoteops-v1/settings/cloudflare.json)
+fi
 
-while IFS= read -r required_key; do
-  grep -Fxq "$required_key" "$AVAILABLE_KEYS_FILE" ||
-    die "required active secret key is missing: $required_key"
-done <"$REQUIRED_KEYS_FILE"
+REQUIRED_KEYS_FILE="$WORK_DIR/.required-secret-keys"
+compose run --rm --no-deps -T quoteops-onboard \
+  /usr/local/bin/node /app/apps/api/dist/lifecycleSecretKeysCli.js \
+  --agent-config /opt/quoteops-v1/connectors/agent/agent-config.yaml \
+  --tms-config /opt/quoteops-v1/connectors/tms-adapter.yaml \
+  "${CLOUDFLARE_ARGS[@]}" \
+  --sakbe-live "${QUOTEOPS_SAKBE_LIVE_ENABLED:-true}" \
+  "${AVAILABLE_KEY_ARGS[@]}" >"$REQUIRED_KEYS_FILE" ||
+  die "active lifecycle configuration or secret derivation failed"
+VALIDATED_REQUIRED_KEYS="$WORK_DIR/.required-secret-keys.validated"
+awk '
+  /^[A-Z_][A-Z0-9_]*$/ && !seen[$0]++ { print; next }
+  { exit 1 }
+' "$REQUIRED_KEYS_FILE" >"$VALIDATED_REQUIRED_KEYS" ||
+  die "lifecycle secret key derivation returned invalid output"
+LC_ALL=C sort "$VALIDATED_REQUIRED_KEYS" >"$REQUIRED_KEYS_FILE"
+cmp -s "$REQUIRED_KEYS_FILE" "$VALIDATED_REQUIRED_KEYS" ||
+  die "lifecycle secret key derivation output was not sorted"
 REQUIRED_KEYS_JSON="$(jq -Rsc 'split("\n") | map(select(length > 0))' "$REQUIRED_KEYS_FILE")"
-rm -f "$AVAILABLE_KEYS_RAW" "$AVAILABLE_KEYS_FILE" "$REQUIRED_KEYS_FILE"
+rm -f \
+  "$AVAILABLE_KEYS_RAW" \
+  "$AVAILABLE_KEYS_FILE" \
+  "$REQUIRED_KEYS_FILE" \
+  "$VALIDATED_REQUIRED_KEYS"
 
 jq -n \
   --arg client "$QUOTEOPS_CLIENT_ID" \
@@ -583,14 +328,6 @@ jq -n \
     required_secret_keys: $required
   }' >"$WORK_DIR/backup-manifest.json"
 
-compose() {
-  docker compose \
-    --env-file "$ENV_FILE" \
-    --env-file "$RELEASE_ENV_FILE" \
-    -f "$COMPOSE_FILE" \
-    "$@"
-}
-compose config >/dev/null
 compose exec -T postgres pg_dump -U "$POSTGRES_USER" "$POSTGRES_DB" \
   >"$WORK_DIR/postgres.sql"
 

@@ -133,3 +133,49 @@ Status: GREEN
 - Shell syntax, executable-mode, workflow YAML, Vercel JSON, production
   backup-bypass absence, secret-output/insecure-curl/eval scans, and
   `git diff --check` passed. `shellcheck` was not installed locally.
+
+## Fix R2 — Production Schema Parsing
+
+Status: GREEN
+
+### Corrections
+
+1. Replaced the handwritten backup AWK parsers with a bounded Node CLI in the
+   existing API image. It imports the production agent and TMS loaders, so
+   backup validation now uses the same strict Zod/YAML schemas as runtime
+   startup, including multiline SQL blocks and canonical/legacy HTTP shapes.
+2. The CLI receives only available environment-key names, never values, and
+   emits only a sorted newline-delimited required-key list. Invalid
+   configuration errors are sanitized; the only specific diagnostic retained
+   is the validated name of a missing active secret.
+3. Backup invokes the pinned appliance runtime and compiled CLI through the
+   existing `quoteops-onboard` service with `--rm --no-deps -T`. It fails
+   closed on command failure, malformed/duplicate/unsorted output, unknown
+   schema fields, symlinked configs, and missing active secrets before
+   `pg_dump`.
+4. Lifecycle fixtures cover file/CSV, canonical HTTP, legacy explicit HTTP,
+   literal (`|`) and folded (`>`) multiline SQL queries/write statements,
+   active agent/mailbox/embeddings/SAKBE/tunnel keys, and stale-key exclusion.
+
+### RED Evidence
+
+- `npx vitest run apps/api/tests/lifecycle-secret-keys.test.ts` first failed
+  because `../src/lifecycleSecretKeys.js` did not exist.
+- `bash deploy/appliance/tests/lifecycle.sh` first failed with
+  `active TMS config failed exact-schema validation`; the handwritten parser
+  rejected the production-valid multiline SQL fixture and created no backup.
+
+### GREEN Evidence
+
+- `npx vitest run apps/api/tests/lifecycle-secret-keys.test.ts`: 9/9 passed,
+  including sanitized failure output.
+- `bash deploy/appliance/tests/lifecycle.sh`: passed with all R1 recovery/order
+  assertions plus every production adapter shape, both multiline SQL styles,
+  stale-key exclusion, unknown-field rejection, and missing-active rejection.
+- `npx vitest run`: 51 files and 554/554 tests passed.
+- `npm run build`: TypeScript and both Vite builds passed.
+- `bash deploy/appliance/tests/smoke.sh`: passed; Docker-only checks reported
+  the local daemon unavailable.
+- Shell syntax, executable modes, removal of both handwritten parser
+  functions, pinned runtime/CLI paths, secret-output/eval/debug scans, and
+  `git diff --check` passed.

@@ -41,11 +41,15 @@ mode_of() {
 need jq
 need tar
 need awk
+need node
 
 MOCK_BIN="$WORK_DIR/bin"
 APPLIANCE_HOME="$WORK_DIR/home"
 CALLER_ACCESS_FILE="$WORK_DIR/caller-cloudflare-access.env"
 COMMAND_LOG="$WORK_DIR/commands.log"
+LIFECYCLE_NODE_BIN="$(command -v node)"
+LIFECYCLE_REPO_ROOT="$(cd "$APPLIANCE_DIR/../.." && pwd -P)"
+export LIFECYCLE_NODE_BIN LIFECYCLE_REPO_ROOT
 mkdir -p \
   "$MOCK_BIN" \
   "$APPLIANCE_HOME/releases/v0.2.0" \
@@ -70,6 +74,34 @@ fi
 case " $* " in
   *" compose version "*) printf '%s\n' compose-version >>"$LIFECYCLE_LOG"; printf '%s\n' '2.24.0' ;;
   *" config "*) printf '%s\n' compose-config >>"$LIFECYCLE_LOG" ;;
+  *" /usr/local/bin/node /app/apps/api/dist/lifecycleSecretKeysCli.js "*)
+    [[ " $* " == *" run --rm --no-deps -T quoteops-onboard /usr/local/bin/node /app/apps/api/dist/lifecycleSecretKeysCli.js "* ]] ||
+      exit 34
+    while [[ $# -gt 0 && "$1" != /app/apps/api/dist/lifecycleSecretKeysCli.js ]]; do
+      shift
+    done
+    [[ "${1:-}" == /app/apps/api/dist/lifecycleSecretKeysCli.js ]] || exit 35
+    shift
+    mapped=()
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        /opt/quoteops-v1/connectors/agent/agent-config.yaml)
+          mapped+=("$QUOTEOPS_HOME/connectors/agent/agent-config.yaml")
+          ;;
+        /opt/quoteops-v1/connectors/tms-adapter.yaml)
+          mapped+=("$QUOTEOPS_HOME/connectors/tms-adapter.yaml")
+          ;;
+        /opt/quoteops-v1/settings/cloudflare.json)
+          mapped+=("$QUOTEOPS_HOME/settings/cloudflare.json")
+          ;;
+        *) mapped+=("$1") ;;
+      esac
+      shift
+    done
+    "$LIFECYCLE_NODE_BIN" \
+      "$LIFECYCLE_REPO_ROOT/apps/api/dist/lifecycleSecretKeysCli.js" \
+      "${mapped[@]}"
+    ;;
   *" pg_dump "*) printf '%s\n' backup >>"$LIFECYCLE_LOG"; printf '%s\n' '-- ORIGINAL_DATABASE' ;;
   *" pull "*) printf '%s\n' pull >>"$LIFECYCLE_LOG" ;;
   *" ps --status running --services "*)
@@ -223,6 +255,7 @@ MAILBOX_PASSWORD=stale-inactive-mailbox-auth
 RESEND_API_KEY=stale-inactive-mailbox-provider
 QUOTEOPS_SAKBE_API_KEY=stale-inactive-sakbe-alias
 TMS_SQL_URL=stale-inactive-tms-provider
+TMS_LEGACY_API_KEY=stale-inactive-legacy-tms-provider
 STALE_INACTIVE_KEY=must-not-be-required
 EOF
 printf '%s\n' 'TUNNEL_TOKEN=tunnel-lifecycle-secret' >"$APPLIANCE_HOME/secrets/cloudflare.env"
@@ -544,6 +577,93 @@ jq -e '
 grep -Fq 'SHA256SUMS' "$BACKUP_EXTRACT/SHA256SUMS" &&
   fail "backup checksum file listed itself"
 
+CANONICAL_TMS_CONFIG="$WORK_DIR/tms-config.canonical.yaml"
+cp "$APPLIANCE_HOME/connectors/tms-adapter.yaml" "$CANONICAL_TMS_CONFIG"
+
+run_adapter_backup() {
+  local name="$1"
+  local output="$WORK_DIR/backups-$name"
+  local extract="$WORK_DIR/backup-$name-extract"
+  local archive
+  mkdir "$output" "$extract"
+  PATH="$MOCK_BIN:/usr/bin:/bin" \
+    QUOTEOPS_HOME="$APPLIANCE_HOME" \
+    LIFECYCLE_LOG="$COMMAND_LOG" \
+    bash "$APPLIANCE_HOME/current/backup.sh" \
+      --home "$APPLIANCE_HOME" \
+      --env-file "$APPLIANCE_HOME/.env" \
+      --output "$output" >/dev/null
+  archive="$(find "$output" -type f -name '*.tar.gz' | head -1)"
+  [[ -n "$archive" ]] || fail "$name adapter backup was not created"
+  tar -xzf "$archive" -C "$extract"
+  printf '%s\n' "$extract/backup-manifest.json"
+}
+
+cat >"$APPLIANCE_HOME/connectors/tms-adapter.yaml" <<'YAML'
+provider: http
+base_url_env: TMS_BASE_URL
+headers:
+  X-API-Key: ${TMS_LEGACY_API_KEY}
+health_endpoint_path: /legacy/health
+search_historical_quotes_endpoint_path: /legacy/history
+write_quote_endpoint_path: /legacy/quotes
+YAML
+LEGACY_MANIFEST="$(run_adapter_backup legacy-http)"
+jq -e '
+  (.required_secret_keys | index("TMS_LEGACY_API_KEY")) != null and
+  (.required_secret_keys | index("TMS_API_KEY")) == null and
+  (.required_secret_keys | index("TMS_SQL_URL")) == null
+' "$LEGACY_MANIFEST" >/dev/null ||
+  fail "legacy HTTP adapter secret derivation was not provider-active"
+
+cat >"$APPLIANCE_HOME/connectors/tms-adapter.yaml" <<'YAML'
+provider: file_import
+rfqs_path_env: QUOTEOPS_TMS_RFQS_PATH
+historical_quotes_path_env: QUOTEOPS_TMS_HISTORICAL_QUOTES_PATH
+historical_shipments_path_env: QUOTEOPS_TMS_HISTORICAL_SHIPMENTS_PATH
+customers_path_env: QUOTEOPS_TMS_CUSTOMERS_PATH
+YAML
+FILE_MANIFEST="$(run_adapter_backup file-csv)"
+jq -e '
+  (.required_secret_keys | index("TMS_LEGACY_API_KEY")) == null and
+  (.required_secret_keys | index("TMS_API_KEY")) == null and
+  (.required_secret_keys | index("TMS_SQL_URL")) == null
+' "$FILE_MANIFEST" >/dev/null ||
+  fail "file/CSV adapter retained inactive provider secrets"
+
+cat >"$APPLIANCE_HOME/connectors/tms-adapter.yaml" <<'YAML'
+provider: sql
+dialect: postgres
+connection_url_env: TMS_SQL_URL
+queries:
+  historical_quotes: |
+    SELECT quote_id, amount
+    FROM historical_quotes
+    WHERE customer_id = $1
+  historical_shipments: >
+    SELECT shipment_id, delivered_at
+    FROM historical_shipments
+    WHERE customer_id = $1
+write_quote:
+  statement: |
+    INSERT INTO quote_writebacks (quote_id, amount)
+    VALUES ($1, $2)
+write_status:
+  statement: >
+    UPDATE quote_writebacks
+    SET status = $2
+    WHERE quote_id = $1
+YAML
+SQL_MANIFEST="$(run_adapter_backup sql-multiline)"
+jq -e '
+  (.required_secret_keys | index("TMS_SQL_URL")) != null and
+  (.required_secret_keys | index("TMS_LEGACY_API_KEY")) == null and
+  (.required_secret_keys | index("TMS_API_KEY")) == null
+' "$SQL_MANIFEST" >/dev/null ||
+  fail "multiline SQL adapter secret derivation was not provider-active"
+
+mv "$CANONICAL_TMS_CONFIG" "$APPLIANCE_HOME/connectors/tms-adapter.yaml"
+
 cp "$APPLIANCE_HOME/connectors/agent/agent-config.yaml" "$WORK_DIR/agent-config.valid.yaml"
 printf '%s\n' 'unknown_component: true' >>"$APPLIANCE_HOME/connectors/agent/agent-config.yaml"
 : >"$COMMAND_LOG"
@@ -556,7 +676,7 @@ if PATH="$MOCK_BIN:/usr/bin:/bin" \
     --output "$APPLIANCE_HOME/backups" >"$WORK_DIR/invalid-agent-config.log" 2>&1; then
   fail "backup accepted an agent config outside the exact schema"
 fi
-grep -Fq 'active agent config failed exact-schema validation' \
+grep -Fq 'active lifecycle configuration or secret derivation failed' \
   "$WORK_DIR/invalid-agent-config.log" ||
   fail "backup did not identify the invalid agent schema"
 grep -Fxq backup "$COMMAND_LOG" &&
@@ -575,7 +695,7 @@ if PATH="$MOCK_BIN:/usr/bin:/bin" \
     --output "$APPLIANCE_HOME/backups" >"$WORK_DIR/invalid-tms-config.log" 2>&1; then
   fail "backup accepted a TMS config outside the exact provider schema"
 fi
-grep -Fq 'active TMS config failed exact-schema validation' \
+grep -Fq 'active lifecycle configuration or secret derivation failed' \
   "$WORK_DIR/invalid-tms-config.log" ||
   fail "backup did not identify the invalid TMS schema"
 grep -Fxq backup "$COMMAND_LOG" &&
