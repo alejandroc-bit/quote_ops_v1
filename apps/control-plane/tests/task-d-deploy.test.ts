@@ -143,6 +143,40 @@ describe("Task D workflows", () => {
     expect(body).not.toContain("tags: ghcr.io/alejandroc-bit/${{ matrix.image }}:latest");
     expect(body).not.toContain("github.repository_owner");
   });
+
+  it("application-reads every N-1 seed class in previous-current-previous order", async () => {
+    const body = await read("deploy/appliance/tests/n-minus-one-schema.sh");
+    const workflow = await read(".github/workflows/release.yml");
+    const applicationReads = [
+      ...body.matchAll(
+        /verify_application_seed_rows "\$(PREVIOUS|CURRENT)_CONTAINER"/g
+      )
+    ].map((match) => match[1]);
+
+    expect(applicationReads).toEqual(["PREVIOUS", "CURRENT", "PREVIOUS"]);
+    for (const seed of [
+      "n1-workflow",
+      "n1-quote",
+      "n1-installation",
+      "n1-knowledge",
+      "n1-signature"
+    ]) {
+      expect(body).toContain(seed);
+    }
+    expect(body).toContain("PostgresKnowledgeRepository");
+    expect(body).toContain('countStatus("N1")');
+    expect(body).toContain("from appliance_license");
+    expect(workflow).toContain(
+      "Run real previous-current-previous compatibility"
+    );
+    expect(workflow).toContain(
+      "bash deploy/appliance/tests/n-minus-one-schema.sh"
+    );
+    expect(workflow).not.toContain("continue-on-error: true");
+    expect(workflow).toContain(
+      "needs: [n-minus-one-schema, verify-anonymous-pulls]"
+    );
+  });
 });
 
 describe("appliance release contract", () => {

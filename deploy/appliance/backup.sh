@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
+umask 077
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 QUOTEOPS_HOME="${QUOTEOPS_HOME:-/opt/quoteops-v1}"
 ENV_FILE="${QUOTEOPS_ENV_FILE:-$QUOTEOPS_HOME/.env}"
 OUTPUT_DIR=""
 ENV_FILE_SET=0
+BACKUP_TEMP_FILE=""
+WORK_DIR=""
 
 usage() {
   cat <<USAGE
@@ -214,11 +217,20 @@ SAFE_CLIENT="$(printf '%s' "$QUOTEOPS_CLIENT_ID" |
   tr '[:upper:]' '[:lower:]' |
   sed 's/[^a-z0-9_.-]/-/g')"
 BACKUP_FILE="$OUTPUT_DIR/quoteops-$SAFE_CLIENT-$QUOTEOPS_VERSION-$TIMESTAMP.tar.gz"
-WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/quoteops-backup.XXXXXX")"
 cleanup() {
-  rm -rf "$WORK_DIR"
+  if [[ -n "$BACKUP_TEMP_FILE" ]]; then
+    rm -f -- "$BACKUP_TEMP_FILE"
+  fi
+  if [[ -n "$WORK_DIR" ]]; then
+    rm -rf "$WORK_DIR"
+  fi
 }
 trap cleanup EXIT
+BACKUP_TEMP_FILE="$(
+  mktemp "$OUTPUT_DIR/.quoteops-$SAFE_CLIENT-$QUOTEOPS_VERSION-$TIMESTAMP.tmp.XXXXXX"
+)"
+chmod 600 "$BACKUP_TEMP_FILE"
+WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/quoteops-backup.XXXXXX")"
 
 for directory in manifests criteria connectors settings state; do
   mkdir -p "$WORK_DIR/$directory"
@@ -340,10 +352,22 @@ compose exec -T postgres pg_dump -U "$POSTGRES_USER" "$POSTGRES_DB" \
        "$file" != *$'\n'* &&
        "$file" != *$'\r'* ]] ||
       die "backup path is not a safe portable relative path"
-    printf '%s  %s\n' "$(sha256_file "$file")" "$file" >>SHA256SUMS
+    checksum="$(sha256_file "$file")" ||
+      die "backup checksum generation failed"
+    [[ "$checksum" =~ ^[a-f0-9]{64}$ ]] ||
+      die "backup checksum generation failed"
+    printf '%s  %s\n' "$checksum" "$file" >>SHA256SUMS
   done < <(LC_ALL=C find . -type f ! -name SHA256SUMS -print | LC_ALL=C sort)
 )
 
-tar -czf "$BACKUP_FILE" -C "$WORK_DIR" .
-chmod 600 "$BACKUP_FILE"
+tar -czf "$BACKUP_TEMP_FILE" -C "$WORK_DIR" .
+chmod 600 "$BACKUP_TEMP_FILE"
+ARCHIVE_CONTENTS_FILE="$WORK_DIR/.archive-contents"
+tar -tzf "$BACKUP_TEMP_FILE" >"$ARCHIVE_CONTENTS_FILE" ||
+  die "backup archive verification failed"
+grep -Fxq './SHA256SUMS' "$ARCHIVE_CONTENTS_FILE" ||
+  die "backup archive verification failed"
+rm -f "$ARCHIVE_CONTENTS_FILE"
+mv -f -- "$BACKUP_TEMP_FILE" "$BACKUP_FILE"
+BACKUP_TEMP_FILE=""
 printf '%s\n' "$BACKUP_FILE"

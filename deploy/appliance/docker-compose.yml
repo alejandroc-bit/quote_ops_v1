@@ -183,6 +183,8 @@ services:
       NODE_ENV: production
       QUOTEOPS_SERVICE: onboard
       QUOTEOPS_CLIENT_ID: ${QUOTEOPS_CLIENT_ID:-}
+      QUOTEOPS_INSTALLATION_ID: ${QUOTEOPS_INSTALLATION_ID:-}
+      QUOTEOPS_VERSION: ${QUOTEOPS_VERSION:-v0.1.0}
       QUOTEOPS_ONBOARD_API_URL: http://quoteops-api:8080
       QUOTEOPS_SECRETS_ENV_FILE: /opt/quoteops-v1/secrets/client.env
       QUOTEOPS_MANIFEST_PATH: /opt/quoteops-v1/manifests/client-manifest.yaml

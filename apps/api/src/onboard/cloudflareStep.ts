@@ -14,6 +14,7 @@ import {
   readSingleLineSecret,
   updateAllowedEnv
 } from "./onboardConfig.js";
+import { matchesCloudflarePublicReceipt } from "./cloudflarePublicReceipt.js";
 
 export type CloudflareTunnelConfig = {
   provider: "cloudflare";
@@ -239,14 +240,13 @@ async function hasMatchingPublicReceipt(
         join(context.paths.settingsDir, "cloudflare-public-validation.json"),
         "utf8"
       )
-    ) as {
-      hostname?: unknown;
-      authenticated_origin_verified?: unknown;
-    };
-    return (
-      receipt.hostname === hostname &&
-      receipt.authenticated_origin_verified === true
-    );
+    ) as unknown;
+    return matchesCloudflarePublicReceipt(receipt, {
+      public_hostname: hostname,
+      version: context.env.QUOTEOPS_VERSION ?? "",
+      client_id: context.env.QUOTEOPS_CLIENT_ID ?? "",
+      installation_id: context.env.QUOTEOPS_INSTALLATION_ID ?? ""
+    });
   } catch {
     return false;
   }

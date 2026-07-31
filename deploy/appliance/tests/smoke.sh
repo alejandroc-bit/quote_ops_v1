@@ -288,6 +288,21 @@ EOF
     fail "Cloudflare verifier retained Service Auth credentials after success"
   [[ -f "$gate_home/settings/cloudflare-public-validation.json" ]] ||
     fail "Cloudflare verifier did not persist the safe validation receipt"
+  jq -e '
+    keys == [
+      "authenticated_origin",
+      "client_id",
+      "installation_id",
+      "public_hostname",
+      "version"
+    ] and
+    .public_hostname == "quote.client.example" and
+    .version == "v0.2.0" and
+    .client_id == "smoke-client" and
+    .installation_id == "smoke-installation" and
+    .authenticated_origin == true
+  ' "$gate_home/settings/cloudflare-public-validation.json" >/dev/null ||
+    fail "Cloudflare verifier receipt did not match the strict identity-bound schema"
   grep -q 'internal receipt=absent required_steps=\["connect_cloudflare"\]' \
     "$MOCK_SETUP_LOG" ||
     fail "fresh verifier did not observe the expected receipt-only setup gate"
@@ -576,6 +591,17 @@ awk '
   in_onboard && /^  [A-Za-z0-9_.-]+:$/ { exit }
   in_onboard { print }
 ' "$COMPOSE_FILE" | grep -q -- '- quoteops_settings:/opt/quoteops-v1/settings' || fail "onboarding must mount settings read-write for probe receipts"
+for identity_env in \
+  'QUOTEOPS_CLIENT_ID: ${QUOTEOPS_CLIENT_ID:-}' \
+  'QUOTEOPS_INSTALLATION_ID: ${QUOTEOPS_INSTALLATION_ID:-}' \
+  'QUOTEOPS_VERSION: ${QUOTEOPS_VERSION:-v0.1.0}'; do
+  awk '
+    /^  quoteops-onboard:$/ { in_onboard = 1; next }
+    in_onboard && /^  [A-Za-z0-9_.-]+:$/ { exit }
+    in_onboard { print }
+  ' "$COMPOSE_FILE" | grep -Fq "$identity_env" ||
+    fail "onboarding must receive $identity_env for identity-bound receipt resume"
+done
 if grep -q 'QUOTEOPS_ACCEPTANCE_MODE' "$COMPOSE_FILE"; then
   fail "production compose must never persist the bounded acceptance-mode override"
 fi
@@ -978,6 +1004,15 @@ JSON
   cat > "$TEST_HOME/settings/cloudflare.json" <<'JSON'
 {"public_hostname":"quotes.client.example"}
 JSON
+  printf '%s\n' 'TUNNEL_TOKEN=acceptance-tunnel-token' \
+    > "$TEST_HOME/secrets/cloudflare.env"
+  cat > "$TEST_HOME/secrets/cloudflare-access-validation.env" <<'ENV'
+CF_ACCESS_CLIENT_ID=acceptance-service-id.access
+CF_ACCESS_CLIENT_SECRET=acceptance-service-secret
+ENV
+  chmod 600 \
+    "$TEST_HOME/secrets/cloudflare.env" \
+    "$TEST_HOME/secrets/cloudflare-access-validation.env"
   cat > "$TEST_HOME/current/verify-install.sh" <<'SH'
 #!/usr/bin/env bash
 printf '%s\n' "verify-install.sh" >> "$ACCEPTANCE_DOCKER_LOG"
@@ -1277,7 +1312,8 @@ PATH="$MOCK_DOCKER_DIR:$PATH" MOCK_DOCKER_LOG="$MOCK_DOCKER_LOG" \
 test "$(cat "$VOLUME_ABSENT_HOME/secrets/client.env")" = "$ABSENT_CLIENT_ENV_BEFORE" ||
   fail "reinstall changed the generated PostgreSQL password"
 
-GUIDED_FLOW_ROOT="$INSTALL_GUARD_DIR/guided-flow"
+GUIDED_FLOW_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/quoteops-mac-e2e.XXXXXX")"
+TEMP_DIRS+=("$GUIDED_FLOW_ROOT")
 GUIDED_FLOW_HOME="$GUIDED_FLOW_ROOT/quoteops-v1"
 GUIDED_FLOW_RELEASE="$GUIDED_FLOW_HOME/releases/v0.2.0"
 GUIDED_FLOW_BIN="$GUIDED_FLOW_ROOT/bin"
@@ -1298,11 +1334,13 @@ cat > "$GUIDED_FLOW_HOME/.env" <<EOF
 QUOTEOPS_CLIENT_ID=smoke
 QUOTEOPS_INSTALLATION_ID=smoke-install-001
 EOF
-cat > "$GUIDED_FLOW_HOME/settings/cloudflare.json" <<'EOF'
-{"provider":"cloudflare","public_hostname":"quotes.client.example","origin_url":"http://caddy:80"}
-EOF
+: > "$GUIDED_FLOW_HOME/secrets/cloudflare.env"
+chmod 600 "$GUIDED_FLOW_HOME/secrets/cloudflare.env"
 cat > "$GUIDED_FLOW_RELEASE/verify-install.sh" <<'SH'
 #!/usr/bin/env bash
+[[ -s "$QUOTEOPS_HOME/secrets/cloudflare.env" ]] || exit 18
+[[ -s "$QUOTEOPS_HOME/settings/cloudflare.json" ]] || exit 18
+[[ -s "$QUOTEOPS_HOME/secrets/cloudflare-access-validation.env" ]] || exit 18
 printf '%s\n' 'verify-install.sh' >> "$GUIDED_FLOW_LOG"
 exit "${GUIDED_VERIFY_EXIT:-0}"
 SH
@@ -1315,9 +1353,29 @@ if [[ "$*" == "compose version --short" ]]; then
   printf '%s\n' '2.24.0'
 elif [[ "$*" == *"exec -T caddy wget"*"http://127.0.0.1/api/health"* ]]; then
   printf '%s\n' '{"ok":true}'
-elif [[ "$*" == *"quoteops-onboard --resume --until knowledge"* &&
-        "${GUIDED_ONBOARD_FAIL:-0}" == "1" ]]; then
-  exit 1
+elif [[ "$*" == *"quoteops-onboard --resume --until knowledge"* ]]; then
+  if [[ "${GUIDED_ONBOARD_FAIL:-0}" == "1" ]]; then
+    exit 1
+  fi
+  [[ -f "$QUOTEOPS_HOME/secrets/cloudflare.env" &&
+     ! -s "$QUOTEOPS_HOME/secrets/cloudflare.env" &&
+     ! -e "$QUOTEOPS_HOME/settings/cloudflare.json" &&
+     ! -e "$QUOTEOPS_HOME/secrets/cloudflare-access-validation.env" ]] ||
+    exit 1
+  printf '%s\n' 'fresh-cloudflare-gate=absent' >> "$GUIDED_FLOW_LOG"
+  printf '%s\n' 'TUNNEL_TOKEN=guided-tunnel-token' \
+    > "$QUOTEOPS_HOME/secrets/cloudflare.env"
+  cat > "$QUOTEOPS_HOME/settings/cloudflare.json" <<'JSON'
+{"provider":"cloudflare","public_hostname":"quotes.client.example","origin_url":"http://caddy:80"}
+JSON
+  cat > "$QUOTEOPS_HOME/secrets/cloudflare-access-validation.env" <<'ENV'
+CF_ACCESS_CLIENT_ID=guided-service-id.access
+CF_ACCESS_CLIENT_SECRET=guided-service-secret
+ENV
+  chmod 600 \
+    "$QUOTEOPS_HOME/secrets/cloudflare.env" \
+    "$QUOTEOPS_HOME/settings/cloudflare.json" \
+    "$QUOTEOPS_HOME/secrets/cloudflare-access-validation.env"
 fi
 SH
 chmod +x "$GUIDED_FLOW_BIN/docker"
@@ -1325,6 +1383,7 @@ chmod +x "$GUIDED_FLOW_BIN/docker"
 : > "$GUIDED_FLOW_LOG"
 PATH="$GUIDED_FLOW_BIN:$PATH" GUIDED_FLOW_LOG="$GUIDED_FLOW_LOG" \
   QUOTEOPS_HOME="$GUIDED_FLOW_HOME" QUOTEOPS_AUTOMATION_MODE=1 \
+  QUOTEOPS_BOOTSTRAP_TEST_MODE=macbook \
   bash "$GUIDED_FLOW_RELEASE/quoteops.sh" onboard --resume \
   >"$GUIDED_FLOW_ROOT/success.log" 2>&1 ||
   fail "quoteops onboard --resume did not complete guided orchestration"
@@ -1333,6 +1392,12 @@ GUIDED_CORE_PATTERN='up -d postgres redis quoteops-agent quoteops-api quoteops-w
 GUIDED_KNOWLEDGE_PATTERN='--profile onboarding run --rm -T quoteops-onboard --resume --until knowledge'
 GUIDED_TEST_RFQ_PATTERN='--profile onboarding run --rm -T quoteops-onboard --resume --only test_rfq'
 GUIDED_TUNNEL_PATTERN='--profile tunnel up -d cloudflared'
+GUIDED_SEQUENCE_SOURCE="$GUIDED_FLOW_ROOT/run-guided-sequence.sh"
+awk '
+  /^run_guided_sequence[(][)]/ { capture=1 }
+  /^resume_guided_install[(][)]/ { capture=0 }
+  capture { print }
+' "$APPLIANCE_DIR/install.sh" > "$GUIDED_SEQUENCE_SOURCE"
 core_first="$(grep -n -- "$GUIDED_CORE_PATTERN" "$GUIDED_FLOW_LOG" | sed -n '1s/:.*//p')"
 knowledge_line="$(grep -n -- "$GUIDED_KNOWLEDGE_PATTERN" "$GUIDED_FLOW_LOG" | sed -n '1s/:.*//p')"
 core_second="$(grep -n -- "$GUIDED_CORE_PATTERN" "$GUIDED_FLOW_LOG" | sed -n '2s/:.*//p')"
@@ -1345,15 +1410,34 @@ verify_line="$(grep -n -- '^verify-install.sh$' "$GUIDED_FLOW_LOG" | sed -n '1s/
    "$knowledge_line" -lt "$core_second" &&
    "$core_second" -lt "$test_rfq_line" &&
    "$test_rfq_line" -lt "$tunnel_line" &&
-   "$tunnel_line" -lt "$verify_line" ]] ||
+    "$tunnel_line" -lt "$verify_line" ]] ||
   fail "guided resume did not follow the required core/onboard/restart/test/tunnel/verify sequence"
+grep -Fxq 'fresh-cloudflare-gate=absent' "$GUIDED_FLOW_LOG" ||
+  fail "fresh guided fixture did not reach onboarding with an empty Cloudflare gate"
+gate_validation_line="$(
+  grep -n 'load_cloudflare_gate_settings' "$GUIDED_SEQUENCE_SOURCE" |
+    sed -n '1s/:.*//p' || true
+)"
+source_knowledge_line="$(
+  grep -n 'run_guided_onboarding_container --until knowledge' \
+    "$GUIDED_SEQUENCE_SOURCE" | sed -n '1s/:.*//p' || true
+)"
+source_tunnel_line="$(
+  grep -n 'guided_compose --profile tunnel up -d cloudflared' \
+    "$GUIDED_SEQUENCE_SOURCE" | sed -n '1s/:.*//p' || true
+)"
+[[ -n "$gate_validation_line" && -n "$source_knowledge_line" &&
+   -n "$source_tunnel_line" &&
+   "$source_knowledge_line" -lt "$gate_validation_line" &&
+   "$gate_validation_line" -lt "$source_tunnel_line" ]] ||
+  fail "guided install did not validate the post-onboarding Cloudflare gate before tunnel startup"
 grep -q 'https://quotes.client.example' "$GUIDED_FLOW_ROOT/success.log" ||
   fail "guided resume did not print the public URL after readiness"
 
 : > "$GUIDED_FLOW_LOG"
 if PATH="$GUIDED_FLOW_BIN:$PATH" GUIDED_FLOW_LOG="$GUIDED_FLOW_LOG" \
   GUIDED_ONBOARD_FAIL=1 QUOTEOPS_HOME="$GUIDED_FLOW_HOME" \
-  QUOTEOPS_AUTOMATION_MODE=1 \
+  QUOTEOPS_AUTOMATION_MODE=1 QUOTEOPS_BOOTSTRAP_TEST_MODE=macbook \
   bash "$GUIDED_FLOW_RELEASE/quoteops.sh" onboard --resume \
   >"$GUIDED_FLOW_ROOT/failure.log" 2>&1; then
   fail "guided resume succeeded after onboarding failure"
@@ -1415,6 +1499,8 @@ printf '%s\n' 'TUNNEL_TOKEN' > "$NO_PULL_HOME/secrets/cloudflare.env"
 assert_tunnel_env_rejected malformed
 printf '%s\n' 'TUNNEL_TOKEN=' > "$NO_PULL_HOME/secrets/cloudflare.env"
 assert_tunnel_env_rejected empty
+rm -f "$NO_PULL_HOME/secrets/cloudflare.env"
+assert_tunnel_env_rejected missing
 printf '%s\n' \
   'TUNNEL_TOKEN=smoke-tunnel-token' \
   'OPENROUTER_API_KEY=must-not-reach-cloudflared' > "$NO_PULL_HOME/secrets/cloudflare.env"

@@ -311,7 +311,15 @@ receipt_matches() {
       --arg version "$VERSION" \
       --arg client "$CLIENT_ID" \
       --arg installation "$INSTALLATION_ID" \
-      '.public_hostname == $hostname and
+      'type == "object" and
+       keys == [
+         "authenticated_origin",
+         "client_id",
+         "installation_id",
+         "public_hostname",
+         "version"
+       ] and
+       .public_hostname == $hostname and
        .version == $version and
        .client_id == $client and
        .installation_id == $installation and

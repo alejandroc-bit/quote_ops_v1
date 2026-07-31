@@ -143,18 +143,44 @@ wait_for_api() {
   return 1
 }
 
-verify_api_rows() {
+verify_application_seed_rows() {
   local container="$1"
   docker exec "$container" node -e '
+    const { Pool } = require("pg");
+    const pool = new Pool({ connectionString: process.env.DATABASE_URL });
     Promise.all([
       fetch("http://127.0.0.1:8080/api/rfqs").then((response) => response.json()),
       fetch("http://127.0.0.1:8080/api/runs").then((response) => response.json()),
-      fetch("http://127.0.0.1:8080/api/health").then((response) => response.json())
-    ]).then(([rfqs, runs, health]) => {
+      fetch("http://127.0.0.1:8080/api/health").then((response) => response.json()),
+      import("./apps/api/dist/storage/PostgresKnowledgeRepository.js").then(
+        ({ PostgresKnowledgeRepository }) =>
+          new PostgresKnowledgeRepository({
+            databaseUrl: process.env.DATABASE_URL
+          }).countStatus("N1")
+      ),
+      pool.query(
+        "select installation_id, client_id, license_payload, signature, status " +
+        "from appliance_license where installation_id=$1",
+        ["n1-installation"]
+      )
+    ]).then(([rfqs, runs, health, knowledge, licenseResult]) => {
       const workflow = rfqs.items?.some((item) => item.run_id === "n1-workflow");
       const quote = runs.runs?.some((item) => item.run_id === "n1-quote");
-      process.exit(workflow && quote && health.heartbeats === 1 ? 0 : 1);
-    }).catch(() => process.exit(1));
+      const heartbeat = health.heartbeats === 1;
+      const knowledgeRead =
+        knowledge.knowledge_documents_count === 1 &&
+        knowledge.knowledge_chunks_count === 0;
+      const license = licenseResult.rows[0];
+      const licenseRead =
+        license?.installation_id === "n1-installation" &&
+        license?.client_id === "N1" &&
+        license?.license_payload?.client_id === "N1" &&
+        license?.signature === "n1-signature" &&
+        license?.status === "active";
+      process.exit(
+        workflow && quote && heartbeat && knowledgeRead && licenseRead ? 0 : 1
+      );
+    }).catch(() => process.exit(1)).finally(() => pool.end());
   ' >/dev/null 2>&1
 }
 
@@ -194,19 +220,19 @@ insert into appliance_license
 values
   ('n1-installation','N1','{"client_id":"N1"}'::jsonb,'n1-signature','active');
 SQL
-verify_api_rows "$PREVIOUS_CONTAINER" || fail
+verify_application_seed_rows "$PREVIOUS_CONTAINER" || fail
 verify_database_rows || fail
 
 docker rm -f "$PREVIOUS_CONTAINER" >/dev/null
 start_api "$CURRENT_CONTAINER" "$CURRENT_IMAGE" "$CURRENT_VERSION"
 wait_for_api "$CURRENT_CONTAINER" "$CURRENT_VERSION" || fail
-verify_api_rows "$CURRENT_CONTAINER" || fail
+verify_application_seed_rows "$CURRENT_CONTAINER" || fail
 verify_database_rows || fail
 
 docker rm -f "$CURRENT_CONTAINER" >/dev/null
 start_api "$PREVIOUS_CONTAINER" "$PREVIOUS_IMAGE" "$PREVIOUS_VERSION"
 wait_for_api "$PREVIOUS_CONTAINER" "$PREVIOUS_VERSION" || fail
-verify_api_rows "$PREVIOUS_CONTAINER" || fail
+verify_application_seed_rows "$PREVIOUS_CONTAINER" || fail
 verify_database_rows || fail
 
 printf 'n-minus-one-schema: %s -> %s compatible\n' \

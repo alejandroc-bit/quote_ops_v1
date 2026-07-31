@@ -577,6 +577,136 @@ jq -e '
 grep -Fq 'SHA256SUMS' "$BACKUP_EXTRACT/SHA256SUMS" &&
   fail "backup checksum file listed itself"
 
+PRIVATE_BACKUP_DIR="$WORK_DIR/private-backup-output"
+PRIVATE_BACKUP_BIN="$WORK_DIR/private-backup-bin"
+PRIVATE_BACKUP_LOG="$WORK_DIR/private-backup.log"
+PRIVATE_BACKUP_TARGET="$PRIVATE_BACKUP_DIR/quoteops-lifecycle-v0.2.0-20300101T000000Z.tar.gz"
+mkdir "$PRIVATE_BACKUP_DIR" "$PRIVATE_BACKUP_BIN"
+chmod 777 "$PRIVATE_BACKUP_DIR"
+printf '%s\n' 'pre-existing-public-target' >"$PRIVATE_BACKUP_TARGET"
+chmod 666 "$PRIVATE_BACKUP_TARGET"
+cat >"$PRIVATE_BACKUP_BIN/date" <<'SH'
+#!/usr/bin/env bash
+case "$*" in
+  *%Y%m%d*) printf '%s\n' '20300101T000000Z' ;;
+  *) printf '%s\n' '2030-01-01T00:00:00.000Z' ;;
+esac
+SH
+cat >"$PRIVATE_BACKUP_BIN/tar" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+output=""
+expect_output=0
+for argument in "$@"; do
+  if [[ "$expect_output" -eq 1 ]]; then
+    output="$argument"
+    expect_output=0
+  elif [[ "$argument" == "-czf" ]]; then
+    expect_output=1
+  fi
+done
+if [[ -n "$output" ]]; then
+  [[ "$output" != "$LIFECYCLE_FINAL_BACKUP" ]] || exit 70
+  output_directory="$(cd "$(dirname "$output")" && pwd -P)"
+  final_directory="$(cd "$(dirname "$LIFECYCLE_FINAL_BACKUP")" && pwd -P)"
+  [[ "$output_directory" == "$final_directory" ]] || exit 76
+  [[ "$(cat "$LIFECYCLE_FINAL_BACKUP")" == "pre-existing-public-target" ]] ||
+    exit 71
+  [[ "$(basename "$output")" == .quoteops-*.tmp.* ]] || exit 72
+  if stat -f '%Lp' "$output" >/dev/null 2>&1; then
+    mode="$(stat -f '%Lp' "$output")"
+  else
+    mode="$(stat -c '%a' "$output")"
+  fi
+  [[ "$mode" == 600 ]] || exit 73
+  printf 'private-temp=%s\n' "$output" >>"$LIFECYCLE_PRIVATE_BACKUP_LOG"
+  if [[ "${LIFECYCLE_TAR_CREATE_FAIL:-0}" == "1" ]]; then
+    printf '%s\n' 'partial-private-archive' >"$output"
+    exit 74
+  fi
+fi
+exec "$LIFECYCLE_REAL_TAR" "$@"
+SH
+cat >"$PRIVATE_BACKUP_BIN/sha256sum" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${LIFECYCLE_CHECKSUM_FAIL:-0}" == "1" ]]; then
+  exit 75
+fi
+if [[ "$LIFECYCLE_HASH_KIND" == "sha256sum" ]]; then
+  exec "$LIFECYCLE_REAL_HASH" "$@"
+fi
+exec "$LIFECYCLE_REAL_HASH" -a 256 "$@"
+SH
+chmod 755 \
+  "$PRIVATE_BACKUP_BIN/date" \
+  "$PRIVATE_BACKUP_BIN/tar" \
+  "$PRIVATE_BACKUP_BIN/sha256sum"
+if command -v sha256sum >/dev/null 2>&1; then
+  LIFECYCLE_HASH_KIND=sha256sum
+  LIFECYCLE_REAL_HASH="$(command -v sha256sum)"
+else
+  LIFECYCLE_HASH_KIND=shasum
+  LIFECYCLE_REAL_HASH="$(command -v shasum)"
+fi
+LIFECYCLE_REAL_TAR="$(command -v tar)"
+
+(
+  umask 000
+  PATH="$PRIVATE_BACKUP_BIN:$MOCK_BIN:/usr/bin:/bin" \
+    QUOTEOPS_HOME="$APPLIANCE_HOME" \
+    LIFECYCLE_LOG="$COMMAND_LOG" \
+    LIFECYCLE_FINAL_BACKUP="$PRIVATE_BACKUP_TARGET" \
+    LIFECYCLE_PRIVATE_BACKUP_LOG="$PRIVATE_BACKUP_LOG" \
+    LIFECYCLE_REAL_TAR="$LIFECYCLE_REAL_TAR" \
+    LIFECYCLE_HASH_KIND="$LIFECYCLE_HASH_KIND" \
+    LIFECYCLE_REAL_HASH="$LIFECYCLE_REAL_HASH" \
+    bash "$APPLIANCE_HOME/current/backup.sh" \
+      --home "$APPLIANCE_HOME" \
+      --env-file "$APPLIANCE_HOME/.env" \
+      --output "$PRIVATE_BACKUP_DIR" >/dev/null
+)
+[[ "$(mode_of "$PRIVATE_BACKUP_TARGET")" == 600 ]] ||
+  fail "backup did not atomically replace a permissive target with mode 0600 (got $(mode_of "$PRIVATE_BACKUP_TARGET"))"
+[[ "$(cat "$PRIVATE_BACKUP_TARGET")" != "pre-existing-public-target" ]] ||
+  fail "backup did not replace the pre-existing target"
+grep -q '^private-temp=' "$PRIVATE_BACKUP_LOG" ||
+  fail "backup did not create a private same-directory temporary archive"
+if find "$PRIVATE_BACKUP_DIR" -maxdepth 1 -name '.quoteops-*.tmp.*' -print -quit |
+  grep -q .; then
+  fail "successful backup retained a temporary archive"
+fi
+
+for failure in tar checksum; do
+  printf '%s\n' 'pre-existing-public-target' >"$PRIVATE_BACKUP_TARGET"
+  chmod 666 "$PRIVATE_BACKUP_TARGET"
+  if (
+    umask 000
+    PATH="$PRIVATE_BACKUP_BIN:$MOCK_BIN:/usr/bin:/bin" \
+      QUOTEOPS_HOME="$APPLIANCE_HOME" \
+      LIFECYCLE_LOG="$COMMAND_LOG" \
+      LIFECYCLE_FINAL_BACKUP="$PRIVATE_BACKUP_TARGET" \
+      LIFECYCLE_PRIVATE_BACKUP_LOG="$PRIVATE_BACKUP_LOG" \
+      LIFECYCLE_REAL_TAR="$LIFECYCLE_REAL_TAR" \
+      LIFECYCLE_HASH_KIND="$LIFECYCLE_HASH_KIND" \
+      LIFECYCLE_REAL_HASH="$LIFECYCLE_REAL_HASH" \
+      LIFECYCLE_TAR_CREATE_FAIL="$([[ "$failure" == tar ]] && printf 1 || printf 0)" \
+      LIFECYCLE_CHECKSUM_FAIL="$([[ "$failure" == checksum ]] && printf 1 || printf 0)" \
+      bash "$APPLIANCE_HOME/current/backup.sh" \
+        --home "$APPLIANCE_HOME" \
+        --env-file "$APPLIANCE_HOME/.env" \
+        --output "$PRIVATE_BACKUP_DIR" >/dev/null 2>&1
+  ); then
+    fail "backup succeeded after $failure failure"
+  fi
+  [[ "$(cat "$PRIVATE_BACKUP_TARGET")" == "pre-existing-public-target" ]] ||
+    fail "$failure failure replaced the requested backup target"
+  if find "$PRIVATE_BACKUP_DIR" -maxdepth 1 -name '.quoteops-*.tmp.*' -print -quit |
+    grep -q .; then
+    fail "$failure failure retained a temporary archive"
+  fi
+done
+
 CANONICAL_TMS_CONFIG="$WORK_DIR/tms-config.canonical.yaml"
 cp "$APPLIANCE_HOME/connectors/tms-adapter.yaml" "$CANONICAL_TMS_CONFIG"
 

@@ -43,6 +43,7 @@ import {
   testRfqPhase
 } from "../src/onboard/testRfqStep.js";
 import {
+  cloudflarePhase,
   configureCloudflareTunnel,
   validatePublicHostname
 } from "../src/onboard/cloudflareStep.js";
@@ -2137,6 +2138,93 @@ describe("Cloudflare configuration", () => {
     ]) {
       expect(serialized).not.toContain(value);
     }
+  });
+
+  it("resumes complete from the verifier receipt after transient Access credentials are deleted", async () => {
+    const context = await testContext({
+      env: {
+        QUOTEOPS_CLIENT_ID: "cliente-demo",
+        QUOTEOPS_INSTALLATION_ID: "cliente-demo-prod-001",
+        QUOTEOPS_VERSION: "v0.2.0"
+      }
+    });
+    await writeFile(
+      join(context.paths.settingsDir, "cloudflare.json"),
+      JSON.stringify({
+        provider: "cloudflare",
+        public_hostname: "quotes.client.example",
+        origin_url: "http://caddy:80"
+      }),
+      { mode: 0o600 }
+    );
+    await writeFile(
+      context.paths.cloudflareSecretsFile,
+      "TUNNEL_TOKEN=tunnel-secret\n",
+      { mode: 0o600 }
+    );
+    await writeFile(
+      join(context.paths.settingsDir, "cloudflare-public-validation.json"),
+      JSON.stringify({
+        public_hostname: "quotes.client.example",
+        version: "v0.2.0",
+        client_id: "cliente-demo",
+        installation_id: "cliente-demo-prod-001",
+        authenticated_origin: true
+      }),
+      { mode: 0o600 }
+    );
+
+    expect(
+      await readFile(
+        join(dirname(context.paths.settingsDir), "secrets/cloudflare-access-validation.env"),
+        "utf8"
+      ).catch(() => null)
+    ).toBeNull();
+    expect(await cloudflarePhase.isComplete(context)).toBe(true);
+  });
+
+  it.each([
+    ["hostname", { public_hostname: "wrong.client.example" }],
+    ["version", { version: "v9.9.9" }],
+    ["client identity", { client_id: "wrong-client" }],
+    ["installation identity", { installation_id: "wrong-installation" }],
+    ["schema", { unexpected: "forbidden" }]
+  ])("rejects a verifier receipt with mismatched %s", async (_label, override) => {
+    const context = await testContext({
+      env: {
+        QUOTEOPS_CLIENT_ID: "cliente-demo",
+        QUOTEOPS_INSTALLATION_ID: "cliente-demo-prod-001",
+        QUOTEOPS_VERSION: "v0.2.0"
+      }
+    });
+    await writeFile(
+      join(context.paths.settingsDir, "cloudflare.json"),
+      JSON.stringify({
+        provider: "cloudflare",
+        public_hostname: "quotes.client.example",
+        origin_url: "http://caddy:80"
+      }),
+      { mode: 0o600 }
+    );
+    await writeFile(
+      context.paths.cloudflareSecretsFile,
+      "TUNNEL_TOKEN=tunnel-secret\n",
+      { mode: 0o600 }
+    );
+    await writeFile(
+      join(context.paths.settingsDir, "cloudflare-public-validation.json"),
+      JSON.stringify({
+        public_hostname: "quotes.client.example",
+        version: "v0.2.0",
+        client_id: "cliente-demo",
+        installation_id: "cliente-demo-prod-001",
+        authenticated_origin: true,
+        ...override
+      }),
+      { mode: 0o600 }
+    );
+
+    expect(await cloudflarePhase.isComplete(context)).toBe(false);
   });
 });
 

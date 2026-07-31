@@ -258,7 +258,15 @@ cloudflare_validation_receipt_matches() {
     --arg version "$QUOTEOPS_VERSION" \
     --arg client "$CLIENT_ID" \
     --arg installation "$QUOTEOPS_INSTALLATION_ID" \
-    '.public_hostname == $hostname and
+    'type == "object" and
+     keys == [
+       "authenticated_origin",
+       "client_id",
+       "installation_id",
+       "public_hostname",
+       "version"
+     ] and
+     .public_hostname == $hostname and
      .version == $version and
      .client_id == $client and
      .installation_id == $installation and
@@ -624,6 +632,8 @@ run_guided_sequence() {
     guided_pending
     return 20
   }
+  validate_cloudflare_tunnel_env
+  load_cloudflare_gate_settings
   guided_compose up -d "${core_services[@]}" || {
     guided_pending
     return 20
@@ -1164,12 +1174,11 @@ fi
 validate_secret_file "$SECRETS_ENV_FILE"
 validate_secret_file "$CLOUDFLARE_ENV_FILE"
 if [[ "$START_STACK" -eq 1 ]]; then
-  if [[ -e "$CLOUDFLARE_ACCESS_ENV_FILE" || -L "$CLOUDFLARE_ACCESS_ENV_FILE" ]]; then
-    validate_cloudflare_access_file
-  fi
-  validate_cloudflare_tunnel_env
-  if [[ "$GUIDED" -eq 1 ]]; then
-    load_cloudflare_gate_settings
+  if [[ "$GUIDED" -ne 1 ]]; then
+    if [[ -e "$CLOUDFLARE_ACCESS_ENV_FILE" || -L "$CLOUDFLARE_ACCESS_ENV_FILE" ]]; then
+      validate_cloudflare_access_file
+    fi
+    validate_cloudflare_tunnel_env
   fi
 fi
 

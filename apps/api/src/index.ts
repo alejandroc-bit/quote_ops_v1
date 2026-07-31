@@ -57,6 +57,7 @@ import type {
   QuoteOpsStore,
   WorkflowRunSummary
 } from "./storage/QuoteOpsStore.js";
+import { matchesCloudflarePublicReceipt } from "./onboard/cloudflarePublicReceipt.js";
 import { hasMatchingTmsProbeReceipt } from "./onboard/tmsProbe.js";
 
 export { createApplianceWorkflowTools, loadApplianceManifest } from "./runtimeTools.js";
@@ -1020,22 +1021,12 @@ async function hasMatchingAuthenticatedOriginReceipt({
     join(resolveSettingsDir(env), "cloudflare-public-validation.json");
   const receipt = await readSafeJsonObject(path);
   if (!receipt) return false;
-  return (
-    receipt.public_hostname === hostname &&
-    receipt.version === version &&
-    receipt.client_id === clientId &&
-    receipt.installation_id === installationId &&
-    receipt.authenticated_origin === true &&
-    Object.keys(receipt).every((key) =>
-      [
-        "public_hostname",
-        "version",
-        "client_id",
-        "installation_id",
-        "authenticated_origin"
-      ].includes(key)
-    )
-  );
+  return matchesCloudflarePublicReceipt(receipt, {
+    public_hostname: hostname,
+    version,
+    client_id: clientId,
+    installation_id: installationId
+  });
 }
 
 async function readSafeJsonObject(
