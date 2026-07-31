@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
-import { resolve } from "node:path";
+import { readFile, stat } from "node:fs/promises";
+import { join, resolve } from "node:path";
 import cors from "cors";
 import express, { type Express, type Request, type Response } from "express";
 import { z } from "zod";
@@ -18,6 +19,7 @@ import {
 import {
   createInstallationLicense,
   generateLicenseKeyPair,
+  parseApplianceRelease,
   parsePublishedApplianceRelease,
   type PublishedApplianceRelease,
   type InstallationLicense,
@@ -31,7 +33,9 @@ import {
 import {
   canonicalizeInstallPack,
   createDefaultControlPlaneData,
+  MAX_RELEASE_ARCHIVE_BYTES,
   type ControlPlaneData,
+  type ReleaseRecord,
   type RegistrationTokenRecord
 } from "./data/index.js";
 
@@ -114,6 +118,7 @@ export type ControlPlaneApiDependencies = {
   controlPlaneUrl?: string;
   applianceReleaseRoot?: string;
   applianceReleaseVersion?: string;
+  releaseSyncToken?: string | null;
   keyPair?: LicenseKeyPair;
   now?: () => Date;
   data?: ControlPlaneData;
@@ -186,6 +191,10 @@ export function createControlPlaneApi(
     dependencies.applianceReleaseVersion ??
     process.env.QUOTEOPS_APPLIANCE_RELEASE_VERSION ??
     null;
+  const configuredReleaseSyncToken =
+    dependencies.releaseSyncToken !== undefined
+      ? dependencies.releaseSyncToken
+      : process.env.QUOTEOPS_RELEASE_SYNC_TOKEN ?? null;
   const verifySessionToken =
     dependencies.verifySessionToken !== undefined
       ? dependencies.verifySessionToken
@@ -242,6 +251,128 @@ export function createControlPlaneApi(
     }
   }
 
+  function requireReleaseSyncAuthentication(req: Request): void {
+    if (
+      !configuredReleaseSyncToken ||
+      Buffer.byteLength(configuredReleaseSyncToken, "utf8") < 32
+    ) {
+      throw new ApiError(
+        503,
+        "release_sync_unavailable",
+        "release synchronization is not configured"
+      );
+    }
+    const authorization = String(req.headers.authorization ?? "").trim();
+    const provided = /^Bearer\s+([^\s]+)$/i.exec(authorization)?.[1] ?? "";
+    const expectedDigest = crypto
+      .createHash("sha256")
+      .update(configuredReleaseSyncToken, "utf8")
+      .digest();
+    const providedDigest = crypto
+      .createHash("sha256")
+      .update(provided, "utf8")
+      .digest();
+    const authenticated = crypto.timingSafeEqual(
+      providedDigest,
+      expectedDigest
+    );
+    if (!authenticated) {
+      throw new ApiError(
+        401,
+        "unauthorized_release_sync",
+        "invalid release synchronization credential"
+      );
+    }
+  }
+
+  async function loadBundledRelease(): Promise<ReleaseRecord> {
+    if (
+      !applianceReleaseVersion ||
+      !/^v\d+\.\d+\.\d+$/.test(applianceReleaseVersion)
+    ) {
+      throw new ApiError(
+        503,
+        "release_sync_unavailable",
+        "deployed appliance release is not configured"
+      );
+    }
+    const releaseDirectory = join(
+      resolve(applianceReleaseRoot),
+      applianceReleaseVersion
+    );
+    const archiveName = `quoteops-appliance-${applianceReleaseVersion}.tar.gz`;
+    const archivePath = join(releaseDirectory, archiveName);
+    const manifestPath = join(releaseDirectory, "release.json");
+    const checksumsPath = join(releaseDirectory, "SHA256SUMS");
+    try {
+      const archiveStat = await stat(archivePath);
+      if (
+        !archiveStat.isFile() ||
+        archiveStat.size > MAX_RELEASE_ARCHIVE_BYTES
+      ) {
+        throw new Error("release_archive_too_large");
+      }
+      const [archiveBytes, manifestBytes, checksumBytes] = await Promise.all([
+        readFile(archivePath),
+        readFile(manifestPath),
+        readFile(checksumsPath, "utf8")
+      ]);
+      const checksumEntries = checksumBytes
+        .split("\n")
+        .filter((line) => line.length > 0)
+        .map((line) => /^([a-f0-9]{64})  ([A-Za-z0-9._-]+)$/.exec(line))
+        .filter((match): match is RegExpExecArray => match !== null);
+      const rawChecksumLines = checksumBytes
+        .split("\n")
+        .filter((line) => line.length > 0);
+      if (
+        checksumEntries.length !== rawChecksumLines.length ||
+        new Set(checksumEntries.map((entry) => entry[2])).size !==
+          checksumEntries.length
+      ) {
+        throw new Error("release_checksums_invalid");
+      }
+      const checksumFor = (name: string): string | null =>
+        checksumEntries.find((entry) => entry[2] === name)?.[1] ?? null;
+      const bundleSha256 = checksumFor(archiveName);
+      if (
+        !bundleSha256 ||
+        bundleSha256 !== sha256(archiveBytes) ||
+        checksumFor("release.json") !== sha256(manifestBytes)
+      ) {
+        throw new Error("release_detached_checksum_mismatch");
+      }
+      const manifest = parseApplianceRelease(
+        JSON.parse(manifestBytes.toString("utf8")) as unknown
+      );
+      if (manifest.version !== applianceReleaseVersion) {
+        throw new Error("release_version_mismatch");
+      }
+      validateReleaseArchive({
+        archiveBytes,
+        bundleSha256,
+        manifest,
+        manifestBytes
+      });
+      return {
+        version: manifest.version,
+        notes: null,
+        bundle_sha256: bundleSha256,
+        manifest,
+        manifest_bytes: manifestBytes,
+        archive_bytes: archiveBytes,
+        published_at: now().toISOString()
+      };
+    } catch (error) {
+      if (error instanceof ApiError) throw error;
+      throw new ApiError(
+        503,
+        "bundled_release_invalid",
+        "deployed appliance release failed verification"
+      );
+    }
+  }
+
   app.use(cors());
   app.use(express.json({ limit: "256kb" }));
 
@@ -274,6 +405,31 @@ export function createControlPlaneApi(
       ok: true,
       service: "quoteops-control-plane-api",
       clients: clients.length
+    });
+  }));
+
+  app.post("/api/internal/releases/sync-bundled", asyncRoute(async (req, res) => {
+    requireReleaseSyncAuthentication(req);
+    const bundled = await loadBundledRelease();
+    try {
+      await data.upsertRelease(bundled);
+    } catch (error) {
+      if (
+        (error as Error).message === "release_version_immutable" ||
+        (error as Error).message === "release_bundle_immutable"
+      ) {
+        throw new ApiError(
+          409,
+          "release_conflict",
+          "release version or bundle is already registered differently"
+        );
+      }
+      throw error;
+    }
+    res.json({
+      version: bundled.version,
+      bundle_sha256: bundled.bundle_sha256,
+      synced: true
     });
   }));
 
@@ -718,7 +874,59 @@ export function createControlPlaneApi(
     if (!release) {
       throw new ApiError(404, "not_found", "no releases published");
     }
-    res.json({ version: release.version, notes: release.notes });
+    res.json({
+      version: release.version,
+      notes: release.notes,
+      bundle_sha256: release.bundle_sha256,
+      manifest: release.manifest
+    });
+  }));
+
+  app.get("/api/releases/:version/appliance", asyncRoute(async (req, res) => {
+    await requireTenantToken(req);
+    const requestedVersion = req.params.version;
+    if (!requestedVersion || !/^v\d+\.\d+\.\d+$/.test(requestedVersion)) {
+      throw new ApiError(
+        404,
+        "release_not_available",
+        "requested release is not available"
+      );
+    }
+    let release: ReleaseRecord | null;
+    try {
+      release = await data.getRelease(requestedVersion);
+      if (!release) {
+        throw new ApiError(
+          404,
+          "release_not_available",
+          "requested release is not available"
+        );
+      }
+      if (
+        release.version !== requestedVersion ||
+        release.manifest.version !== requestedVersion
+      ) {
+        throw new Error("release_version_mismatch");
+      }
+      validateReleaseArchive({
+        archiveBytes: Buffer.from(release.archive_bytes),
+        bundleSha256: release.bundle_sha256,
+        manifest: release.manifest,
+        manifestBytes: release.manifest_bytes
+      });
+    } catch (error) {
+      if (error instanceof ApiError) throw error;
+      throw new ApiError(
+        503,
+        "release_unavailable",
+        "registered release failed verification"
+      );
+    }
+    res.setHeader("content-type", "application/gzip");
+    res.setHeader("cache-control", "private, no-store");
+    res.setHeader("x-quoteops-version", release.version);
+    res.setHeader("x-quoteops-sha256", release.bundle_sha256);
+    res.send(Buffer.from(release.archive_bytes));
   }));
 
   app.use((error: unknown, _req: Request, res: Response, _next: unknown) => {

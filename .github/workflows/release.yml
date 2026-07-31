@@ -1,4 +1,4 @@
-name: release-appliance-images
+name: release-appliance
 
 on:
   push:
@@ -20,8 +20,10 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run build
-      - run: npm test -- --run
+      - run: npx vitest run
       - run: bash deploy/appliance/tests/smoke.sh
+      - run: bash deploy/appliance/tests/lifecycle.sh
+      - run: bash -n deploy/appliance/*.sh deploy/appliance/tests/*.sh
 
   build-and-push:
     needs: verify
@@ -57,14 +59,12 @@ jobs:
         with:
           context: .
           file: ${{ matrix.dockerfile }}
-          # ponytail: amd64-only — QEMU arm64 flakes (esbuild hang, npm SIGILL);
-          # arm64 needs native arm64 runners or npm cross-install (--cpu/--os/--libc)
           platforms: linux/amd64
           push: true
           build-args: ${{ matrix.build_args }}
           tags: ghcr.io/alejandroc-bit/${{ matrix.image }}:${{ github.ref_name }}
-      - name: Save pushed digest
-        run: echo '${{ steps.build.outputs.digest }}' > ${{ matrix.key }}.digest
+      - name: Save immutable application digest
+        run: printf '%s\n' '${{ steps.build.outputs.digest }}' >${{ matrix.key }}.digest
       - uses: actions/upload-artifact@v4
         with:
           name: appliance-${{ matrix.key }}-digest
@@ -84,40 +84,342 @@ jobs:
           pattern: appliance-*-digest
           merge-multiple: true
       - id: digests
-        name: Expose distinct application digests
         run: |
           set -euo pipefail
           for image in agent api web; do
             digest="$(cat "$image.digest")"
             [[ "$digest" =~ ^sha256:[a-f0-9]{64}$ ]]
-            echo "${image}_digest=$digest" >> "$GITHUB_OUTPUT"
+            printf '%s=%s\n' "${image}_digest" "$digest" >>"$GITHUB_OUTPUT"
           done
 
-  verify-anonymous-pulls:
+  package-appliance:
     needs: collect-image-digests
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: read
     steps:
-      - name: Require anonymously pullable immutable application images
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: docker/setup-buildx-action@v3
+      - run: npm ci
+      - name: Resolve immutable runtime manifest-list digests
+        id: runtime
+        run: |
+          set -euo pipefail
+          resolve() {
+            local image="$1"
+            local canonical
+            canonical="$(
+              docker buildx imagetools \
+                inspect "$image" |
+                sed -n 's/^Name:[[:space:]]*//p' |
+                head -1
+            )"
+            [[ "$canonical" =~ ^[^[:space:]@]+@sha256:[a-f0-9]{64}$ ]]
+            printf '%s' "$canonical"
+          }
+          printf 'postgres=%s\n' "$(resolve postgres:16-alpine)" >>"$GITHUB_OUTPUT"
+          printf 'redis=%s\n' "$(resolve redis:7-alpine)" >>"$GITHUB_OUTPUT"
+          printf 'caddy=%s\n' "$(resolve caddy:2-alpine)" >>"$GITHUB_OUTPUT"
+          printf 'cloudflared=%s\n' "$(resolve cloudflare/cloudflared:2026.7.3)" >>"$GITHUB_OUTPUT"
+      - name: Package the exact candidate once
         env:
           VERSION: ${{ github.ref_name }}
           AGENT_DIGEST: ${{ needs.collect-image-digests.outputs.agent_digest }}
           API_DIGEST: ${{ needs.collect-image-digests.outputs.api_digest }}
           WEB_DIGEST: ${{ needs.collect-image-digests.outputs.web_digest }}
+          POSTGRES_IMAGE: ${{ steps.runtime.outputs.postgres }}
+          REDIS_IMAGE: ${{ steps.runtime.outputs.redis }}
+          CADDY_IMAGE: ${{ steps.runtime.outputs.caddy }}
+          CLOUDFLARED_IMAGE: ${{ steps.runtime.outputs.cloudflared }}
         run: |
           set -euo pipefail
           [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
-          for image_and_digest in \
-            "quote-ops-agent:$AGENT_DIGEST" \
-            "quote-ops-api:$API_DIGEST" \
-            "quote-ops-web:$WEB_DIGEST"; do
-            image="${image_and_digest%%:*}"
-            digest="${image_and_digest#*:}"
-            repository="ghcr.io/alejandroc-bit/$image"
-            [[ "$digest" =~ ^sha256:[a-f0-9]{64}$ ]]
-            reference="$repository:$VERSION@$digest"
+          assets="dist/appliance-runtime-assets"
+          mkdir -p "$assets"
+          for file in \
+            docker-compose.yml Caddyfile install.sh quoteops.sh verify-install.sh \
+            upgrade.sh backup.sh restore.sh secrets.sh bootstrap.sh; do
+            cp "deploy/appliance/$file" "$assets/$file"
+          done
+          export SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)"
+          node scripts/package-appliance-release.mjs \
+            --version "$VERSION" \
+            --git-sha "$GITHUB_SHA" \
+            --assets-dir "$assets" \
+            --output-dir "dist/appliance/$VERSION" \
+            --agent-digest "$AGENT_DIGEST" \
+            --api-digest "$API_DIGEST" \
+            --web-digest "$WEB_DIGEST" \
+            --postgres-image "$POSTGRES_IMAGE" \
+            --redis-image "$REDIS_IMAGE" \
+            --caddy-image "$CADDY_IMAGE" \
+            --cloudflared-image "$CLOUDFLARED_IMAGE"
+      - name: Verify candidate inventory, modes, and checksums
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          directory="dist/appliance/$VERSION"
+          expected="$(
+            printf '%s\n' \
+              SHA256SUMS bootstrap.sh "quoteops-appliance-$VERSION.tar.gz" release.json
+          )"
+          actual="$(find "$directory" -mindepth 1 -maxdepth 1 -type f -printf '%f\n' | sort)"
+          [[ "$actual" == "$expected" ]]
+          (cd "$directory" && sha256sum -c SHA256SUMS)
+          [[ "$(stat -c '%a' "$directory/bootstrap.sh")" == 755 ]]
+          [[ "$(stat -c '%a' "$directory/release.json")" == 644 ]]
+          tar -tzf "$directory/quoteops-appliance-$VERSION.tar.gz" | sort >actual-inventory
+          {
+            jq -r '.files_sha256 | keys[]' "$directory/release.json"
+            printf '%s\n' PAYLOAD_SHA256SUMS release.json
+          } | sort >expected-inventory
+          cmp actual-inventory expected-inventory
+      - uses: actions/upload-artifact@v4
+        with:
+          name: appliance-release
+          path: dist/appliance
+          if-no-files-found: error
+          retention-days: 3
+
+  n-minus-one-schema:
+    needs: package-appliance
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      previous_version: ${{ steps.previous.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: appliance-release
+          path: dist/appliance
+      - uses: docker/setup-buildx-action@v3
+      - id: previous
+        name: Resolve and verify the deterministic previous release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CURRENT_VERSION: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          mkdir -p previous
+          mapfile -t candidates < <(
+            gh release list --limit 100 --json tagName,isDraft,isPrerelease \
+              --jq '.[] | select(.isDraft == false and .isPrerelease == false) | .tagName' |
+              grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' |
+              sort -rV
+          )
+          selected=""
+          for candidate in "${candidates[@]}"; do
+            [[ "$candidate" != "$CURRENT_VERSION" ]] || continue
+            [[ "$(printf '%s\n%s\n' "$candidate" "$CURRENT_VERSION" | sort -V | head -1)" == "$candidate" ]] ||
+              continue
+            rm -rf previous/candidate
+            mkdir -p previous/candidate
+            if gh release download "$candidate" \
+              --pattern release.json \
+              --pattern SHA256SUMS \
+              --dir previous/candidate >/dev/null 2>&1 &&
+              (cd previous/candidate &&
+                grep -E '^[a-f0-9]{64}  release\.json$' SHA256SUMS |
+                  sha256sum -c - >/dev/null); then
+              selected="$candidate"
+              cp previous/candidate/release.json previous/release.json
+              break
+            fi
+          done
+          if [[ -z "$selected" ]]; then
+            [[ "$CURRENT_VERSION" == v0.2.0 ]]
+            selected=v0.1.7
+            previous_api="$(
+              docker buildx imagetools \
+                inspect ghcr.io/alejandroc-bit/quote-ops-api:v0.1.7 |
+                sed -n 's/^Name:[[:space:]]*//p' |
+                head -1
+            )"
+            [[ "$previous_api" =~ ^ghcr[.]io/alejandroc-bit/quote-ops-api@sha256:[a-f0-9]{64}$ ]]
+            jq \
+              --arg version "$selected" \
+              --arg api "ghcr.io/alejandroc-bit/quote-ops-api:$selected@${previous_api##*@}" \
+              '.version=$version |
+               .git_sha=("0"*40) |
+               .images.api=$api |
+               .files_sha256={} |
+               .created_at="2026-07-29T18:00:00.000Z"' \
+              "dist/appliance/$CURRENT_VERSION/release.json" >previous/release.json
+          fi
+          printf '%s\n' "$selected" >previous-version.txt
+          printf 'version=%s\n' "$selected" >>"$GITHUB_OUTPUT"
+      - name: Run real previous-current-previous compatibility
+        env:
+          CURRENT_VERSION: ${{ github.ref_name }}
+        run: |
+          bash deploy/appliance/tests/n-minus-one-schema.sh \
+            --previous-manifest previous/release.json \
+            --current-manifest "dist/appliance/$CURRENT_VERSION/release.json"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: n-minus-one-evidence
+          path: |
+            previous/release.json
+            previous-version.txt
+
+  verify-anonymous-pulls:
+    needs: package-appliance
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: appliance-release
+          path: dist/appliance
+      - name: Pull every candidate reference without registry login
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          manifest="dist/appliance/$VERSION/release.json"
+          for key in agent api web; do
+            reference="$(jq -er --arg key "$key" '.images[$key]' "$manifest")"
+            [[ "$reference" == *":$VERSION@sha256:"* ]]
+          done
+          while IFS= read -r reference; do
+            [[ "$reference" =~ @sha256:[a-f0-9]{64}$ ]]
             [[ "$reference" != *:latest@* ]]
             docker pull "$reference"
-          done
+          done < <(jq -r '.images[]' "$manifest")
+
+  publish-appliance:
+    needs: [n-minus-one-schema, verify-anonymous-pulls]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: appliance-release
+          path: dist/appliance
+      - name: Publish the exact gated candidate bytes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          ! gh release view "$VERSION" >/dev/null 2>&1
+          directory="dist/appliance/$VERSION"
+          gh release create "$VERSION" \
+            "$directory/quoteops-appliance-$VERSION.tar.gz" \
+            "$directory/release.json" \
+            "$directory/bootstrap.sh" \
+            "$directory/SHA256SUMS" \
+            --verify-tag \
+            --generate-notes
+
+  deploy-control-plane:
+    needs: [verify, publish-appliance, n-minus-one-schema]
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: appliance-release
+          path: dist/appliance
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Assert downloaded candidate layout
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          directory="dist/appliance/$VERSION"
+          test -f "$directory/quoteops-appliance-$VERSION.tar.gz"
+          test -f "$directory/release.json"
+          test -f "$directory/bootstrap.sh"
+          test -f "$directory/SHA256SUMS"
+          (cd "$directory" && sha256sum -c SHA256SUMS)
+      - run: npx vercel pull --yes --environment=production --token="$VERCEL_TOKEN"
+      - run: npx vercel build --prod --token="$VERCEL_TOKEN"
+        env:
+          QUOTEOPS_APPLIANCE_RELEASE_VERSION: ${{ github.ref_name }}
+      - name: Assert release and TMS assets exist in the function bundle
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          function_root=".vercel/output/functions/api/index.func"
+          test -f "$function_root/dist/appliance/$VERSION/quoteops-appliance-$VERSION.tar.gz"
+          test -f "$function_root/dist/appliance/$VERSION/release.json"
+          test -f "$function_root/dist/appliance/$VERSION/bootstrap.sh"
+          test -f "$function_root/dist/appliance/$VERSION/SHA256SUMS"
+          test -f "$function_root/docs/integrations/tms-http-v1.openapi.yaml"
+          test -f "$function_root/docs/integrations/tms-http-v1.md"
+      - run: npx vercel deploy --prebuilt --prod --token="$VERCEL_TOKEN"
+      - name: Sync and re-download exact immutable release bytes
+        env:
+          VERSION: ${{ github.ref_name }}
+          PREVIOUS_VERSION: ${{ needs.n-minus-one-schema.outputs.previous_version }}
+          CONTROL_PLANE_URL: ${{ secrets.QUOTEOPS_CONTROL_PLANE_URL }}
+          RELEASE_SYNC_TOKEN: ${{ secrets.QUOTEOPS_RELEASE_SYNC_TOKEN }}
+          INSTALLATION_TEST_TOKEN: ${{ secrets.QUOTEOPS_INSTALLATION_TEST_TOKEN }}
+        run: |
+          set -euo pipefail
+          [[ "${#RELEASE_SYNC_TOKEN}" -ge 32 ]]
+          temporary="$(mktemp -d)"
+          trap 'rm -rf "$temporary"' EXIT
+          umask 077
+          printf 'header = "Authorization: Bearer %s"\n' \
+            "$RELEASE_SYNC_TOKEN" >"$temporary/sync.curl"
+          printf 'header = "Authorization: Bearer %s"\n' \
+            "$INSTALLATION_TEST_TOKEN" >"$temporary/install.curl"
+          chmod 600 "$temporary/"*.curl
+          curl --fail --silent --show-error \
+            --proto "=https" --proto-redir "=https" --tlsv1.2 \
+            --config "$temporary/sync.curl" \
+            --request POST \
+            "$CONTROL_PLANE_URL/api/internal/releases/sync-bundled" \
+            >"$temporary/sync.json"
+          curl --fail --silent --show-error \
+            --proto "=https" --proto-redir "=https" --tlsv1.2 \
+            --config "$temporary/install.curl" \
+            "$CONTROL_PLANE_URL/api/releases/latest" \
+            >"$temporary/latest.json"
+          expected="$(
+            awk -v name="quoteops-appliance-$VERSION.tar.gz" \
+              '$2 == name { print $1 }' "dist/appliance/$VERSION/SHA256SUMS"
+          )"
+          jq -e --arg version "$VERSION" --arg checksum "$expected" '
+            keys == ["bundle_sha256","manifest","notes","version"] and
+            .version == $version and
+            .bundle_sha256 == $checksum and
+            .manifest.version == $version
+          ' "$temporary/latest.json" >/dev/null
+          curl --fail --silent --show-error \
+            --proto "=https" --proto-redir "=https" --tlsv1.2 \
+            --config "$temporary/install.curl" \
+            --output "$temporary/release.tar.gz" \
+            "$CONTROL_PLANE_URL/api/releases/$VERSION/appliance"
+          [[ "$(sha256sum "$temporary/release.tar.gz" | awk '{print $1}')" == "$expected" ]]
+          if [[ "$VERSION" != v0.2.0 ]]; then
+            curl --fail --silent --show-error \
+              --proto "=https" --proto-redir "=https" --tlsv1.2 \
+              --config "$temporary/install.curl" \
+              --output "$temporary/previous.tar.gz" \
+              "$CONTROL_PLANE_URL/api/releases/$PREVIOUS_VERSION/appliance"
+            test -s "$temporary/previous.tar.gz"
+          fi
+    env:
+      VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+      VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+      VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}

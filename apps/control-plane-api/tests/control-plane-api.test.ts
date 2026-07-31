@@ -828,9 +828,8 @@ describe("minimal control-plane API", () => {
   });
 
   it("uses the activated install-pack token as the bound credential for every ingest endpoint", async () => {
-    const data = createInMemoryControlPlaneData({
-      releases: [await createTestRelease("v1.2.0", "Stable")]
-    });
+    const stableRelease = await createTestRelease("v1.2.0", "Stable");
+    const data = createInMemoryControlPlaneData({ releases: [stableRelease] });
     const api = await startApi({
       data,
       tokenGenerator: () => "issued-appliance-token",
@@ -882,6 +881,12 @@ describe("minimal control-plane API", () => {
     expect([heartbeat.status, counters.status, sentinel.status, usage.status, release.status])
       .toEqual([202, 202, 201, 202, 200]);
     expect(heartbeat.body.latest_version).toBe("v1.2.0");
+    expect(release.body).toEqual({
+      version: stableRelease.version,
+      notes: stableRelease.notes,
+      bundle_sha256: stableRelease.bundle_sha256,
+      manifest: stableRelease.manifest
+    });
 
     const wrongInstallation = await api.post("/api/sentinel/reports", {
       installation_id: "other-prod-001",
@@ -890,6 +895,152 @@ describe("minimal control-plane API", () => {
       stats: { runs: 1, errors: 0, interrupts: 0, avg_node_ms: 20 }
     }, authorization);
     expect(wrongInstallation.status).toBe(403);
+  });
+
+  it("downloads every exact registered release with installation authentication", async () => {
+    const oldRelease = await createTestRelease("v0.2.0", "Historical");
+    const currentRelease = await createTestRelease("v0.2.1", "Current");
+    const data = createInMemoryControlPlaneData({
+      releases: [oldRelease, currentRelease]
+    });
+    const api = await startApi({
+      data,
+      tokenGenerator: () => "release-download-installation-token",
+      now: () => new Date("2026-07-29T18:00:00.000Z")
+    });
+    await api.post("/api/admin/clients", {
+      client_id: "DOWNLOAD",
+      legal_name: "Release Download Client",
+      authorized_email: "ops@download.example"
+    });
+    await api.post("/api/admin/clients/DOWNLOAD/install-pack", {});
+    await api.post("/api/onboarding/activate", {
+      client_id: "DOWNLOAD",
+      installation_id: "download-prod-001",
+      email: "ops@download.example",
+      registration_token: "release-download-installation-token"
+    });
+
+    expect((await api.get("/api/releases/v0.2.0/appliance", null)).status).toBe(401);
+    for (const expected of [oldRelease, currentRelease]) {
+      const response = await api.getBinary(
+        `/api/releases/${expected.version}/appliance`,
+        "Bearer release-download-installation-token"
+      );
+      expect(response.status).toBe(200);
+      expect(response.headers["content-type"]).toMatch(/application\/gzip/);
+      expect(response.headers["cache-control"]).toBe("private, no-store");
+      expect(response.headers["x-quoteops-version"]).toBe(expected.version);
+      expect(response.headers["x-quoteops-sha256"]).toBe(expected.bundle_sha256);
+      expect(response.bytes).toEqual(Buffer.from(expected.archive_bytes));
+    }
+
+    const unavailable = await api.get(
+      "/api/releases/v0.2.2/appliance",
+      "Bearer release-download-installation-token"
+    );
+    expect(unavailable.status).toBe(404);
+    expect(unavailable.body.error).toBe("release_not_available");
+  });
+
+  it("syncs only verified bundled bytes with a dedicated constant-time machine credential", async () => {
+    const root = await mkdtemp(join(tmpdir(), "quoteops-release-sync-"));
+    tempDirs.push(root);
+    const releaseDir = join(root, "v0.2.1");
+    await mkdir(releaseDir);
+    const bundledRelease = await createTestRelease("v0.2.1", "Bundled");
+    const archiveName = "quoteops-appliance-v0.2.1.tar.gz";
+    await writeFile(join(releaseDir, archiveName), bundledRelease.archive_bytes);
+    await writeFile(join(releaseDir, "release.json"), bundledRelease.manifest_bytes);
+    await writeFile(
+      join(releaseDir, "SHA256SUMS"),
+      [
+        `${bundledRelease.bundle_sha256}  ${archiveName}`,
+        `${sha256(bundledRelease.manifest_bytes)}  release.json`
+      ].join("\n") + "\n"
+    );
+
+    const data = createInMemoryControlPlaneData({
+      releases: [await createTestRelease("v0.2.0", "Historical")]
+    });
+    const releaseSyncToken = "release-sync-token-0123456789abcdef";
+    const api = await startApi({
+      data,
+      applianceReleaseRoot: root,
+      applianceReleaseVersion: "v0.2.1",
+      releaseSyncToken
+    });
+
+    expect(
+      (await api.post("/api/internal/releases/sync-bundled", {}, null)).status
+    ).toBe(401);
+    expect(
+      (
+        await api.post(
+          "/api/internal/releases/sync-bundled",
+          {},
+          "Bearer wrong-release-sync-token-0123456789abcdef"
+        )
+      ).status
+    ).toBe(401);
+    const synced = await api.post(
+      "/api/internal/releases/sync-bundled",
+      {},
+      `Bearer ${releaseSyncToken}`
+    );
+    expect(synced.status).toBe(200);
+    expect(synced.body).toEqual({
+      version: bundledRelease.version,
+      bundle_sha256: bundledRelease.bundle_sha256,
+      synced: true
+    });
+    expect(
+      (
+        await api.post(
+          "/api/internal/releases/sync-bundled",
+          {},
+          `Bearer ${releaseSyncToken}`
+        )
+      ).status
+    ).toBe(200);
+    expect((await data.getRelease("v0.2.0"))?.version).toBe("v0.2.0");
+    expect((await data.getRelease("v0.2.1"))?.bundle_sha256).toBe(
+      bundledRelease.bundle_sha256
+    );
+
+    const conflicting = await createTestRelease("v0.2.1", "Conflict");
+    await writeFile(join(releaseDir, archiveName), conflicting.archive_bytes);
+    await writeFile(join(releaseDir, "release.json"), conflicting.manifest_bytes);
+    await writeFile(
+      join(releaseDir, "SHA256SUMS"),
+      [
+        `${conflicting.bundle_sha256}  ${archiveName}`,
+        `${sha256(conflicting.manifest_bytes)}  release.json`
+      ].join("\n") + "\n"
+    );
+    const conflict = await api.post(
+      "/api/internal/releases/sync-bundled",
+      {},
+      `Bearer ${releaseSyncToken}`
+    );
+    expect(conflict.status).toBe(409);
+    expect(conflict.body.error).toBe("release_conflict");
+
+    const disabled = await startApi({
+      data,
+      applianceReleaseRoot: root,
+      applianceReleaseVersion: "v0.2.1",
+      releaseSyncToken: "too-short"
+    });
+    expect(
+      (
+        await disabled.post(
+          "/api/internal/releases/sync-bundled",
+          {},
+          "Bearer too-short"
+        )
+      ).status
+    ).toBe(503);
   });
 
   it("serves tenant ingests from the default in-memory unified data store", async () => {
@@ -1206,7 +1357,12 @@ describe("minimal control-plane API", () => {
 
     const latest = await api.get("/api/releases/latest", "Bearer release-token");
     expect(latest.status).toBe(200);
-    expect(latest.body).toEqual({ version: "v1.10.0", notes: "Current" });
+    expect(latest.body).toEqual({
+      version: currentRelease.version,
+      notes: currentRelease.notes,
+      bundle_sha256: currentRelease.bundle_sha256,
+      manifest: currentRelease.manifest
+    });
 
     const anonymous = await api.get("/api/releases/latest", null);
     expect(anonymous.status).toBe(401);
@@ -1513,6 +1669,7 @@ async function startApi(options: {
   controlPlaneUrl?: string;
   applianceReleaseRoot?: string;
   applianceReleaseVersion?: string;
+  releaseSyncToken?: string | null;
   data?: ControlPlaneData;
   verifySessionToken?: (token: string) => Promise<{ user_id: string; email: string } | null>;
   isVendorAdminEmail?: (email: string) => boolean;
@@ -1548,6 +1705,14 @@ async function startApi(options: {
       return {
         status: response.status,
         text: response.text,
+        headers: response.headers
+      };
+    },
+    async getBinary(path: string, authorization: string | null = null) {
+      const response = await directRequest(app, "GET", path, undefined, authorization);
+      return {
+        status: response.status,
+        bytes: response.bytes,
         headers: response.headers
       };
     },
@@ -1737,6 +1902,7 @@ async function directRequest(
   status: number;
   body: Record<string, any>;
   text: string;
+  bytes: Buffer;
   headers: ReturnType<ServerResponse["getHeaders"]>;
 }> {
   const payload = body === undefined ? "" : JSON.stringify(body);
@@ -1790,7 +1956,8 @@ async function directRequest(
   app(req, res);
   await finished;
 
-  const text = Buffer.concat(chunks).toString("utf8");
+  const bytes = Buffer.concat(chunks);
+  const text = bytes.toString("utf8");
   const contentType = String(res.getHeader("content-type") ?? "");
   return {
     status: res.statusCode,
@@ -1799,6 +1966,7 @@ async function directRequest(
         ? (JSON.parse(text) as Record<string, any>)
         : {},
     text,
+    bytes,
     headers: res.getHeaders()
   };
 }
