@@ -1,5 +1,5 @@
 import { Readable } from "node:stream";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { createInstallationLicense, generateLicenseKeyPair } from "@quoteops/shared";
 import { createQuoteOpsApi } from "../src/index.js";
 import { createInMemoryQuoteOpsStore } from "../src/storage/InMemoryQuoteOpsStore.js";
@@ -85,6 +85,51 @@ describe("traced run API", () => {
       approval_decision: { action: "approve", email_sent: false },
       response_sent: true
     });
+  });
+
+  it("persists an agent approval in its own audit path without touching the legacy workflow FK", async () => {
+    const events: string[] = [];
+    const claimAgentRunForResume = vi.fn(async () => {
+      events.push("claim_and_audit");
+      return true;
+    });
+    const store = Object.assign(createInMemoryQuoteOpsStore(), {
+      claimAgentRunForResume
+    });
+    const legacyApprovalSave = vi
+      .spyOn(store, "saveApprovalDecision")
+      .mockRejectedValue(new Error("legacy workflow FK must not receive agent runs"));
+    await store.createRun({
+      run_id: "run-api-agent-audit",
+      channel: "email",
+      status: "waiting_approval",
+      summary: "review"
+    });
+    const app = createQuoteOpsApi({
+      store,
+      graphRuntime: {
+        resume: async (runId) => {
+          events.push("resume");
+          await store.updateRunStatus(runId, "done", "approved");
+          return { run_id: runId, response_sent: true } as never;
+        }
+      }
+    });
+
+    const response = await dispatch(
+      app,
+      "POST",
+      "/api/approvals/run-api-agent-audit/decision",
+      { action: "approve" }
+    );
+
+    expect(response.statusCode).toBe(200);
+    expect(legacyApprovalSave).not.toHaveBeenCalled();
+    expect(claimAgentRunForResume).toHaveBeenCalledWith(
+      "run-api-agent-audit",
+      expect.objectContaining({ action: "approve", email_sent: false })
+    );
+    expect(events).toEqual(["claim_and_audit", "resume"]);
   });
 
   it("blocks new-graph approval resume when the appliance license is missing", async () => {

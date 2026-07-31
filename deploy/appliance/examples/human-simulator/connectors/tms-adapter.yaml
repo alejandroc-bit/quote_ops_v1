@@ -1,0 +1,17 @@
+# HTTP mock that simulates a SAP-style contract for this fixture. It is not a
+# SAP connector and is not certified against any SAP product or tenant.
+provider: http
+base_url_env: MOCK_TMS_BASE_URL
+health_endpoint_path: /health
+get_rfq_endpoint_path: /rfqs/{rfq_id}
+list_new_rfqs_endpoint_path: /rfqs/new
+search_historical_quotes_endpoint_path: /historical-quotes/search
+search_historical_shipments_endpoint_path: /historical-shipments/search
+get_customer_endpoint_path: /customers/{customer_id}
+get_customer_agreements_endpoint_path: /customers/{customer_id}/agreements
+get_unit_positions_endpoint_path: /unit-positions
+get_units_endpoint_path: /units
+get_unit_performance_endpoint_path: /unit-performance
+get_availability_zones_endpoint_path: /availability-zones
+write_quote_endpoint_path: /quotes
+write_status_endpoint_path: /status

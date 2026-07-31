@@ -1,4 +1,6 @@
 import crypto from "node:crypto";
+import { readFile, stat } from "node:fs/promises";
+import { join, resolve } from "node:path";
 import cors from "cors";
 import express, { type Express, type Request, type Response } from "express";
 import { z } from "zod";
@@ -8,6 +10,7 @@ import {
   authorizeUserForClient,
   createInstallPack,
   createMinimalClientRecord,
+  normalizeControlPlaneOrigin,
   parseMinimalCounters,
   parseMinimalHeartbeat,
   type InstallPack,
@@ -16,16 +19,23 @@ import {
 import {
   createInstallationLicense,
   generateLicenseKeyPair,
+  parseApplianceRelease,
+  parsePublishedApplianceRelease,
+  type PublishedApplianceRelease,
   type InstallationLicense,
   type LicenseKeyPair
 } from "@quoteops/shared";
 import {
-  loadApplianceDeployFiles,
-  renderInstallerScript
+  loadBootstrapScript,
+  renderInstallerScript,
+  validateReleaseArchive
 } from "./installerScript.js";
 import {
+  canonicalizeInstallPack,
   createDefaultControlPlaneData,
+  MAX_RELEASE_ARCHIVE_BYTES,
   type ControlPlaneData,
+  type ReleaseRecord,
   type RegistrationTokenRecord
 } from "./data/index.js";
 
@@ -106,6 +116,9 @@ export type ControlPlaneApiDependencies = {
   verifySessionToken?: SessionTokenVerifier | null;
   isVendorAdminEmail?: VendorAdminEmailVerifier | null;
   controlPlaneUrl?: string;
+  applianceReleaseRoot?: string;
+  applianceReleaseVersion?: string;
+  releaseSyncToken?: string | null;
   keyPair?: LicenseKeyPair;
   now?: () => Date;
   data?: ControlPlaneData;
@@ -171,6 +184,17 @@ export function createControlPlaneApi(
     dependencies.controlPlaneUrl ??
     process.env.QUOTEOPS_CONTROL_PLANE_URL ??
     null;
+  const applianceReleaseRoot =
+    dependencies.applianceReleaseRoot ??
+    resolve(process.cwd(), "dist", "appliance");
+  const applianceReleaseVersion =
+    dependencies.applianceReleaseVersion ??
+    process.env.QUOTEOPS_APPLIANCE_RELEASE_VERSION ??
+    null;
+  const configuredReleaseSyncToken =
+    dependencies.releaseSyncToken !== undefined
+      ? dependencies.releaseSyncToken
+      : process.env.QUOTEOPS_RELEASE_SYNC_TOKEN ?? null;
   const verifySessionToken =
     dependencies.verifySessionToken !== undefined
       ? dependencies.verifySessionToken
@@ -179,6 +203,175 @@ export function createControlPlaneApi(
     dependencies.isVendorAdminEmail !== undefined
       ? dependencies.isVendorAdminEmail
       : createDefaultVendorAdminEmailVerifier();
+
+  async function requireInstallableRelease(): Promise<PublishedApplianceRelease> {
+    const published = await data.latestRelease();
+    if (
+      !published ||
+      !/^[a-f0-9]{64}$/.test(published.bundle_sha256) ||
+      sha256(published.archive_bytes) !== published.bundle_sha256
+    ) {
+      throw new ApiError(
+        503,
+        "release_unavailable",
+        "no verified appliance release is available"
+      );
+    }
+    return parsePublishedApplianceRelease({
+      manifest: published.manifest,
+      bundle_sha256: published.bundle_sha256
+    });
+  }
+
+  async function loadRegistrationToken(
+    tokenHash: string
+  ): Promise<RegistrationTokenRecord | null> {
+    try {
+      return await data.getRegistrationToken(tokenHash);
+    } catch (error) {
+      const message = (error as Error).message;
+      if (message === "registration_token_reissue_required") {
+        throw new ApiError(
+          403,
+          "registration_token_reissue_required",
+          "registration token must be reissued after the release-pin migration"
+        );
+      }
+      if (
+        message.startsWith("install_pack_") ||
+        message.startsWith("registration_token_release_pin_")
+      ) {
+        throw new ApiError(
+          403,
+          "registration_token_invalid",
+          "registration token payload failed integrity validation"
+        );
+      }
+      throw error;
+    }
+  }
+
+  function requireReleaseSyncAuthentication(req: Request): void {
+    if (
+      !configuredReleaseSyncToken ||
+      Buffer.byteLength(configuredReleaseSyncToken, "utf8") < 32
+    ) {
+      throw new ApiError(
+        503,
+        "release_sync_unavailable",
+        "release synchronization is not configured"
+      );
+    }
+    const authorization = String(req.headers.authorization ?? "").trim();
+    const provided = /^Bearer\s+([^\s]+)$/i.exec(authorization)?.[1] ?? "";
+    const expectedDigest = crypto
+      .createHash("sha256")
+      .update(configuredReleaseSyncToken, "utf8")
+      .digest();
+    const providedDigest = crypto
+      .createHash("sha256")
+      .update(provided, "utf8")
+      .digest();
+    const authenticated = crypto.timingSafeEqual(
+      providedDigest,
+      expectedDigest
+    );
+    if (!authenticated) {
+      throw new ApiError(
+        401,
+        "unauthorized_release_sync",
+        "invalid release synchronization credential"
+      );
+    }
+  }
+
+  async function loadBundledRelease(): Promise<ReleaseRecord> {
+    if (
+      !applianceReleaseVersion ||
+      !/^v\d+\.\d+\.\d+$/.test(applianceReleaseVersion)
+    ) {
+      throw new ApiError(
+        503,
+        "release_sync_unavailable",
+        "deployed appliance release is not configured"
+      );
+    }
+    const releaseDirectory = join(
+      resolve(applianceReleaseRoot),
+      applianceReleaseVersion
+    );
+    const archiveName = `quoteops-appliance-${applianceReleaseVersion}.tar.gz`;
+    const archivePath = join(releaseDirectory, archiveName);
+    const manifestPath = join(releaseDirectory, "release.json");
+    const checksumsPath = join(releaseDirectory, "SHA256SUMS");
+    try {
+      const archiveStat = await stat(archivePath);
+      if (
+        !archiveStat.isFile() ||
+        archiveStat.size > MAX_RELEASE_ARCHIVE_BYTES
+      ) {
+        throw new Error("release_archive_too_large");
+      }
+      const [archiveBytes, manifestBytes, checksumBytes] = await Promise.all([
+        readFile(archivePath),
+        readFile(manifestPath),
+        readFile(checksumsPath, "utf8")
+      ]);
+      const checksumEntries = checksumBytes
+        .split("\n")
+        .filter((line) => line.length > 0)
+        .map((line) => /^([a-f0-9]{64})  ([A-Za-z0-9._-]+)$/.exec(line))
+        .filter((match): match is RegExpExecArray => match !== null);
+      const rawChecksumLines = checksumBytes
+        .split("\n")
+        .filter((line) => line.length > 0);
+      if (
+        checksumEntries.length !== rawChecksumLines.length ||
+        new Set(checksumEntries.map((entry) => entry[2])).size !==
+          checksumEntries.length
+      ) {
+        throw new Error("release_checksums_invalid");
+      }
+      const checksumFor = (name: string): string | null =>
+        checksumEntries.find((entry) => entry[2] === name)?.[1] ?? null;
+      const bundleSha256 = checksumFor(archiveName);
+      if (
+        !bundleSha256 ||
+        bundleSha256 !== sha256(archiveBytes) ||
+        checksumFor("release.json") !== sha256(manifestBytes)
+      ) {
+        throw new Error("release_detached_checksum_mismatch");
+      }
+      const manifest = parseApplianceRelease(
+        JSON.parse(manifestBytes.toString("utf8")) as unknown
+      );
+      if (manifest.version !== applianceReleaseVersion) {
+        throw new Error("release_version_mismatch");
+      }
+      validateReleaseArchive({
+        archiveBytes,
+        bundleSha256,
+        manifest,
+        manifestBytes
+      });
+      return {
+        version: manifest.version,
+        notes: null,
+        bundle_sha256: bundleSha256,
+        manifest,
+        manifest_bytes: manifestBytes,
+        archive_bytes: archiveBytes,
+        published_at: now().toISOString()
+      };
+    } catch (error) {
+      if (error instanceof ApiError) throw error;
+      throw new ApiError(
+        503,
+        "bundled_release_invalid",
+        "deployed appliance release failed verification"
+      );
+    }
+  }
 
   app.use(cors());
   app.use(express.json({ limit: "256kb" }));
@@ -213,6 +406,60 @@ export function createControlPlaneApi(
       service: "quoteops-control-plane-api",
       clients: clients.length
     });
+  }));
+
+  app.post("/api/internal/releases/sync-bundled", asyncRoute(async (req, res) => {
+    requireReleaseSyncAuthentication(req);
+    const bundled = await loadBundledRelease();
+    try {
+      await data.upsertRelease(bundled);
+    } catch (error) {
+      if (
+        (error as Error).message === "release_version_immutable" ||
+        (error as Error).message === "release_bundle_immutable"
+      ) {
+        throw new ApiError(
+          409,
+          "release_conflict",
+          "release version or bundle is already registered differently"
+        );
+      }
+      throw error;
+    }
+    res.json({
+      version: bundled.version,
+      bundle_sha256: bundled.bundle_sha256,
+      synced: true
+    });
+  }));
+
+  app.get("/install/quoteops", asyncRoute(async (_req, res) => {
+    const controlPlaneUrl = requireControlPlaneOrigin(configuredControlPlaneUrl);
+    if (!applianceReleaseVersion) {
+      throw new ApiError(
+        503,
+        "bootstrap_unavailable",
+        "deployed appliance release is not configured"
+      );
+    }
+    let script: string;
+    try {
+      script = await loadBootstrapScript({
+        applianceReleaseRoot,
+        applianceReleaseVersion,
+        controlPlaneUrl
+      });
+    } catch {
+      throw new ApiError(
+        503,
+        "bootstrap_unavailable",
+        "deployed bootstrap failed verification"
+      );
+    }
+    res.setHeader("content-type", "text/x-shellscript; charset=utf-8");
+    res.setHeader("cache-control", "no-store");
+    res.setHeader("referrer-policy", "no-referrer");
+    res.send(script);
   }));
 
   app.post("/api/portal/profile/claim", asyncRoute(async (req, res) => {
@@ -259,27 +506,50 @@ export function createControlPlaneApi(
   app.post("/api/admin/clients/:clientId/install-pack", asyncRoute(async (req, res) => {
     const client = await requireClient(data, req.params.clientId);
     ensureClientCanReceiveLicense(client);
-
+    const controlPlaneUrl = requireControlPlaneOrigin(configuredControlPlaneUrl);
+    const release = await requireInstallableRelease();
+    const registrationToken = tokenGenerator();
+    const expiresAt = addMinutes(now(), tokenTtlMinutes).toISOString();
+    const issuedPack = createInstallPack({
+      client,
+      control_plane_url: controlPlaneUrl,
+      registration_token: registrationToken,
+      expires_at: expiresAt,
+      release
+    });
+    const {
+      registration_token: _registrationToken,
+      ...installPackSnapshot
+    } = issuedPack;
     const token: RegistrationTokenRecord = {
-      token: tokenGenerator(),
+      token: sha256(registrationToken),
       client_id: client.client_id,
       installation_id: client.installation.installation_id,
-      expires_at: addMinutes(now(), tokenTtlMinutes).toISOString(),
-      used_at: null
+      expires_at: expiresAt,
+      used_at: null,
+      release_version: release.manifest.version,
+      bundle_sha256: release.bundle_sha256,
+      install_pack_snapshot: installPackSnapshot,
+      pack_sha256: sha256(canonicalizeInstallPack(installPackSnapshot))
     };
     await data.saveRegistrationToken(token);
-
-    const pack = createInstallPack({
-      client,
-      control_plane_url: resolveControlPlaneUrl(req, configuredControlPlaneUrl),
-      registration_token: token.token,
-      expires_at: token.expires_at
+    res.status(201).json({
+      install_pack: {
+        ...token.install_pack_snapshot,
+        registration_token: registrationToken
+      }
     });
-    res.status(201).json({ install_pack: pack });
   }));
 
-  app.get("/api/install/:registrationToken", asyncRoute(async (req, res) => {
-    const token = await data.getRegistrationToken(req.params.registrationToken ?? "");
+  app.get("/api/install", asyncRoute(async (req, res) => {
+    const controlPlaneUrl = requireControlPlaneOrigin(configuredControlPlaneUrl);
+    const authorization = String(req.headers.authorization ?? "").trim();
+    const registrationToken =
+      /^Bearer\s+([^\s]+)$/i.exec(authorization)?.[1] ?? null;
+    if (!registrationToken) {
+      throw new ApiError(401, "unauthorized_install", "Bearer registration token required");
+    }
+    const token = await loadRegistrationToken(sha256(registrationToken));
     if (!token) {
       throw new ApiError(404, "not_found", "registration token not found");
     }
@@ -290,22 +560,55 @@ export function createControlPlaneApi(
       throw new ApiError(403, "registration_token_expired", "registration token expired");
     }
 
-    const client = await requireClient(data, token.client_id);
-    ensureClientCanReceiveLicense(client);
-
-    const deployFiles = await loadApplianceDeployFiles();
-    if (!deployFiles) {
-      throw new ApiError(503, "installer_unavailable", "appliance deploy files are not bundled");
+    const pack = token.install_pack_snapshot;
+    if (pack.control_plane_url !== controlPlaneUrl) {
+      throw new ApiError(
+        409,
+        "install_pack_origin_mismatch",
+        "registration token is pinned to another control-plane origin"
+      );
     }
-
-    const pack = createInstallPack({
-      client,
-      control_plane_url: resolveControlPlaneUrl(req, configuredControlPlaneUrl),
-      registration_token: token.token,
-      expires_at: token.expires_at
-    });
+    const release = await data.getRelease(token.release_version);
+    if (!release || release.bundle_sha256 !== token.bundle_sha256) {
+      throw new ApiError(
+        503,
+        "release_unavailable",
+        "pinned appliance release is unavailable"
+      );
+    }
+    try {
+      validateReleaseArchive({
+        archiveBytes: Buffer.from(release.archive_bytes),
+        bundleSha256: release.bundle_sha256,
+        manifest: release.manifest,
+        manifestBytes: release.manifest_bytes
+      });
+    } catch {
+      throw new ApiError(
+        503,
+        "release_verification_failed",
+        "pinned appliance release failed verification"
+      );
+    }
+    let script: string;
+    try {
+      script = renderInstallerScript({
+        pack,
+        archiveBytes: Buffer.from(release.archive_bytes),
+        bundleSha256: release.bundle_sha256,
+        manifest: release.manifest
+      });
+    } catch {
+      throw new ApiError(
+        503,
+        "installer_unavailable",
+        "pinned installer payload is invalid"
+      );
+    }
     res.setHeader("content-type", "text/x-shellscript; charset=utf-8");
-    res.send(renderInstallerScript({ pack, deployFiles }));
+    res.setHeader("cache-control", "no-store");
+    res.setHeader("referrer-policy", "no-referrer");
+    res.send(script);
   }));
 
   app.post("/api/admin/clients/:clientId/suspend", asyncRoute(async (req, res) => {
@@ -395,13 +698,25 @@ export function createControlPlaneApi(
       return;
     }
 
-    const token = await data.getRegistrationToken(registrationToken);
+    const token = await loadRegistrationToken(sha256(registrationToken));
     if (!token || token.client_id !== client.client_id || token.installation_id !== installationId) {
       res.status(403).json({ error: "registration_token_invalid" });
       return;
     }
     if (token.used_at) {
-      res.status(403).json({ error: "registration_token_used" });
+      if (
+        client.status === "active" &&
+        client.installation.license_status === "active"
+      ) {
+        res.json({
+          activated: true,
+          client,
+          license: issueLicense(client, keyPair.private_key_pem, token.used_at),
+          public_key_pem: keyPair.public_key_pem
+        });
+        return;
+      }
+      res.status(409).json({ error: "registration_token_used_without_license" });
       return;
     }
     if (Date.parse(token.expires_at) <= now().getTime()) {
@@ -500,7 +815,19 @@ export function createControlPlaneApi(
     if (!token) {
       throw new ApiError(401, "unauthorized_installation", "invalid installation token");
     }
-    const resolved = await data.resolveTenantByToken(token);
+    let resolved;
+    try {
+      resolved = await data.resolveTenantByToken(sha256(token));
+    } catch (error) {
+      if ((error as Error).message === "registration_token_reissue_required") {
+        throw new ApiError(
+          403,
+          "registration_token_reissue_required",
+          "registration token must be reissued after the release-pin migration"
+        );
+      }
+      throw error;
+    }
     if (!resolved) {
       throw new ApiError(401, "unauthorized_installation", "invalid installation token");
     }
@@ -547,7 +874,59 @@ export function createControlPlaneApi(
     if (!release) {
       throw new ApiError(404, "not_found", "no releases published");
     }
-    res.json({ version: release.version, notes: release.notes });
+    res.json({
+      version: release.version,
+      notes: release.notes,
+      bundle_sha256: release.bundle_sha256,
+      manifest: release.manifest
+    });
+  }));
+
+  app.get("/api/releases/:version/appliance", asyncRoute(async (req, res) => {
+    await requireTenantToken(req);
+    const requestedVersion = req.params.version;
+    if (!requestedVersion || !/^v\d+\.\d+\.\d+$/.test(requestedVersion)) {
+      throw new ApiError(
+        404,
+        "release_not_available",
+        "requested release is not available"
+      );
+    }
+    let release: ReleaseRecord | null;
+    try {
+      release = await data.getRelease(requestedVersion);
+      if (!release) {
+        throw new ApiError(
+          404,
+          "release_not_available",
+          "requested release is not available"
+        );
+      }
+      if (
+        release.version !== requestedVersion ||
+        release.manifest.version !== requestedVersion
+      ) {
+        throw new Error("release_version_mismatch");
+      }
+      validateReleaseArchive({
+        archiveBytes: Buffer.from(release.archive_bytes),
+        bundleSha256: release.bundle_sha256,
+        manifest: release.manifest,
+        manifestBytes: release.manifest_bytes
+      });
+    } catch (error) {
+      if (error instanceof ApiError) throw error;
+      throw new ApiError(
+        503,
+        "release_unavailable",
+        "registered release failed verification"
+      );
+    }
+    res.setHeader("content-type", "application/gzip");
+    res.setHeader("cache-control", "private, no-store");
+    res.setHeader("x-quoteops-version", release.version);
+    res.setHeader("x-quoteops-sha256", release.bundle_sha256);
+    res.send(Buffer.from(release.archive_bytes));
   }));
 
   app.use((error: unknown, _req: Request, res: Response, _next: unknown) => {
@@ -678,18 +1057,27 @@ function decodeBase64Env(value: string | undefined): string | undefined {
   return Buffer.from(value.trim(), "base64").toString("utf8").trim();
 }
 
-function resolveControlPlaneUrl(req: Request, configuredUrl: string | null): string {
-  if (configuredUrl?.trim()) {
-    return configuredUrl.trim().replace(/\/+$/, "");
+function requireControlPlaneOrigin(configuredUrl: string | null): string {
+  if (!configuredUrl?.trim()) {
+    throw new ApiError(
+      503,
+      "control_plane_origin_missing",
+      "QUOTEOPS_CONTROL_PLANE_URL must be a normalized HTTPS origin"
+    );
   }
+  try {
+    return normalizeControlPlaneOrigin(configuredUrl.trim());
+  } catch {
+    throw new ApiError(
+      503,
+      "control_plane_origin_missing",
+      "QUOTEOPS_CONTROL_PLANE_URL must be a normalized HTTPS origin"
+    );
+  }
+}
 
-  const forwardedProto = String(req.headers["x-forwarded-proto"] ?? "").split(",")[0]?.trim();
-  const proto = forwardedProto || req.protocol || "https";
-  const host = req.headers.host;
-  if (!host) {
-    return "http://localhost:19083";
-  }
-  return `${proto}://${host}`.replace(/\/+$/, "");
+function sha256(value: string | Uint8Array): string {
+  return crypto.createHash("sha256").update(value).digest("hex");
 }
 
 function asyncRoute(

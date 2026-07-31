@@ -1,8 +1,15 @@
+import { createHash } from "node:crypto";
 import {
   normalizeClientId,
   normalizeEmail,
+  parseInstallPack,
+  type InstallPack,
   type MinimalClientRecord
 } from "@quoteops/control-plane";
+import {
+  parseApplianceRelease,
+  type ApplianceRelease
+} from "@quoteops/shared";
 import { createFileControlPlaneData } from "./file.js";
 import { createPostgresControlPlaneData } from "./postgres.js";
 
@@ -14,6 +21,10 @@ export type RegistrationTokenRecord = {
   installation_id: string;
   expires_at: string;
   used_at: string | null;
+  release_version: string;
+  bundle_sha256: string;
+  install_pack_snapshot: InstallPack;
+  pack_sha256: string;
 };
 
 export type TenantToken = { tenant_id: string; installation_id: string };
@@ -47,7 +58,15 @@ export type UsageEventInput = {
   routes: number;
 };
 
-export type ReleaseRecord = { version: string; notes: string | null };
+export type ReleaseRecord = {
+  version: string;
+  notes: string | null;
+  bundle_sha256: string;
+  manifest: ApplianceRelease;
+  manifest_bytes: Uint8Array;
+  archive_bytes: Uint8Array;
+  published_at: string;
+};
 
 /**
  * The single control-plane persistence boundary. Client records are projected
@@ -68,6 +87,8 @@ export type ControlPlaneData = {
   insertSentinelReport(report: SentinelReportInput): MaybePromise<void>;
   recordUsage(event: UsageEventInput): MaybePromise<void>;
   latestRelease(): MaybePromise<ReleaseRecord | null>;
+  getRelease(version: string): MaybePromise<ReleaseRecord | null>;
+  upsertRelease(release: ReleaseRecord): MaybePromise<ReleaseRecord>;
   getInstallationSettings(installationId: string): MaybePromise<Record<string, unknown>>;
   touchInstallation(
     installationId: string,
@@ -118,7 +139,17 @@ export function createInMemoryControlPlaneData(seed: InMemoryControlPlaneDataSee
     ])
   );
   const tokens = new Map<string, StoredToken>();
-  const releases = [...(seed.releases ?? [])];
+  const releases = new Map<string, ReleaseRecord>();
+  for (const release of seed.releases ?? []) {
+    const valid = validateReleaseRecord(release);
+    const existingByHash = [...releases.values()].find(
+      (candidate) => candidate.bundle_sha256 === valid.bundle_sha256
+    );
+    if (existingByHash && existingByHash.version !== valid.version) {
+      throw new Error("release_bundle_immutable");
+    }
+    releases.set(valid.version, valid);
+  }
   const sentinelReports: Array<SentinelReportInput & { status: "new" }> = [];
   const usageEvents = new Map<string, UsageEventInput>();
   const profiles = new Map<string, PortalProfile>();
@@ -224,14 +255,15 @@ export function createInMemoryControlPlaneData(seed: InMemoryControlPlaneDataSee
       ) {
         throw new Error("installation_not_provisioned");
       }
-      tokens.set(token.token, { ...token, tenant_id: installation.tenant_id });
-      return token;
+      const valid = validateRegistrationTokenRecord(token);
+      tokens.set(valid.token, { ...cloneToken(valid), tenant_id: installation.tenant_id });
+      return cloneToken(valid);
     },
     getRegistrationToken(token: string): RegistrationTokenRecord | null {
       const record = tokens.get(token);
       if (!record) return null;
       const { tenant_id: _tenantId, ...publicRecord } = record;
-      return publicRecord;
+      return validateRegistrationTokenRecord(publicRecord);
     },
     markRegistrationTokenUsed(token: string, usedAt: string): void {
       const record = tokens.get(token);
@@ -241,6 +273,7 @@ export function createInMemoryControlPlaneData(seed: InMemoryControlPlaneDataSee
     resolveTenantByToken(token: string): TenantToken | null {
       const record = tokens.get(token);
       if (!record) return null;
+      validateRegistrationTokenRecord(record);
       // ponytail: after activation the used token is the installation's
       // long-lived credential; only unused tokens expire.
       if (!record.used_at && Date.parse(record.expires_at) <= Date.now()) return null;
@@ -277,8 +310,28 @@ export function createInMemoryControlPlaneData(seed: InMemoryControlPlaneDataSee
       usageEvents.set(`${event.tenant_id}|${event.day}|${event.channel}`, event);
     },
     latestRelease(): ReleaseRecord | null {
-      const version = maxSemver(releases.map((release) => release.version));
-      return releases.find((release) => release.version === version) ?? null;
+      const version = maxSemver([...releases.keys()]);
+      const release = version ? releases.get(version) : null;
+      return release ? validateReleaseRecord(release) : null;
+    },
+    getRelease(version: string): ReleaseRecord | null {
+      const release = releases.get(version);
+      return release ? validateReleaseRecord(release) : null;
+    },
+    upsertRelease(release: ReleaseRecord): ReleaseRecord {
+      const valid = validateReleaseRecord(release);
+      const current = releases.get(valid.version);
+      if (current && current.bundle_sha256 !== valid.bundle_sha256) {
+        throw new Error("release_version_immutable");
+      }
+      const existingByHash = [...releases.values()].find(
+        (candidate) => candidate.bundle_sha256 === valid.bundle_sha256
+      );
+      if (existingByHash && existingByHash.version !== valid.version) {
+        throw new Error("release_bundle_immutable");
+      }
+      if (!current) releases.set(valid.version, valid);
+      return validateReleaseRecord(current ?? valid);
     },
     getInstallationSettings(installationId: string): Record<string, unknown> {
       return installations.get(installationId)?.settings ?? {};
@@ -298,6 +351,134 @@ export function createInMemoryControlPlaneData(seed: InMemoryControlPlaneDataSee
   } satisfies ControlPlaneData & Record<string, unknown>;
 
   return data;
+}
+
+export const MAX_RELEASE_ARCHIVE_BYTES = 2 * 1024 * 1024;
+
+export function canonicalizeInstallPack(value: unknown): string {
+  return canonicalizeJson(parseInstallPack(value));
+}
+
+export function canonicalizeJson(value: unknown): string {
+  if (value === null) return "null";
+  if (typeof value === "string" || typeof value === "boolean") {
+    return JSON.stringify(value);
+  }
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) throw new Error("canonical_json_non_finite_number");
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) {
+    return `[${value.map((entry) => canonicalizeJson(entry)).join(",")}]`;
+  }
+  if (typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    const prototype = Object.getPrototypeOf(record);
+    if (prototype !== Object.prototype && prototype !== null) {
+      throw new Error("canonical_json_non_plain_object");
+    }
+    return `{${Object.keys(record)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${canonicalizeJson(record[key])}`)
+      .join(",")}}`;
+  }
+  throw new Error("canonical_json_unsupported_value");
+}
+
+export function validateRegistrationTokenRecord(
+  record: RegistrationTokenRecord
+): RegistrationTokenRecord {
+  if (
+    !record ||
+    typeof record.release_version !== "string" ||
+    typeof record.bundle_sha256 !== "string" ||
+    !record.install_pack_snapshot ||
+    typeof record.pack_sha256 !== "string"
+  ) {
+    throw new Error("registration_token_reissue_required");
+  }
+  const snapshot = parseInstallPack(record.install_pack_snapshot);
+  const canonical = canonicalizeInstallPack(snapshot);
+  const packSha256 = sha256(canonical);
+  if (!/^[a-f0-9]{64}$/.test(record.pack_sha256) || packSha256 !== record.pack_sha256) {
+    throw new Error("install_pack_hash_mismatch");
+  }
+  if (
+    snapshot.client_id !== record.client_id ||
+    snapshot.installation_id !== record.installation_id ||
+    snapshot.expires_at !== record.expires_at ||
+    snapshot.release.version !== record.release_version ||
+    snapshot.release.bundle_sha256 !== record.bundle_sha256
+  ) {
+    throw new Error("install_pack_token_mismatch");
+  }
+  if (
+    !/^v\d+\.\d+\.\d+$/.test(record.release_version) ||
+    !/^[a-f0-9]{64}$/.test(record.bundle_sha256)
+  ) {
+    throw new Error("registration_token_release_pin_invalid");
+  }
+  if (record.token && canonical.includes(record.token)) {
+    throw new Error("install_pack_contains_registration_token");
+  }
+  return {
+    ...record,
+    install_pack_snapshot: parseInstallPack(
+      JSON.parse(JSON.stringify(snapshot)) as unknown
+    )
+  };
+}
+
+export function validateReleaseRecord(record: ReleaseRecord): ReleaseRecord {
+  if (
+    !record ||
+    !(record.manifest_bytes instanceof Uint8Array) ||
+    !(record.archive_bytes instanceof Uint8Array)
+  ) {
+    throw new Error("release_bytes_required");
+  }
+  if (record.archive_bytes.byteLength > MAX_RELEASE_ARCHIVE_BYTES) {
+    throw new Error("release_archive_too_large");
+  }
+  if (
+    !/^[a-f0-9]{64}$/.test(record.bundle_sha256) ||
+    sha256(record.archive_bytes) !== record.bundle_sha256
+  ) {
+    throw new Error("release_bundle_hash_mismatch");
+  }
+  let parsedManifestBytes: unknown;
+  try {
+    parsedManifestBytes = JSON.parse(
+      Buffer.from(record.manifest_bytes).toString("utf8")
+    ) as unknown;
+  } catch {
+    throw new Error("release_manifest_bytes_invalid");
+  }
+  const manifestFromBytes = parseApplianceRelease(parsedManifestBytes);
+  const manifest = parseApplianceRelease(record.manifest);
+  if (
+    canonicalizeJson(manifestFromBytes) !== canonicalizeJson(manifest) ||
+    manifest.version !== record.version
+  ) {
+    throw new Error("release_manifest_mismatch");
+  }
+  if (!Number.isFinite(Date.parse(record.published_at))) {
+    throw new Error("release_published_at_invalid");
+  }
+  return {
+    ...record,
+    manifest,
+    manifest_bytes: Uint8Array.from(record.manifest_bytes),
+    archive_bytes: Uint8Array.from(record.archive_bytes)
+  };
+}
+
+function cloneToken(record: RegistrationTokenRecord): RegistrationTokenRecord {
+  return validateRegistrationTokenRecord(record);
+}
+
+function sha256(value: string | Uint8Array): string {
+  return createHash("sha256").update(value).digest("hex");
 }
 
 export function compareSemver(a: string, b: string): number {

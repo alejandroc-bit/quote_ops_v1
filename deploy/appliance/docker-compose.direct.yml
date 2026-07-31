@@ -1,0 +1,4 @@
+services:
+  caddy:
+    ports:
+      - "127.0.0.1:${QUOTEOPS_HTTP_PORT:-8080}:80"

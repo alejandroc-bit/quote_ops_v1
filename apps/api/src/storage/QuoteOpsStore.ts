@@ -102,6 +102,7 @@ export type QuoteOpsStore = {
   getRun(runId: string): Promise<AgentRun | null>;
   getSteps(runId: string): Promise<StepEvent[]>;
   claimRunForResume(runId: string): Promise<boolean>;
+  claimAgentRunForResume(runId: string, decision: ApprovalDecision): Promise<boolean>;
 };
 
 export type WorkflowRunProjectionOptions = {

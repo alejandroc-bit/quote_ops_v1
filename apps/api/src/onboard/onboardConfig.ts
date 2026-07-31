@@ -1,12 +1,42 @@
-import { chmod, readFile, writeFile } from "node:fs/promises";
+import {
+  chmod,
+  lstat,
+  mkdir,
+  open,
+  readFile,
+  realpath,
+  rename,
+  stat,
+  writeFile
+} from "node:fs/promises";
+import { constants } from "node:fs";
+import { createHash } from "node:crypto";
+import {
+  basename,
+  dirname,
+  isAbsolute,
+  relative,
+  resolve,
+  sep
+} from "node:path";
+import { TextDecoder } from "node:util";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 import type {
   ProfitabilityRbBracket,
   QuoteManifest,
   QuoteVehicleProfile
 } from "@quoteops/quote-core";
-import type { TmsCanonicalPerformance } from "@quoteops/contracts";
+import {
+  TMS_HTTP_V1_CONTRACT,
+  TMS_HTTP_V1_PATHS,
+  type TmsCanonicalPerformance
+} from "@quoteops/contracts";
 import type { ManifestAuthorization } from "./wizardSteps.js";
+import {
+  OnboardingError,
+  type OnboardingContext,
+  type SecretFileRef
+} from "./onboardingFlow.js";
 
 // Pure config builders for the onboarding CLI. Kept side-effect free (except the
 // thin file wrappers) so the risky logic — secret escaping, TMS yaml, profile
@@ -19,7 +49,7 @@ import type { ManifestAuthorization } from "./wizardSteps.js";
  */
 export function upsertEnvLine(contents: string, key: string, value: string): string {
   if (!/^[A-Z_][A-Z0-9_]*$/.test(key)) throw new Error(`invalid secret key: ${key}`);
-  if (value.includes("\n")) throw new Error("secret values cannot contain newlines");
+  if (/[\r\n]/.test(value)) throw new Error("secret values cannot contain newlines");
   const escaped = value
     .replace(/\\/g, "\\\\")
     .replace(/"/g, '\\"')
@@ -33,9 +63,299 @@ export function upsertEnvLine(contents: string, key: string, value: string): str
 }
 
 export async function writeSecret(file: string, key: string, value: string): Promise<void> {
+  await updateAllowedEnv(file, { [key]: value }, [key]);
+}
+
+const MAX_SECRET_BYTES = 16 * 1024;
+const SECRET_CONTROL_CHARACTERS = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/;
+
+/**
+ * Load a credential without ever copying it back into the parsed answer object.
+ * File inputs are deliberately stricter than normal config files: a regular,
+ * non-symlink 0600 file, owned by root or the invoking uid, under answersRoot.
+ */
+export async function readSingleLineSecret(
+  input: string | SecretFileRef,
+  context?: Pick<OnboardingContext, "answersRoot" | "afterSecretOpen">
+): Promise<string> {
+  if (typeof input === "string") return validateSingleLineSecret(input);
+  const requested = resolve(input.file);
+  let canonicalRoot: string | undefined;
+  let canonicalParentBefore: string | undefined;
+  if (context?.answersRoot) {
+    try {
+      [canonicalRoot, canonicalParentBefore] = await Promise.all([
+        realpath(resolve(context.answersRoot)),
+        realpath(dirname(requested))
+      ]);
+    } catch {
+      throw new OnboardingError("secret_file_unsafe");
+    }
+    if (!isPathInside(canonicalRoot, canonicalParentBefore)) {
+      throw new OnboardingError("secret_file_unsafe");
+    }
+  }
+
+  let handle;
+  try {
+    handle = await open(
+      requested,
+      constants.O_RDONLY | constants.O_NOFOLLOW
+    );
+  } catch {
+    throw new OnboardingError("secret_file_unsafe");
+  }
+  try {
+    await context?.afterSecretOpen?.();
+    const metadata = await handle.stat();
+    const invokingUid =
+      typeof process.getuid === "function" ? process.getuid() : metadata.uid;
+    if (
+      !metadata.isFile() ||
+      (metadata.mode & 0o777) !== 0o600 ||
+      (metadata.uid !== 0 && metadata.uid !== invokingUid)
+    ) {
+      throw new OnboardingError("secret_file_unsafe");
+    }
+    if (metadata.size > MAX_SECRET_BYTES) {
+      throw new OnboardingError("secret_invalid");
+    }
+
+    let pathMetadata;
+    let canonicalRequested: string;
+    let canonicalParentAfter: string;
+    try {
+      [pathMetadata, canonicalRequested, canonicalParentAfter] =
+        await Promise.all([
+          lstat(requested),
+          realpath(requested),
+          realpath(dirname(requested))
+        ]);
+    } catch {
+      throw new OnboardingError("secret_file_unsafe");
+    }
+    if (
+      pathMetadata.isSymbolicLink() ||
+      !pathMetadata.isFile() ||
+      pathMetadata.dev !== metadata.dev ||
+      pathMetadata.ino !== metadata.ino ||
+      canonicalRequested !== resolve(canonicalParentAfter, basename(requested)) ||
+      (canonicalParentBefore !== undefined &&
+        canonicalParentAfter !== canonicalParentBefore) ||
+      (canonicalRoot !== undefined &&
+        (!isPathInside(canonicalRoot, canonicalParentAfter) ||
+          !isPathInside(canonicalRoot, canonicalRequested)))
+    ) {
+      throw new OnboardingError("secret_file_unsafe");
+    }
+
+    const bytes = Buffer.alloc(MAX_SECRET_BYTES + 1);
+    let offset = 0;
+    while (offset < bytes.length) {
+      const { bytesRead } = await handle.read(
+        bytes,
+        offset,
+        bytes.length - offset,
+        offset
+      );
+      if (bytesRead === 0) break;
+      offset += bytesRead;
+    }
+    if (offset > MAX_SECRET_BYTES) {
+      throw new OnboardingError("secret_invalid");
+    }
+    let decoded: string;
+    try {
+      decoded = new TextDecoder("utf-8", { fatal: true }).decode(
+        bytes.subarray(0, offset)
+      );
+    } catch {
+      throw new OnboardingError("secret_invalid");
+    }
+    return validateSingleLineSecret(decoded);
+  } finally {
+    await handle.close().catch(() => undefined);
+  }
+}
+
+function isPathInside(root: string, candidate: string): boolean {
+  const pathFromRoot = relative(root, candidate);
+  return !(
+    pathFromRoot === ".." ||
+    pathFromRoot.startsWith(`..${sep}`) ||
+    isAbsolute(pathFromRoot)
+  );
+}
+
+export function validateSingleLineSecret(value: string): string {
+  if (Buffer.byteLength(value, "utf8") > MAX_SECRET_BYTES) {
+    throw new OnboardingError("secret_invalid");
+  }
+  const normalized = value.endsWith("\n") ? value.slice(0, -1) : value;
+  if (
+    normalized.length === 0 ||
+    normalized.includes("\n") ||
+    normalized.includes("\r") ||
+    SECRET_CONTROL_CHARACTERS.test(normalized) ||
+    normalized.trim() !== normalized
+  ) {
+    throw new OnboardingError("secret_invalid");
+  }
+  return normalized;
+}
+
+export function validateTmsBaseUrl(
+  value: string,
+  acceptanceMode?: string
+): string {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new OnboardingError("tms_base_url_invalid");
+  }
+  if (
+    url.username ||
+    url.password ||
+    url.pathname !== "/" ||
+    url.search ||
+    url.hash
+  ) {
+    throw new OnboardingError("tms_base_url_invalid");
+  }
+  const origin = url.origin;
+  const macbookAcceptanceOrigin = "http://host.docker.internal:19091";
+  if (
+    url.protocol !== "https:" &&
+    !(
+      acceptanceMode === "macbook" &&
+      origin === macbookAcceptanceOrigin
+    )
+  ) {
+    throw new OnboardingError("tms_base_url_invalid");
+  }
+  return origin;
+}
+
+/**
+ * Atomically merge a bounded set of env keys. All values are validated before
+ * the original file is read, so a rejected value cannot cause a partial write.
+ * null removes a key, which is used to guarantee exact active-provider keys.
+ */
+export async function updateAllowedEnv(
+  file: string,
+  updates: Record<string, string | null | undefined>,
+  allowlist: readonly string[],
+  afterRename?: () => void | Promise<void>
+): Promise<void> {
+  const allowed = new Set(allowlist);
+  const validated = new Map<string, string | null>();
+  for (const [key, value] of Object.entries(updates)) {
+    if (!allowed.has(key) || !/^[A-Z_][A-Z0-9_]*$/.test(key)) {
+      throw new OnboardingError("secret_env_key_invalid");
+    }
+    validated.set(
+      key,
+      value === null || value === undefined
+        ? null
+        : validateSingleLineSecret(value)
+    );
+  }
+
   const current = await readFile(file, "utf8").catch(() => "");
-  await writeFile(file, upsertEnvLine(current, key, value), "utf8");
-  await chmod(file, 0o600);
+  const retained = current.split(/\r?\n/).filter((line) => {
+    const match =
+      /^\s*export\s+([A-Z_][A-Z0-9_]*)=/.exec(line) ??
+      /^\s*([A-Z_][A-Z0-9_]*)=/.exec(line);
+    return !match?.[1] || !validated.has(match[1]);
+  });
+  while (retained.at(-1) === "") retained.pop();
+  for (const [key, value] of validated) {
+    if (value !== null) retained.push(serializeEnvLine(key, value));
+  }
+  await atomicWriteText(file, `${retained.join("\n")}${retained.length ? "\n" : ""}`, {
+    mode: 0o600,
+    afterRename
+  });
+}
+
+export async function readEnvFileValues(
+  file: string
+): Promise<Map<string, string>> {
+  const values = new Map<string, string>();
+  const contents = await readFile(file, "utf8").catch(() => "");
+  for (const line of contents.split(/\r?\n/)) {
+    const match =
+      /^\s*export\s+([A-Z_][A-Z0-9_]*)=(.*)$/.exec(line) ??
+      /^\s*([A-Z_][A-Z0-9_]*)=(.*)$/.exec(line);
+    if (!match?.[1]) continue;
+    values.set(match[1], parseEnvValue(match[2] ?? ""));
+  }
+  return values;
+}
+
+export async function atomicWriteJson(
+  file: string,
+  value: unknown,
+  options: {
+    mode?: number;
+    afterRename?: () => void | Promise<void>;
+  } = {}
+): Promise<void> {
+  await atomicWriteText(file, `${JSON.stringify(value, null, 2)}\n`, options);
+}
+
+export async function atomicWriteText(
+  file: string,
+  contents: string,
+  options: {
+    mode?: number;
+    afterRename?: () => void | Promise<void>;
+  } = {}
+): Promise<void> {
+  const mode = options.mode ?? 0o600;
+  await mkdir(dirname(file), { recursive: true, mode: 0o700 });
+  const temporary = `${file}.tmp-${process.pid}-${Math.random()
+    .toString(16)
+    .slice(2)}`;
+  await writeFile(temporary, contents, { encoding: "utf8", mode });
+  await chmod(temporary, mode);
+  await rename(temporary, file);
+  await chmod(file, mode);
+  if (!(await stat(file)).isFile()) {
+    throw new OnboardingError("atomic_write_failed");
+  }
+  await options.afterRename?.();
+}
+
+export async function sha256File(file: string): Promise<string> {
+  return createHash("sha256").update(await readFile(file)).digest("hex");
+}
+
+function serializeEnvLine(key: string, value: string): string {
+  const escaped = value
+    .replace(/\\/g, "\\\\")
+    .replace(/"/g, '\\"')
+    .replace(/\$/g, "\\$")
+    .replace(/`/g, "\\`");
+  return `${key}="${escaped}"`;
+}
+
+function parseEnvValue(value: string): string {
+  const trimmed = value.trim();
+  if (trimmed.startsWith('"') && trimmed.endsWith('"')) {
+    return trimmed
+      .slice(1, -1)
+      .replace(/\\\\/g, "\u0000")
+      .replace(/\\"/g, '"')
+      .replace(/\\\$/g, "$")
+      .replace(/\\`/g, "`")
+      .replace(/\u0000/g, "\\");
+  }
+  if (trimmed.startsWith("'") && trimmed.endsWith("'")) {
+    return trimmed.slice(1, -1);
+  }
+  return trimmed;
 }
 
 /** Preserve the tool policy while persisting the onboarding approver identity. */
@@ -67,7 +387,15 @@ export type TmsAdapterYamlInput =
   | {
       provider: "http";
       base_url_env: string;
-      endpoints?: Record<string, string>;
+      contract?: undefined;
+      endpoints: Record<string, string>;
+      headers?: Record<string, string>;
+    }
+  | {
+      provider: "http";
+      contract: typeof TMS_HTTP_V1_CONTRACT;
+      base_url_env: string;
+      api_key_env: string;
     }
   | {
       provider: "sql";
@@ -98,10 +426,30 @@ export function buildTmsAdapterYaml(input: TmsAdapterYamlInput): string {
     return stringifyYaml(FILE_IMPORT_DEFAULTS);
   }
   if (input.provider === "http") {
+    if (input.contract === TMS_HTTP_V1_CONTRACT) {
+      return stringifyYaml({
+        provider: "http",
+        contract: TMS_HTTP_V1_CONTRACT,
+        base_url_env: input.base_url_env,
+        headers: {
+          authorization: `Bearer \${${input.api_key_env}}`
+        },
+        health_endpoint_path: TMS_HTTP_V1_PATHS.health,
+        search_historical_quotes_endpoint_path:
+          TMS_HTTP_V1_PATHS.historical_quotes,
+        get_units_endpoint_path: TMS_HTTP_V1_PATHS.units,
+        get_unit_performance_endpoint_path:
+          TMS_HTTP_V1_PATHS.unit_performance,
+        get_availability_zones_endpoint_path:
+          TMS_HTTP_V1_PATHS.availability_zones,
+        write_quote_endpoint_path: TMS_HTTP_V1_PATHS.write_quote
+      });
+    }
     return stringifyYaml({
       provider: "http",
       base_url_env: input.base_url_env,
-      ...(input.endpoints ?? {})
+      ...(input.headers ? { headers: input.headers } : {}),
+      ...input.endpoints
     });
   }
   return stringifyYaml({

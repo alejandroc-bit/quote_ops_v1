@@ -1,17 +1,41 @@
 import { spawnSync } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import { parse as parseYaml } from "yaml";
+import type { PublishedApplianceRelease } from "@quoteops/shared";
 import {
   createInstallPack,
-  createMinimalClientRecord
+  createMinimalClientRecord,
+  normalizeControlPlaneOrigin
 } from "../src/index";
 
 const tempDirs: string[] = [];
 const repoDir = fileURLToPath(new URL("../../../", import.meta.url));
+const release: PublishedApplianceRelease = {
+  manifest: {
+    schema_version: 1,
+    version: "v0.2.0",
+    git_sha: "b".repeat(40),
+    platform: "linux/amd64",
+    images: {
+      agent: `quoteops-agent:v0.2.0@sha256:${"1".repeat(64)}`,
+      api: `quoteops-api:v0.2.0@sha256:${"2".repeat(64)}`,
+      web: `quoteops-web:v0.2.0@sha256:${"3".repeat(64)}`,
+      postgres: `postgres:16@sha256:${"4".repeat(64)}`,
+      redis: `redis:7@sha256:${"5".repeat(64)}`,
+      caddy: `caddy:2@sha256:${"6".repeat(64)}`,
+      cloudflared: `cloudflare/cloudflared:2025.7.0@sha256:${"7".repeat(64)}`
+    },
+    files_sha256: {
+      "install.sh": "8".repeat(64)
+    },
+    created_at: "2026-06-25T12:00:00.000Z"
+  },
+  bundle_sha256: "a".repeat(64)
+};
 
 afterEach(async () => {
   await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
@@ -30,13 +54,48 @@ describe("generated install pack", () => {
       client,
       control_plane_url: "https://quoteops-control-plane.vercel.app/",
       registration_token: "registration-token-install-test",
-      expires_at: "2026-06-25T13:00:00.000Z"
+      expires_at: "2026-06-25T13:00:00.000Z",
+      release
     });
     const workDir = await mkdtemp(join(tmpdir(), "quoteops-generated-pack-"));
     tempDirs.push(workDir);
     const packDir = join(workDir, "pack");
     const homeDir = join(workDir, "home");
+    const mockBinDir = join(workDir, "bin");
+    await mkdir(mockBinDir, { recursive: true });
+    await writeFile(
+      join(mockBinDir, "docker"),
+      `#!/usr/bin/env bash
+if [[ "$1" == "volume" && "\${2:-}" == "inspect" ]]; then
+  exit 1
+fi
+if [[ "$1" == "volume" && "\${2:-}" == "ls" ]]; then
+  exit 0
+fi
+exit 1
+`,
+      "utf8"
+    );
+    await chmod(join(mockBinDir, "docker"), 0o755);
 
+    expect(pack.files["connectors/knowledge/README.md"]).toContain(
+      "documentos de conocimiento"
+    );
+    expect(pack.files["connectors/knowledge/README.md"]).toContain(
+      "consentimiento"
+    );
+    expect(pack.files["connectors/tms-http-v1.openapi.yaml"]).toBe(
+      await readFile(
+        join(repoDir, "docs/integrations/tms-http-v1.openapi.yaml"),
+        "utf8"
+      )
+    );
+    expect(pack.files["connectors/tms-http-v1.md"]).toBe(
+      await readFile(
+        join(repoDir, "docs/integrations/tms-http-v1.md"),
+        "utf8"
+      )
+    );
     await materializeFiles(packDir, pack.files);
     const result = spawnSync(
       "bash",
@@ -62,7 +121,11 @@ describe("generated install pack", () => {
       ],
       {
         cwd: packDir,
-        encoding: "utf8"
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          PATH: `${mockBinDir}:${process.env.PATH ?? ""}`
+        }
       }
     );
 
@@ -85,6 +148,49 @@ describe("generated install pack", () => {
     expect(installedAgentConfig).toContain("api_key_env: OPENROUTER_API_KEY");
     expect(installedTmsAdapter).toContain("provider: file_import");
     expect(installedRfqs).toContain("rfq_id,lane_id");
+    const generatedManifest = parseYaml(
+      pack.files["client-manifest.yaml"]!
+    ) as {
+      business_units: Array<{
+        business_unit_id: string;
+        default: boolean;
+      }>;
+      vehicle_profiles: Array<{
+        vehicle_profile_id: string;
+        business_unit_id: string;
+        pricing_model: string;
+        margin_target_pct: number;
+        minimum_margin_pct: number;
+      }>;
+    };
+    expect(generatedManifest.business_units).toContainEqual(
+      expect.objectContaining({
+        business_unit_id: "general",
+        default: true
+      })
+    );
+    expect(generatedManifest.vehicle_profiles).toContainEqual(
+      expect.objectContaining({
+        vehicle_profile_id: "T3S3_53_DRYVAN",
+        business_unit_id: "general",
+        pricing_model: "profitability",
+        margin_target_pct: 0.2,
+        minimum_margin_pct: 0.12
+      })
+    );
+    expect(pack.release).toEqual({
+      version: "v0.2.0",
+      bundle_sha256: "a".repeat(64)
+    });
+    expect(pack.install_command).toContain(
+      'curl --proto "=https" --proto-redir "=https" --tlsv1.2'
+    );
+    expect(pack.install_command).toContain(
+      `${pack.control_plane_url}/install/quoteops`
+    );
+    expect(pack.install_command).toContain("sudo bash");
+    expect(pack.install_command).not.toContain("|");
+    expect(pack.install_command).not.toContain(pack.registration_token);
 
     // 10-jul E2E regression: the pack shipped without the unit CSVs and
     // sync-units died with "env var is missing: QUOTEOPS_TMS_UNITS_PATH".
@@ -136,3 +242,29 @@ async function materializeFiles(rootDir: string, files: Record<string, string>):
     await writeFile(target, contents, "utf8");
   }
 }
+
+describe("control plane origin normalization", () => {
+  it("rejects http://localhost without the opt-in flag", () => {
+    expect(() =>
+      normalizeControlPlaneOrigin("http://localhost:19083/")
+    ).toThrow("control_plane_origin_invalid");
+  });
+
+  it("accepts http://127.0.0.1 only with allowLocal", () => {
+    expect(normalizeControlPlaneOrigin("http://127.0.0.1:19083/", { allowLocal: true })).toBe(
+      "http://127.0.0.1:19083"
+    );
+    expect(() =>
+      normalizeControlPlaneOrigin("http://127.0.0.1:19083/")
+    ).toThrow("control_plane_origin_invalid");
+  });
+
+  it("still normalizes https origins regardless of the flag", () => {
+    expect(normalizeControlPlaneOrigin("https://quoteops-control-plane.vercel.app/")).toBe(
+      "https://quoteops-control-plane.vercel.app"
+    );
+    expect(
+      normalizeControlPlaneOrigin("https://quoteops-control-plane.vercel.app/", { allowLocal: true })
+    ).toBe("https://quoteops-control-plane.vercel.app");
+  });
+});

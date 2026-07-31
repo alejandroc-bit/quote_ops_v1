@@ -1,9 +1,14 @@
-# TMS vía API HTTP (ejemplo: el mock TMS de este directorio).
+# TMS vía el contrato HTTP v1 (mock de este directorio).
 # Instalar con: install.sh --tms-adapter-config deploy/appliance/mock-tms/tms-adapter.http.yaml
-# y exportar QUOTEOPS_TMS_BASE_URL en el env/secretos del appliance, p.ej.:
-#   http://mock-tms:8099   (contenedor en la misma red compose)
-#   http://172.17.0.1:8099 (mock corriendo en el host del VPS)
+# TMS_HTTP_BASE_URL y TMS_API_KEY viven únicamente en client.env.
 provider: http
-base_url_env: QUOTEOPS_TMS_BASE_URL
-write_quote_endpoint_path: /quotes
-write_status_endpoint_path: /status
+contract: quoteops-tms-http-v1
+base_url_env: TMS_HTTP_BASE_URL
+headers:
+  authorization: Bearer ${TMS_API_KEY}
+health_endpoint_path: /quoteops/v1/health
+search_historical_quotes_endpoint_path: /quoteops/v1/historical-quotes/search
+get_units_endpoint_path: /quoteops/v1/units
+get_unit_performance_endpoint_path: /quoteops/v1/unit-performance
+get_availability_zones_endpoint_path: /quoteops/v1/availability-zones
+write_quote_endpoint_path: /quoteops/v1/quotes

@@ -1,4 +1,14 @@
-import { access, mkdir, readFile, readdir, rename, unlink, writeFile } from "node:fs/promises";
+import {
+  access,
+  lstat,
+  mkdir,
+  readFile,
+  readdir,
+  rename,
+  unlink,
+  writeFile
+} from "node:fs/promises";
+import { createHash } from "node:crypto";
 import { dirname, join } from "node:path";
 import express, { type Express, type Request, type Response } from "express";
 import cors from "cors";
@@ -9,14 +19,21 @@ import {
   type QuoteWorkflowState,
   type QuoteWorkflowTools,
   type QuoteAgentRuntime,
-  type AgentGraphResult
+  type AgentGraphResult,
+  mailboxCredentialsPresent
 } from "@quoteops/agent";
 import type { Rfq } from "@quoteops/contracts";
 import {
   verifyInstallationLicense,
   type InstallationLicense
 } from "@quoteops/shared";
-import { loadTmsAdapterConfig, tmsMappingConfigSchema } from "@quoteops/connectors";
+import {
+  loadAgentRuntimeConfig,
+  createTmsAdapterFromConfig,
+  loadTmsAdapterConfig,
+  tmsMappingConfigSchema,
+  type AgentRuntimeConfig
+} from "@quoteops/connectors";
 import { ingestKnowledgeDocument } from "@quoteops/knowledge";
 import { applyApprovalDecision } from "./approval/applyApprovalDecision.js";
 import {
@@ -40,11 +57,93 @@ import type {
   QuoteOpsStore,
   WorkflowRunSummary
 } from "./storage/QuoteOpsStore.js";
+import { matchesCloudflarePublicReceipt } from "./onboard/cloudflarePublicReceipt.js";
+import { hasMatchingTmsProbeReceipt } from "./onboard/tmsProbe.js";
 
 export { createApplianceWorkflowTools, loadApplianceManifest } from "./runtimeTools.js";
 export { createInMemoryQuoteOpsStore } from "./storage/InMemoryQuoteOpsStore.js";
 export { createQuoteOpsStore } from "./storage/createQuoteOpsStore.js";
 export { PostgresQuoteOpsStore } from "./storage/PostgresQuoteOpsStore.js";
+export {
+  createFileOnboardingStateStore,
+  onboardingAnswersSchema,
+  parseOnboardingAnswers,
+  parseOnboardingSelection,
+  readOnboardingAnswersFile,
+  runOnboarding,
+  OnboardingError
+} from "./onboard/onboardingFlow.js";
+export type {
+  OnboardPaths,
+  OnboardingAnswers,
+  OnboardingAuditState,
+  OnboardingContext,
+  OnboardingFileRef,
+  OnboardingIo,
+  OnboardingPhase,
+  OnboardingPhaseId,
+  OnboardingPhaseSelection,
+  OnboardingResult,
+  OnboardingStateStore,
+  RunOnboardingInput,
+  SecretFileRef
+} from "./onboard/onboardingFlow.js";
+export {
+  aiProviderPhase,
+  configureAiProvider,
+  isAiProviderComplete,
+  validateAiProviderCredential
+} from "./onboard/aiProviderStep.js";
+export type {
+  AiProviderValidationReceipt,
+  ConfigureAiProviderInput,
+  OnboardingAiConfig
+} from "./onboard/aiProviderStep.js";
+export {
+  activateLicenseFromOnboarding,
+  activationOnboardingResponseSchema,
+  licenseActivationPhase,
+  ONBOARD_INTERNAL_API_ORIGIN
+} from "./onboard/licenseActivationStep.js";
+export {
+  deterministicReadinessRunId,
+  readinessRfqRequest,
+  requestSha256ForReadinessRfq,
+  runTestRfqPhase,
+  testRfqPhase
+} from "./onboard/testRfqStep.js";
+export type { TestRfqReceipt } from "./onboard/testRfqStep.js";
+export {
+  cloudflarePhase,
+  configureCloudflareTunnel,
+  readCloudflareConfig,
+  validatePublicHostname
+} from "./onboard/cloudflareStep.js";
+export {
+  hasMatchingTmsProbeReceipt,
+  probeLegacyCustomHttp,
+  probeTmsHttpV1,
+  TmsProbeError
+} from "./onboard/tmsProbe.js";
+export type {
+  LegacyCustomHttpProbeReceipt,
+  TmsHttpV1ProbeReceipt,
+  TmsProbeInput,
+  TmsProbeReceipt
+} from "./onboard/tmsProbe.js";
+export type {
+  CloudflareTunnelConfig,
+  ConfigureCloudflareTunnelInput
+} from "./onboard/cloudflareStep.js";
+export {
+  applianceSecretsPhase,
+  configureApplianceSecrets,
+  isApplianceSecretsComplete,
+  knowledgePhase,
+  listKnowledgeSourceFiles,
+  runKnowledgeIngestion,
+  stageKnowledgeSources
+} from "./onboard/applianceSecretsStep.js";
 export type {
   ApplianceHeartbeat,
   ApprovalDecision,
@@ -57,17 +156,39 @@ export type QuoteOpsApiDependencies = {
   defaultManifest: Promise<QuoteManifest | null>;
   store: QuoteOpsStore;
   graphRuntime: Pick<QuoteAgentRuntime, "resume">;
+  tunnelReadinessProbe: TunnelReadinessProbe;
 };
 
 export type SetupStepId =
   | "activate_license"
   | "configure_secrets"
+  | "connect_cloudflare"
   | "connect_tms"
   | "map_tms"
   | "connect_knowledge_base"
   | "connect_mailbox"
   | "connect_sakbe"
   | "run_test_rfq";
+
+export type TunnelSetupState = {
+  provider: "cloudflare";
+  required: true;
+  status:
+    | "missing_config"
+    | "missing_token"
+    | "starting"
+    | "ready"
+    | "unreachable"
+    | "access_unprotected"
+    | "pending_manual_public_validation";
+  public_hostname: string | null;
+  last_checked_at: string;
+};
+
+export type TunnelReadinessProbe = {
+  getHaConnections(): Promise<number>;
+  fetchPublic(url: URL, init: RequestInit): Promise<globalThis.Response>;
+};
 
 export type LocalSetupState = {
   activation: {
@@ -76,8 +197,11 @@ export type LocalSetupState = {
     client_id: string | null;
     installation_id: string | null;
   };
+  tunnel: TunnelSetupState;
   required_steps: SetupStepId[];
 };
+
+const DEFAULT_AGENT_CONFIG_PATH = "/opt/quoteops-v1/connectors/agent/agent-config.yaml";
 
 export function createQuoteOpsApi(
   dependencies: Partial<QuoteOpsApiDependencies> = {}
@@ -106,7 +230,8 @@ export function createQuoteOpsApi(
       await buildLocalSetupState({
         env: process.env,
         manifest,
-        testRfqReady
+        testRfqReady,
+        tunnelReadinessProbe: dependencies.tunnelReadinessProbe
       })
     );
   }));
@@ -278,8 +403,24 @@ export function createQuoteOpsApi(
       return;
     }
 
-    const rawRfq = buildPlaygroundRfq(request, manifest);
     const runId = request.run_id ?? createPlaygroundRunId(manifest.client_id);
+    const requestFingerprint = playgroundRequestFingerprint(request);
+    const existing = await store.getWorkflowRun(runId);
+    if (existing) {
+      const storedFingerprint = (
+        existing as QuoteWorkflowState & {
+          playground_request_fingerprint?: string;
+        }
+      ).playground_request_fingerprint;
+      if (storedFingerprint !== requestFingerprint) {
+        res.status(409).json({ error: "playground_run_conflict" });
+        return;
+      }
+      res.status(202).json(playgroundSubmissionResponse(existing));
+      return;
+    }
+
+    const rawRfq = buildPlaygroundRfq(request, manifest);
     const input = await withDefaultTools(
       {
         run_id: runId,
@@ -302,20 +443,24 @@ export function createQuoteOpsApi(
       intakePlanner: "completed",
       normalizer: "pending"
     };
+    (
+      queuedRun as QuoteWorkflowState & {
+        playground_request_fingerprint?: string;
+      }
+    ).playground_request_fingerprint = requestFingerprint;
     await store.saveWorkflowRun(queuedRun);
     void workflowRunner(input)
-      .then((result) => store.saveWorkflowRun(result))
+      .then((result) => {
+        (
+          result as QuoteWorkflowState & {
+            playground_request_fingerprint?: string;
+          }
+        ).playground_request_fingerprint = requestFingerprint;
+        return store.saveWorkflowRun(result);
+      })
       .catch((error) => store.saveWorkflowRun(failedPlaygroundRun(queuedRun, error)));
 
-    res.status(202).json({
-      run_id: queuedRun.run_id,
-      rfq_id: queuedRun.raw_rfq.rfq_id,
-      status: "RECEIVED",
-      approval_required: false,
-      route_source: null,
-      base_rate_mxn: null,
-      recommended_rate_mxn: null
-    });
+    res.status(202).json(playgroundSubmissionResponse(queuedRun));
   }));
 
   app.get("/api/workflow-state/:runId", asyncRoute(async (req, res) => {
@@ -349,7 +494,7 @@ export function createQuoteOpsApi(
         return;
       }
       const decision = parseApprovalDecision(req.body);
-      if (!(await store.claimRunForResume(runId))) {
+      if (!(await store.claimAgentRunForResume(runId, decision))) {
         res.status(409).json({ error: "run_not_waiting_approval" });
         return;
       }
@@ -357,7 +502,6 @@ export function createQuoteOpsApi(
         action: decision.action,
         ...(decision.rate_mxn !== undefined ? { rate_mxn: decision.rate_mxn } : {})
       }, { alreadyClaimed: true });
-      await store.saveApprovalDecision(runId, decision);
       res.json({
         run_id: runId,
         approval_decision: decision,
@@ -521,10 +665,11 @@ async function runControlPlaneMinimalSync({
   }
 
   const testRfqReady = await hasPassingTestRfq(workflowRuns, store);
-  const setup = await buildLocalSetupState({ env, manifest, testRfqReady });
+  const providerReadiness = await loadProviderReadiness(env);
+  const setup = await buildLocalSetupState({ env, manifest, testRfqReady, providerReadiness });
   const heartbeat = {
     client_id: clientId,
-    ai_key_status: hasAiProviderKey(env) ? "configured" : "missing",
+    ai_key_status: hasAiProviderKey(providerReadiness, env) ? "configured" : "missing",
     onboarding_status: minimalOnboardingStatus(setup),
     version
   };
@@ -608,28 +753,42 @@ export function startControlPlaneSyncScheduler({
   return timer;
 }
 
-async function buildLocalSetupState({
+export async function buildLocalSetupState({
   env,
   manifest,
-  testRfqReady
+  testRfqReady,
+  providerReadiness,
+  tunnelReadinessProbe
 }: {
   env: NodeJS.ProcessEnv;
   manifest: QuoteManifest | null;
   testRfqReady: boolean;
+  providerReadiness?: ProviderReadiness;
+  tunnelReadinessProbe?: TunnelReadinessProbe;
 }): Promise<LocalSetupState> {
+  const resolvedProviderReadiness = providerReadiness ?? (await loadProviderReadiness(env));
   const clientId = manifest?.client_id ?? optionalEnv(env.QUOTEOPS_CLIENT_ID) ?? null;
   const installationId = optionalEnv(env.QUOTEOPS_INSTALLATION_ID) ?? null;
   const activationRequired = true;
   const activationStatus = await deriveActivationStatus({ env, clientId, installationId });
+  const tunnel = await deriveTunnelSetupState({
+    env,
+    clientId,
+    installationId,
+    probe: tunnelReadinessProbe ?? defaultTunnelReadinessProbe
+  });
   const requiredSteps: SetupStepId[] = [];
 
   if (activationStatus !== "unlocked") {
     requiredSteps.push("activate_license");
   }
-  if (!(await hasConfiguredSecrets(env))) {
+  if (!(await hasConfiguredSecrets(resolvedProviderReadiness, env))) {
     requiredSteps.push("configure_secrets");
   }
-  if (!hasTmsConnection(env)) {
+  if (tunnel.status !== "ready") {
+    requiredSteps.push("connect_cloudflare");
+  }
+  if (!(await hasTmsConnection(resolvedProviderReadiness, env))) {
     requiredSteps.push("connect_tms");
   }
   if (!(await hasTmsMapping(env))) {
@@ -638,10 +797,10 @@ async function buildLocalSetupState({
   if (!(await hasKnowledgeBase(env))) {
     requiredSteps.push("connect_knowledge_base");
   }
-  if (!hasAgentMailbox(env)) {
+  if (!(await hasAgentMailbox(resolvedProviderReadiness, env))) {
     requiredSteps.push("connect_mailbox");
   }
-  if (!hasSakbeRouteEvidence(env)) {
+  if (!hasSakbeRouteEvidence(resolvedProviderReadiness, env)) {
     requiredSteps.push("connect_sakbe");
   }
   if (!testRfqReady) {
@@ -655,8 +814,243 @@ async function buildLocalSetupState({
       client_id: clientId,
       installation_id: installationId
     },
+    tunnel,
     required_steps: [...new Set(requiredSteps)]
   };
+}
+
+const defaultTunnelReadinessProbe: TunnelReadinessProbe = {
+  async getHaConnections() {
+    const response = await fetch("http://cloudflared:2000/metrics", {
+      signal: AbortSignal.timeout(3_000)
+    });
+    if (!response.ok) throw new Error("cloudflared_metrics_unreachable");
+    const metrics = await response.text();
+    let found = false;
+    let connections = 0;
+    for (const line of metrics.split(/\r?\n/)) {
+      const match =
+        /^cloudflared_tunnel_ha_connections(?:\{[^}]*\})?\s+([0-9]+(?:\.[0-9]+)?)\s*$/.exec(
+          line
+        );
+      if (!match) continue;
+      const value = Number(match[1]);
+      if (!Number.isFinite(value)) throw new Error("cloudflared_metrics_invalid");
+      found = true;
+      connections += value;
+    }
+    if (!found) throw new Error("cloudflared_metrics_invalid");
+    return connections;
+  },
+  fetchPublic(url, init) {
+    return fetch(url, init);
+  }
+};
+
+async function deriveTunnelSetupState({
+  env,
+  clientId,
+  installationId,
+  probe
+}: {
+  env: NodeJS.ProcessEnv;
+  clientId: string | null;
+  installationId: string | null;
+  probe: TunnelReadinessProbe;
+}): Promise<TunnelSetupState> {
+  const checkedAt = new Date().toISOString();
+  const base = {
+    provider: "cloudflare" as const,
+    required: true as const,
+    last_checked_at: checkedAt
+  };
+  const config = await readTunnelConfig(env);
+  if (!config) {
+    return {
+      ...base,
+      status: "missing_config",
+      public_hostname: null
+    };
+  }
+  if (!(await hasTunnelToken(env))) {
+    return {
+      ...base,
+      status: "missing_token",
+      public_hostname: config.public_hostname
+    };
+  }
+
+  let connections: number;
+  try {
+    connections = await probe.getHaConnections();
+  } catch {
+    return {
+      ...base,
+      status: "unreachable",
+      public_hostname: config.public_hostname
+    };
+  }
+  if (!Number.isFinite(connections) || connections <= 0) {
+    return {
+      ...base,
+      status: "starting",
+      public_hostname: config.public_hostname
+    };
+  }
+
+  let publicResponse: globalThis.Response;
+  try {
+    publicResponse = await probe.fetchPublic(
+      new URL(`https://${config.public_hostname}/api/health`),
+      {
+        redirect: "manual",
+        signal: AbortSignal.timeout(3_000)
+      }
+    );
+  } catch {
+    return {
+      ...base,
+      status: "unreachable",
+      public_hostname: config.public_hostname
+    };
+  }
+  if (!hasCloudflareAccessEvidence(publicResponse)) {
+    return {
+      ...base,
+      status: "access_unprotected",
+      public_hostname: config.public_hostname
+    };
+  }
+  if (
+    !(await hasMatchingAuthenticatedOriginReceipt({
+      env,
+      hostname: config.public_hostname,
+      clientId,
+      installationId
+    }))
+  ) {
+    return {
+      ...base,
+      status: "pending_manual_public_validation",
+      public_hostname: config.public_hostname
+    };
+  }
+  return {
+    ...base,
+    status: "ready",
+    public_hostname: config.public_hostname
+  };
+}
+
+async function readTunnelConfig(
+  env: NodeJS.ProcessEnv
+): Promise<{ public_hostname: string } | null> {
+  const path =
+    optionalEnv(env.QUOTEOPS_CLOUDFLARE_CONFIG_PATH) ??
+    join(resolveSettingsDir(env), "cloudflare.json");
+  const value = await readSafeJsonObject(path);
+  if (
+    !value ||
+    value.provider !== "cloudflare" ||
+    value.origin_url !== "http://caddy:80" ||
+    typeof value.public_hostname !== "string" ||
+    !/^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/i.test(
+      value.public_hostname
+    )
+  ) {
+    return null;
+  }
+  return { public_hostname: value.public_hostname.toLowerCase() };
+}
+
+async function hasTunnelToken(env: NodeJS.ProcessEnv): Promise<boolean> {
+  if (Object.prototype.hasOwnProperty.call(env, "TUNNEL_TOKEN")) return true;
+  const path =
+    optionalEnv(env.QUOTEOPS_CLOUDFLARE_ENV_FILE) ??
+    (optionalEnv(env.QUOTEOPS_HOME)
+      ? join(optionalEnv(env.QUOTEOPS_HOME)!, "secrets/cloudflare.env")
+      : null);
+  if (!path) return false;
+  try {
+    const metadata = await lstat(path);
+    if (!metadata.isFile() || metadata.isSymbolicLink()) return false;
+    const contents = await readFile(path, "utf8");
+    return contents.split(/\r?\n/).some((line) => /^\s*TUNNEL_TOKEN=/.test(line));
+  } catch {
+    return false;
+  }
+}
+
+function hasCloudflareAccessEvidence(response: globalThis.Response): boolean {
+  const status = response.status;
+  const server = response.headers.get("server")?.trim().toLowerCase();
+  const ray = response.headers.get("cf-ray")?.trim();
+  if (server !== "cloudflare" || !ray) return false;
+  if (status === 401 || status === 403) return true;
+  if (![301, 302, 303, 307, 308].includes(status)) return false;
+  const location = response.headers.get("location");
+  if (!location) return false;
+  try {
+    const url = new URL(location);
+    return (
+      url.protocol === "https:" &&
+      (url.hostname === "cloudflareaccess.com" ||
+        url.hostname.endsWith(".cloudflareaccess.com")) &&
+      url.pathname.startsWith("/cdn-cgi/access/login/")
+    );
+  } catch {
+    return false;
+  }
+}
+
+async function hasMatchingAuthenticatedOriginReceipt({
+  env,
+  hostname,
+  clientId,
+  installationId
+}: {
+  env: NodeJS.ProcessEnv;
+  hostname: string;
+  clientId: string | null;
+  installationId: string | null;
+}): Promise<boolean> {
+  const version = optionalEnv(env.QUOTEOPS_VERSION);
+  if (!version || !clientId || !installationId) return false;
+  const path =
+    optionalEnv(env.QUOTEOPS_CLOUDFLARE_PUBLIC_VALIDATION_RECEIPT_PATH) ??
+    join(resolveSettingsDir(env), "cloudflare-public-validation.json");
+  const receipt = await readSafeJsonObject(path);
+  if (!receipt) return false;
+  return matchesCloudflarePublicReceipt(receipt, {
+    public_hostname: hostname,
+    version,
+    client_id: clientId,
+    installation_id: installationId
+  });
+}
+
+async function readSafeJsonObject(
+  path: string
+): Promise<Record<string, unknown> | null> {
+  try {
+    const metadata = await lstat(path);
+    if (!metadata.isFile() || metadata.isSymbolicLink()) return null;
+    const value = JSON.parse(await readFile(path, "utf8")) as unknown;
+    return value && typeof value === "object" && !Array.isArray(value)
+      ? (value as Record<string, unknown>)
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function resolveSettingsDir(env: NodeJS.ProcessEnv): string {
+  return (
+    optionalEnv(env.QUOTEOPS_SETTINGS_DIR) ??
+    (optionalEnv(env.QUOTEOPS_HOME)
+      ? join(optionalEnv(env.QUOTEOPS_HOME)!, "settings")
+      : "/opt/quoteops-v1/settings")
+  );
 }
 
 type CloudActivationResponse = {
@@ -863,13 +1257,11 @@ function minimalOnboardingStatus(setup: LocalSetupState):
   return "licensed";
 }
 
-function hasAiProviderKey(env: NodeJS.ProcessEnv): boolean {
-  return hasAnyEnv(env, [
-    "OPENROUTER_API_KEY",
-    "GEMINI_API_KEY",
-    "ANTHROPIC_API_KEY",
-    "OPENAI_API_KEY"
-  ]);
+function hasAiProviderKey(readiness: ProviderReadiness, env: NodeJS.ProcessEnv): boolean {
+  return Boolean(
+    readiness.agentConfig &&
+      hasConfiguredModelKey(readiness.agentConfig, readiness, env)
+  );
 }
 
 async function persistActivatedLicense({
@@ -1038,53 +1430,154 @@ export async function assertApplianceLicenseForClient({
   assertApplianceLicensed(state);
 }
 
-async function hasConfiguredSecrets(env: NodeJS.ProcessEnv): Promise<boolean> {
-  const configuredKeys = new Set<string>();
-  for (const key of [
-    "INEGI_SAKBE_KEY",
-    "QUOTEOPS_SAKBE_API_KEY",
-    "OPENROUTER_API_KEY",
-    "GEMINI_API_KEY",
-    "ANTHROPIC_API_KEY",
-    "OPENAI_API_KEY",
-    "QUOTEOPS_EMBEDDING_API_KEY",
-    "TMS_API_KEY",
-    "QUOTEOPS_TMS_API_KEY",
-    "TMS_AUTH_TOKEN",
-    "MAILBOX_PASSWORD",
-    "MAILBOX_OAUTH_REFRESH_TOKEN"
-  ]) {
-    if (optionalEnv(env[key])) configuredKeys.add(key);
-  }
+type ProviderReadiness = {
+  agentConfig: AgentRuntimeConfig | null;
+  agentConfigPath: string;
+  secretFileKeys: Set<string>;
+};
 
-  const secretsFile = optionalEnv(env.QUOTEOPS_SECRETS_ENV_FILE);
-  if (secretsFile) {
-    for (const key of await readSecretKeysFromEnvFile(secretsFile)) {
-      configuredKeys.add(key);
-    }
-  }
-
-  return [
-    ["INEGI_SAKBE_KEY", "QUOTEOPS_SAKBE_API_KEY"],
-    ["OPENROUTER_API_KEY", "GEMINI_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY"],
-    ["QUOTEOPS_EMBEDDING_API_KEY"],
-    ["TMS_API_KEY", "QUOTEOPS_TMS_API_KEY", "TMS_AUTH_TOKEN"],
-    ["MAILBOX_PASSWORD", "MAILBOX_OAUTH_REFRESH_TOKEN"]
-  ].every((group) => group.some((key) => configuredKeys.has(key)));
+async function loadProviderReadiness(env: NodeJS.ProcessEnv): Promise<ProviderReadiness> {
+  const agentConfigPath = optionalEnv(env.QUOTEOPS_AGENT_CONFIG_PATH) ?? DEFAULT_AGENT_CONFIG_PATH;
+  const [agentConfig, secretFileKeys] = await Promise.all([
+    loadAgentRuntimeConfig(agentConfigPath).catch(() => null),
+    readSecretKeysFromEnvFile(optionalEnv(env.QUOTEOPS_SECRETS_ENV_FILE) ?? "")
+  ]);
+  return { agentConfig, agentConfigPath, secretFileKeys };
 }
 
-function hasTmsConnection(env: NodeJS.ProcessEnv): boolean {
-  return hasAnyEnv(env, [
-    "QUOTEOPS_TMS_ADAPTER_CONFIG_PATH",
-    "QUOTEOPS_TMS_RFQS_PATH",
-    "QUOTEOPS_TMS_HISTORICAL_QUOTES_PATH",
-    "QUOTEOPS_TMS_HISTORICAL_SHIPMENTS_PATH",
-    "QUOTEOPS_TMS_QUOTE_WRITEBACKS_PATH",
-    "TMS_BASE_URL"
-  ]);
+async function hasConfiguredSecrets(
+  readiness: ProviderReadiness,
+  env: NodeJS.ProcessEnv
+): Promise<boolean> {
+  const config = readiness.agentConfig;
+  if (!config) return false;
+
+  return (
+    hasSakbeRouteEvidence(readiness, env) &&
+    hasConfiguredModelKey(config, readiness, env) &&
+    hasConfiguredEmbeddingsKey(config, readiness, env) &&
+    (await hasTmsConnection(readiness, env))
+  );
+}
+
+function hasConfiguredModelKey(
+  config: AgentRuntimeConfig,
+  readiness: ProviderReadiness,
+  env: NodeJS.ProcessEnv
+): boolean {
+  if (config.model.provider === "deterministic" || config.model.provider === "claude_cli") {
+    return true;
+  }
+  return Boolean(
+    config.model.api_key_env && hasConfiguredKey(config.model.api_key_env, readiness, env)
+  );
+}
+
+function hasConfiguredEmbeddingsKey(
+  config: AgentRuntimeConfig,
+  readiness: ProviderReadiness,
+  env: NodeJS.ProcessEnv
+): boolean {
+  return !config.embeddings || hasConfiguredKey(config.embeddings.api_key_env, readiness, env);
+}
+
+async function hasTmsConnection(
+  readiness: ProviderReadiness,
+  env: NodeJS.ProcessEnv
+): Promise<boolean> {
+  const adapterPath = optionalEnv(env.QUOTEOPS_TMS_ADAPTER_CONFIG_PATH);
+  if (!adapterPath) return false;
+
+  try {
+    const config = await loadTmsAdapterConfig(adapterPath);
+    if (config.provider === "file_import") {
+      const configuredPathEnvKeys = [
+        config.rfqs_path_env,
+        config.historical_quotes_path_env,
+        config.historical_shipments_path_env,
+        config.customers_path_env,
+        config.agreements_path_env,
+        config.unit_positions_path_env,
+        config.units_path_env,
+        config.performance_path_env,
+        config.availability_zones_path_env,
+        config.quote_writebacks_path_env,
+        config.status_writebacks_path_env
+      ].filter((key): key is string => Boolean(key));
+
+      // A file-import adapter cannot be considered connected merely because
+      // its env-var names exist. Build the production adapter and check each
+      // configured input/writeback path, keeping the legacy empty adapter
+      // configuration valid for packs that stage their CSVs later.
+      if (!configuredPathEnvKeys.every((key) => Boolean(optionalEnv(env[key])))) {
+        return false;
+      }
+      return (await (await createTmsAdapterFromConfig(adapterPath, { env })).healthCheck()).ok;
+    }
+    if (config.provider === "sql") {
+      return hasConfiguredKey(config.connection_url_env, readiness, env);
+    }
+
+    const requiredKeys = new Set<string>([config.base_url_env]);
+    for (const value of Object.values(config.headers ?? {})) {
+      for (const match of value.matchAll(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g)) {
+        const key = match[1];
+        if (key) requiredKeys.add(key);
+      }
+    }
+    if (
+      ![...requiredKeys].every((key) =>
+        hasConfiguredKey(key, readiness, env)
+      )
+    ) {
+      return false;
+    }
+    if (config.contract !== "quoteops-tms-http-v1") {
+      return hasCurrentTmsProbeReceipt({
+        env,
+        adapterPath,
+        expectedContract: "legacy-custom-http-canonical-output-v1"
+      });
+    }
+    return hasCurrentTmsProbeReceipt({
+      env,
+      adapterPath,
+      expectedContract: "quoteops-tms-http-v1"
+    });
+  } catch {
+    return false;
+  }
+}
+
+function hasConfiguredKey(
+  key: string,
+  readiness: ProviderReadiness,
+  env: NodeJS.ProcessEnv
+): boolean {
+  return Boolean(optionalEnv(env[key]) || readiness.secretFileKeys.has(key));
 }
 
 async function hasTmsMapping(env: NodeJS.ProcessEnv): Promise<boolean> {
+  const adapterPath = optionalEnv(env.QUOTEOPS_TMS_ADAPTER_CONFIG_PATH);
+  if (adapterPath) {
+    try {
+      const config = await loadTmsAdapterConfig(adapterPath);
+      if (config.provider === "http") {
+        if (config.contract === "quoteops-tms-http-v1") {
+          return true;
+        }
+        return hasCurrentTmsProbeReceipt({
+          env,
+          adapterPath,
+          expectedContract: "legacy-custom-http-canonical-output-v1"
+        });
+      }
+      if (config.provider === "file_import") return true;
+    } catch {
+      return false;
+    }
+  }
+
   const mappingPath = optionalEnv(env.QUOTEOPS_TMS_MAPPING_CONFIG_PATH);
   if (mappingPath) {
     try {
@@ -1095,12 +1588,10 @@ async function hasTmsMapping(env: NodeJS.ProcessEnv): Promise<boolean> {
     }
   }
 
-  const adapterPath = optionalEnv(env.QUOTEOPS_TMS_ADAPTER_CONFIG_PATH);
   if (adapterPath) {
     try {
       const config = await loadTmsAdapterConfig(adapterPath);
-      // file_import maps deterministically through the CSV templates;
-      // http providers need an explicit mapping config from onboarding
+      // file_import maps deterministically through the CSV templates.
       return config.provider === "file_import";
     } catch {
       return false;
@@ -1114,23 +1605,78 @@ async function hasTmsMapping(env: NodeJS.ProcessEnv): Promise<boolean> {
   return false;
 }
 
+async function hasCurrentTmsProbeReceipt(input: {
+  env: NodeJS.ProcessEnv;
+  adapterPath: string;
+  expectedContract:
+    | "quoteops-tms-http-v1"
+    | "legacy-custom-http-canonical-output-v1";
+}): Promise<boolean> {
+  const receiptPath =
+    optionalEnv(input.env.QUOTEOPS_TMS_PROBE_PATH) ??
+    defaultSettingsFile(input.env, "tms-probe.json");
+  const revisionPath =
+    optionalEnv(input.env.QUOTEOPS_TMS_CREDENTIAL_REVISION_PATH) ??
+    defaultSettingsFile(input.env, "tms-credential-revision");
+  if (!receiptPath || !revisionPath) return false;
+  const credentialRevision = await readTmsCredentialRevision(revisionPath);
+  if (credentialRevision < 1) return false;
+  return hasMatchingTmsProbeReceipt({
+    adapterConfigPath: input.adapterPath,
+    receiptPath,
+    credentialRevision,
+    expectedContract: input.expectedContract
+  });
+}
+
+async function readTmsCredentialRevision(path: string): Promise<number> {
+  try {
+    const value = JSON.parse(await readFile(path, "utf8")) as Record<
+      string,
+      unknown
+    >;
+    if (
+      Object.keys(value).sort().join(",") !==
+        "credential_revision,schema_version" ||
+      value.schema_version !== 1 ||
+      !Number.isSafeInteger(value.credential_revision) ||
+      Number(value.credential_revision) < 1
+    ) {
+      return 0;
+    }
+    return Number(value.credential_revision);
+  } catch {
+    return 0;
+  }
+}
+
 async function hasKnowledgeBase(env: NodeJS.ProcessEnv): Promise<boolean> {
-  // ready if the vector store already has chunks, OR source files are staged
-  // for ingestion (the transition window before the first ingest runs)
   try {
     const service = await getKnowledgeService(env);
-    if (service && (await service.repo.countStatus()).knowledge_chunks_count > 0) return true;
-  } catch {
-    // fall through to the file-staging check
-  }
-  const connectorsDir = optionalEnv(env.QUOTEOPS_CONNECTORS_DIR);
-  const knowledgeDir =
-    optionalEnv(env.QUOTEOPS_KNOWLEDGE_DIR) ??
-    (connectorsDir ? join(connectorsDir, "knowledge") : null);
-  if (!knowledgeDir) return false;
-  try {
-    const entries = await readdir(knowledgeDir);
-    return entries.some((entry) => !entry.startsWith("."));
+    if (!service) return false;
+    const status = await service.repo.countStatus();
+    if (status.knowledge_chunks_count <= 0) return false;
+    const agentConfigPath =
+      optionalEnv(env.QUOTEOPS_AGENT_CONFIG_PATH) ??
+      DEFAULT_AGENT_CONFIG_PATH;
+    const receiptPath =
+      optionalEnv(env.QUOTEOPS_KNOWLEDGE_RECEIPT_PATH) ??
+      defaultSettingsFile(env, "knowledge-ingest.json");
+    if (!receiptPath) return false;
+    const receipt = JSON.parse(await readFile(receiptPath, "utf8")) as {
+      schema_version?: unknown;
+      provider_config_sha256?: unknown;
+      document_count?: unknown;
+      chunk_count?: unknown;
+      consent_external_embedding_transfer?: unknown;
+    };
+    return (
+      receipt.schema_version === 1 &&
+      receipt.consent_external_embedding_transfer === true &&
+      Number(receipt.document_count) > 0 &&
+      Number(receipt.chunk_count) > 0 &&
+      receipt.provider_config_sha256 === (await sha256Path(agentConfigPath))
+    );
   } catch {
     return false;
   }
@@ -1146,8 +1692,18 @@ function knowledgeSourceDir(env: NodeJS.ProcessEnv): string | null {
 
 async function listKnowledgeFiles(dir: string): Promise<string[]> {
   try {
-    const entries = await readdir(dir);
-    return entries.filter((entry) => !entry.startsWith("."));
+    const entries = await readdir(dir, { withFileTypes: true });
+    return entries
+      .filter(
+        (entry) =>
+          entry.isFile() &&
+          entry.name !== "README.md" &&
+          !entry.name.startsWith(".") &&
+          [".md", ".txt", ".json"].some((extension) =>
+            entry.name.toLowerCase().endsWith(extension)
+          )
+      )
+      .map((entry) => entry.name);
   } catch {
     return [];
   }
@@ -1178,14 +1734,99 @@ async function fileExists(path: string): Promise<boolean> {
   }
 }
 
-function hasAgentMailbox(env: NodeJS.ProcessEnv): boolean {
-  // the agent mailbox tool needs an address plus either an app password or OAuth refresh token
-  if (!hasAnyEnv(env, ["MAILBOX_USER"])) return false;
-  return hasAnyEnv(env, ["MAILBOX_PASSWORD", "MAILBOX_OAUTH_REFRESH_TOKEN"]);
+async function hasAgentMailbox(
+  readiness: ProviderReadiness,
+  env: NodeJS.ProcessEnv
+): Promise<boolean> {
+  const mailbox = readiness.agentConfig?.mailbox;
+  if (!mailbox) return false;
+  const effectiveEnv = envWithSecretFilePresence(readiness, env);
+  if (!mailboxCredentialsPresent(mailbox, effectiveEnv)) return false;
+  const provider = mailbox.provider;
+  const exactKeys =
+    provider === "resend"
+      ? Boolean(
+          optionalEnv(effectiveEnv.RESEND_API_KEY) &&
+            optionalEnv(effectiveEnv.MAILBOX_USER) &&
+            optionalEnv(effectiveEnv.MAILBOX_FROM) &&
+            !optionalEnv(effectiveEnv.MAILBOX_PASSWORD)
+        )
+      : provider === "imap"
+        ? Boolean(
+            optionalEnv(effectiveEnv.MAILBOX_USER) &&
+              optionalEnv(effectiveEnv.MAILBOX_PASSWORD) &&
+              !optionalEnv(effectiveEnv.RESEND_API_KEY) &&
+              !optionalEnv(effectiveEnv.MAILBOX_FROM)
+          )
+        : false;
+  if (!exactKeys) return false;
+  const receiptPath =
+    optionalEnv(env.QUOTEOPS_MAILBOX_PROBE_RECEIPT_PATH) ??
+    defaultSettingsFile(env, "mailbox-probe.json");
+  const revisionPath =
+    optionalEnv(env.QUOTEOPS_APPLIANCE_CREDENTIAL_REVISION_PATH) ??
+    defaultSettingsFile(env, "appliance-secrets-credential.json");
+  if (!receiptPath || !revisionPath) return false;
+  try {
+    const [receipt, revision] = await Promise.all([
+      readFile(receiptPath, "utf8").then((raw) => JSON.parse(raw)) as Promise<{
+        schema_version?: unknown;
+        provider?: unknown;
+        status?: unknown;
+        agent_config_sha256?: unknown;
+        credential_revision?: unknown;
+      }>,
+      readFile(revisionPath, "utf8").then((raw) => JSON.parse(raw)) as Promise<{
+        schema_version?: unknown;
+        credential_revision?: unknown;
+      }>
+    ]);
+    return (
+      receipt.schema_version === 1 &&
+      receipt.provider === provider &&
+      receipt.status === "ok" &&
+      revision.schema_version === 1 &&
+      Number(receipt.credential_revision) ===
+        Number(revision.credential_revision) &&
+      Number(revision.credential_revision) >= 1 &&
+      receipt.agent_config_sha256 ===
+        (await sha256Path(readiness.agentConfigPath))
+    );
+  } catch {
+    return false;
+  }
 }
 
-function hasSakbeRouteEvidence(env: NodeJS.ProcessEnv): boolean {
-  return hasAnyEnv(env, ["INEGI_SAKBE_KEY", "QUOTEOPS_SAKBE_API_KEY"]);
+function defaultSettingsFile(
+  env: NodeJS.ProcessEnv,
+  filename: string
+): string | null {
+  const explicit = optionalEnv(env.QUOTEOPS_SETTINGS_DIR);
+  if (explicit) return join(explicit, filename);
+  const home = optionalEnv(env.QUOTEOPS_HOME);
+  return home ? join(home, "settings", filename) : null;
+}
+
+async function sha256Path(path: string): Promise<string> {
+  return createHash("sha256").update(await readFile(path)).digest("hex");
+}
+
+function envWithSecretFilePresence(
+  readiness: ProviderReadiness,
+  env: NodeJS.ProcessEnv
+): NodeJS.ProcessEnv {
+  const effectiveEnv = { ...env };
+  for (const key of readiness.secretFileKeys) {
+    if (!optionalEnv(effectiveEnv[key])) effectiveEnv[key] = "configured";
+  }
+  return effectiveEnv;
+}
+
+function hasSakbeRouteEvidence(readiness: ProviderReadiness, env: NodeJS.ProcessEnv): boolean {
+  return (
+    hasConfiguredKey("INEGI_SAKBE_KEY", readiness, env) ||
+    hasConfiguredKey("QUOTEOPS_SAKBE_API_KEY", readiness, env)
+  );
 }
 
 async function hasPassingTestRfq(
@@ -1293,10 +1934,6 @@ async function readFirstConfiguredFile(
   return null;
 }
 
-function hasAnyEnv(env: NodeJS.ProcessEnv, keys: string[]): boolean {
-  return keys.some((key) => Boolean(optionalEnv(env[key])));
-}
-
 function optionalEnv(value: string | undefined): string | undefined {
   return value && value.trim() ? value.trim() : undefined;
 }
@@ -1401,6 +2038,7 @@ function parseApprovalDecision(body: Record<string, unknown>): ApprovalDecision 
 
 type PlaygroundRfqRequest = {
   run_id?: string;
+  request_sha256?: string;
   manifest_version?: string;
   criteria_version?: string;
   origin_city: string;
@@ -1426,6 +2064,7 @@ type PlaygroundRfqRequest = {
 function parsePlaygroundRfqRequest(body: Record<string, unknown>): PlaygroundRfqRequest {
   return {
     run_id: optionalText(body.run_id),
+    request_sha256: optionalSha256(body.request_sha256),
     manifest_version: optionalText(body.manifest_version),
     criteria_version: optionalText(body.criteria_version),
     origin_city: requiredText(body.origin_city, "origin_city"),
@@ -1446,6 +2085,28 @@ function parsePlaygroundRfqRequest(body: Record<string, unknown>): PlaygroundRfq
     customer_type: optionalText(body.customer_type),
     business_unit_id: optionalText(body.business_unit_id),
     route_policy: optionalText(body.route_policy)
+  };
+}
+
+function playgroundRequestFingerprint(request: PlaygroundRfqRequest): string {
+  const { run_id: _runId, ...structuralRequest } = request;
+  return createHash("sha256")
+    .update(JSON.stringify(structuralRequest))
+    .digest("hex");
+}
+
+function playgroundSubmissionResponse(run: QuoteWorkflowState) {
+  return {
+    run_id: run.run_id,
+    rfq_id: run.raw_rfq.rfq_id,
+    status:
+      run.base_quote || run.approval_state?.required
+        ? playgroundStatus(run)
+        : "RECEIVED",
+    approval_required: run.approval_state?.required ?? false,
+    route_source: run.route_evidence?.source ?? null,
+    base_rate_mxn: run.base_quote?.base_rate_mxn ?? null,
+    recommended_rate_mxn: null
   };
 }
 
@@ -1551,6 +2212,15 @@ function requiredText(value: unknown, field: string): string {
 
 function optionalText(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function optionalSha256(value: unknown): string | undefined {
+  const parsed = optionalText(value);
+  if (parsed === undefined) return undefined;
+  if (!/^[a-f0-9]{64}$/.test(parsed)) {
+    throw new Error("playground RFQ request_sha256 must be lowercase sha256");
+  }
+  return parsed;
 }
 
 function optionalNumberOrNull(value: unknown): number | null {

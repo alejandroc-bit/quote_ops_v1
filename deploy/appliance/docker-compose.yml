@@ -12,14 +12,16 @@ x-quoteops-service: &quoteops-service
 
 services:
   postgres:
-    image: postgres:16-alpine
+    image: ${QUOTEOPS_POSTGRES_IMAGE:?QUOTEOPS_POSTGRES_IMAGE is required}
     restart: unless-stopped
     networks:
       - quoteops_internal
+    env_file:
+      - path: ${QUOTEOPS_CLIENT_ENV_FILE:?QUOTEOPS_CLIENT_ENV_FILE is required}
+        required: true
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-quoteops}
       POSTGRES_USER: ${POSTGRES_USER:-quoteops}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-}
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -34,7 +36,7 @@ services:
         max-file: "5"
 
   redis:
-    image: redis:7-alpine
+    image: ${QUOTEOPS_REDIS_IMAGE:?QUOTEOPS_REDIS_IMAGE is required}
     restart: unless-stopped
     networks:
       - quoteops_internal
@@ -52,10 +54,11 @@ services:
 
   quoteops-agent:
     <<: *quoteops-service
-    image: ${QUOTEOPS_IMAGE_REGISTRY:-ghcr.io/alejandroc-bit}/quote-ops-agent:${QUOTEOPS_VERSION:-v0.1.0}
+    image: ${QUOTEOPS_AGENT_IMAGE:?QUOTEOPS_AGENT_IMAGE is required}
+    platform: ${QUOTEOPS_PLATFORM:-linux/amd64}
     env_file:
-      - path: ${QUOTEOPS_SECRETS_ENV_FILE:-/opt/quoteops-v1/secrets/client.env}
-        required: false
+      - path: ${QUOTEOPS_CLIENT_ENV_FILE:?QUOTEOPS_CLIENT_ENV_FILE is required}
+        required: true
     depends_on:
       postgres:
         condition: service_healthy
@@ -92,7 +95,6 @@ services:
       QUOTEOPS_TMS_STATUS_WRITEBACKS_PATH: /opt/quoteops-v1/connectors/tms/status-writebacks.jsonl
       QUOTEOPS_LOG_DIR: /var/log/quoteops
       QUOTEOPS_BACKUP_DIR: /opt/quoteops-v1/backups
-      DATABASE_URL: postgresql://${POSTGRES_USER:-quoteops}:${POSTGRES_PASSWORD:-}@postgres:5432/${POSTGRES_DB:-quoteops}
       REDIS_URL: redis://redis:6379/0
     volumes:
       - quoteops_manifests:/opt/quoteops-v1/manifests:ro
@@ -105,10 +107,11 @@ services:
 
   quoteops-api:
     <<: *quoteops-service
-    image: ${QUOTEOPS_IMAGE_REGISTRY:-ghcr.io/alejandroc-bit}/quote-ops-api:${QUOTEOPS_VERSION:-v0.1.0}
+    image: ${QUOTEOPS_API_IMAGE:?QUOTEOPS_API_IMAGE is required}
+    platform: ${QUOTEOPS_PLATFORM:-linux/amd64}
     env_file:
-      - path: ${QUOTEOPS_SECRETS_ENV_FILE:-/opt/quoteops-v1/secrets/client.env}
-        required: false
+      - path: ${QUOTEOPS_CLIENT_ENV_FILE:?QUOTEOPS_CLIENT_ENV_FILE is required}
+        required: true
     depends_on:
       postgres:
         condition: service_healthy
@@ -134,6 +137,9 @@ services:
       QUOTEOPS_CONNECTORS_DIR: /opt/quoteops-v1/connectors
       QUOTEOPS_AGENT_CONFIG_PATH: /opt/quoteops-v1/connectors/agent/agent-config.yaml
       QUOTEOPS_TMS_ADAPTER_CONFIG_PATH: /opt/quoteops-v1/connectors/tms-adapter.yaml
+      QUOTEOPS_TMS_MAPPING_CONFIG_PATH: ${QUOTEOPS_TMS_MAPPING_CONFIG_PATH:-}
+      QUOTEOPS_TMS_PROBE_PATH: /opt/quoteops-v1/settings/tms-probe.json
+      QUOTEOPS_TMS_CREDENTIAL_REVISION_PATH: /opt/quoteops-v1/settings/tms-credential-revision
       QUOTEOPS_ROUTE_CACHE_PATH: /opt/quoteops-v1/connectors/sakbe/route-cache.json
       QUOTEOPS_SAKBE_CACHE_MODE: ${QUOTEOPS_SAKBE_CACHE_MODE:-cache_first}
       QUOTEOPS_SAKBE_LIVE_ENABLED: ${QUOTEOPS_SAKBE_LIVE_ENABLED:-true}
@@ -150,7 +156,6 @@ services:
       QUOTEOPS_TMS_STATUS_WRITEBACKS_PATH: /opt/quoteops-v1/connectors/tms/status-writebacks.jsonl
       QUOTEOPS_LOG_DIR: /var/log/quoteops
       QUOTEOPS_BACKUP_DIR: /opt/quoteops-v1/backups
-      DATABASE_URL: postgresql://${POSTGRES_USER:-quoteops}:${POSTGRES_PASSWORD:-}@postgres:5432/${POSTGRES_DB:-quoteops}
       REDIS_URL: redis://redis:6379/0
     volumes:
       - quoteops_manifests:/opt/quoteops-v1/manifests:ro
@@ -166,17 +171,20 @@ services:
   # run it with: docker compose run --rm quoteops-onboard
   quoteops-onboard:
     profiles: ["onboarding"]
-    image: ${QUOTEOPS_IMAGE_REGISTRY:-ghcr.io/alejandroc-bit}/quote-ops-api:${QUOTEOPS_VERSION:-v0.1.0}
+    image: ${QUOTEOPS_API_IMAGE:?QUOTEOPS_API_IMAGE is required}
+    platform: ${QUOTEOPS_PLATFORM:-linux/amd64}
     restart: "no"
     networks:
       - quoteops_internal
     env_file:
-      - path: ${QUOTEOPS_SECRETS_ENV_FILE:-/opt/quoteops-v1/secrets/client.env}
-        required: false
+      - path: ${QUOTEOPS_CLIENT_ENV_FILE:?QUOTEOPS_CLIENT_ENV_FILE is required}
+        required: true
     environment:
       NODE_ENV: production
       QUOTEOPS_SERVICE: onboard
       QUOTEOPS_CLIENT_ID: ${QUOTEOPS_CLIENT_ID:-}
+      QUOTEOPS_INSTALLATION_ID: ${QUOTEOPS_INSTALLATION_ID:-}
+      QUOTEOPS_VERSION: ${QUOTEOPS_VERSION:-v0.1.0}
       QUOTEOPS_ONBOARD_API_URL: http://quoteops-api:8080
       QUOTEOPS_SECRETS_ENV_FILE: /opt/quoteops-v1/secrets/client.env
       QUOTEOPS_MANIFEST_PATH: /opt/quoteops-v1/manifests/client-manifest.yaml
@@ -184,6 +192,8 @@ services:
       QUOTEOPS_CONNECTORS_DIR: /opt/quoteops-v1/connectors
       QUOTEOPS_AGENT_CONFIG_PATH: /opt/quoteops-v1/connectors/agent/agent-config.yaml
       QUOTEOPS_TMS_ADAPTER_CONFIG_PATH: /opt/quoteops-v1/connectors/tms-adapter.yaml
+      QUOTEOPS_TMS_PROBE_PATH: /opt/quoteops-v1/settings/tms-probe.json
+      QUOTEOPS_TMS_CREDENTIAL_REVISION_PATH: /opt/quoteops-v1/settings/tms-credential-revision
       QUOTEOPS_TMS_RFQS_PATH: /opt/quoteops-v1/connectors/tms/rfqs.csv
       QUOTEOPS_TMS_HISTORICAL_QUOTES_PATH: /opt/quoteops-v1/connectors/tms/historical-quotes.csv
       QUOTEOPS_TMS_HISTORICAL_SHIPMENTS_PATH: /opt/quoteops-v1/connectors/tms/historical-shipments.csv
@@ -200,6 +210,7 @@ services:
       - quoteops_criteria:/opt/quoteops-v1/criteria
       - quoteops_connectors:/opt/quoteops-v1/connectors
       - quoteops_secrets:/opt/quoteops-v1/secrets
+      - quoteops_settings:/opt/quoteops-v1/settings
     logging:
       driver: json-file
       options:
@@ -208,7 +219,8 @@ services:
 
   quoteops-web:
     <<: *quoteops-service
-    image: ${QUOTEOPS_IMAGE_REGISTRY:-ghcr.io/alejandroc-bit}/quote-ops-web:${QUOTEOPS_VERSION:-v0.1.0}
+    image: ${QUOTEOPS_WEB_IMAGE:?QUOTEOPS_WEB_IMAGE is required}
+    platform: ${QUOTEOPS_PLATFORM:-linux/amd64}
     depends_on:
       quoteops-api:
         condition: service_started
@@ -225,7 +237,7 @@ services:
       - quoteops_logs:/var/log/quoteops
 
   caddy:
-    image: caddy:2-alpine
+    image: ${QUOTEOPS_CADDY_IMAGE:?QUOTEOPS_CADDY_IMAGE is required}
     restart: unless-stopped
     networks:
       - quoteops_internal
@@ -234,9 +246,8 @@ services:
         condition: service_started
       quoteops-web:
         condition: service_started
-    ports:
-      - "${QUOTEOPS_HTTP_PORT:-80}:80"
-      - "${QUOTEOPS_HTTPS_PORT:-443}:443"
+    expose:
+      - "80"
     environment:
       QUOTEOPS_SITE_ADDRESS: ${QUOTEOPS_SITE_ADDRESS:-:80}
     volumes:
@@ -247,6 +258,29 @@ services:
       interval: 30s
       timeout: 5s
       retries: 5
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  cloudflared:
+    profiles: ["tunnel"]
+    image: ${QUOTEOPS_CLOUDFLARED_IMAGE:?QUOTEOPS_CLOUDFLARED_IMAGE is required}
+    restart: unless-stopped
+    env_file:
+      - path: ${QUOTEOPS_CLOUDFLARE_ENV_FILE:-/opt/quoteops-v1/secrets/cloudflare.env}
+        required: true
+    environment:
+      TUNNEL_METRICS: 0.0.0.0:2000
+    command: ["tunnel", "--no-autoupdate", "run"]
+    depends_on:
+      caddy:
+        condition: service_healthy
+    expose:
+      - "2000"
+    networks:
+      - quoteops_internal
     logging:
       driver: json-file
       options:

@@ -1,0 +1,35 @@
+{
+  "appliance": {
+    "base_url": "http://2.25.78.180:8094",
+    "health_ok": true,
+    "product_version": "v0.1.7",
+    "workflow_runs": 1,
+    "activation_status": "unlocked",
+    "required_steps": []
+  },
+  "runtime": {
+    "agent_mailbox_pollers": 0,
+    "api_mailbox_pollers": 1,
+    "postgres_healthy": true,
+    "redis_healthy": true,
+    "tms_configured": true,
+    "sakbe_mode": "live"
+  },
+  "providers": {
+    "resend": "validated_and_received",
+    "nvidia_nim": "http_200_completion",
+    "inegi_sakbe": "live_route_validated"
+  },
+  "final_run": {
+    "run_id": "run-rfq-2026-771655",
+    "status": "done",
+    "step_count": 25,
+    "approval_action": "approve",
+    "quote_id": "quote-v2-RFQ-2026-120504-L01",
+    "rate_mxn": 34842.26,
+    "quote_writeback": true,
+    "status_writeback_probe": true,
+    "response_pdf_received": true
+  },
+  "secrets": "[REDACTED]"
+}

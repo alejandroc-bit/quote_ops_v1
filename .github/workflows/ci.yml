@@ -17,3 +17,6 @@ jobs:
       - run: npm ci
       - run: npm run build
       - run: npx vitest run
+      - run: bash deploy/appliance/tests/smoke.sh
+      - run: bash deploy/appliance/tests/lifecycle.sh
+      - run: bash -n deploy/appliance/*.sh deploy/appliance/tests/*.sh

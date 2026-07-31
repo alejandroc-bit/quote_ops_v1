@@ -1,6 +1,11 @@
 import { readFile, writeFile } from "node:fs/promises";
+import { dirname, join, resolve } from "node:path";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
-import { createTmsAdapterFromConfig } from "@quoteops/connectors";
+import {
+  createTmsAdapterFromConfig,
+  loadTmsAdapterConfig,
+  type HistoricalSearchQuery
+} from "@quoteops/connectors";
 import type { QuoteManifest } from "@quoteops/quote-core";
 import type { TmsCanonicalPerformance } from "@quoteops/contracts";
 import {
@@ -26,10 +31,19 @@ import {
   createCopilot,
   applyAuthorizationToAgentConfig,
   mergeConfiguredProfileStubs,
+  readEnvFileValues,
+  readSingleLineSecret,
+  validateTmsBaseUrl,
   writeSecret,
   type Copilot,
   type ProfileCommercialLayer
 } from "./onboardConfig.js";
+import {
+  configureLegacyCustomHttp,
+  configureTmsHttpV1,
+  hasMatchingTmsProbeReceipt,
+  readTmsCredentialRevision
+} from "./tmsProbe.js";
 import {
   applyAuthorization,
   buildSampleQuoteRows,
@@ -42,6 +56,28 @@ import {
   validateMarginParams,
   type OnboardManifest
 } from "./wizardSteps.js";
+import {
+  ACCEPTANCE_ANSWERS_ROOT,
+  assertAcceptanceAnswersInvocation,
+  createFileOnboardingStateStore,
+  parseOnboardingSelection,
+  readValidatedAcceptanceAnswersFile,
+  runOnboarding,
+  OnboardingError,
+  type OnboardPaths as FlowOnboardPaths,
+  type OnboardingAnswers,
+  type OnboardingContext,
+  type OnboardingPhase
+} from "./onboardingFlow.js";
+import { aiProviderPhase } from "./aiProviderStep.js";
+import { licenseActivationPhase } from "./licenseActivationStep.js";
+import {
+  applianceSecretsPhase,
+  knowledgePhase,
+  runKnowledgeIngestion
+} from "./applianceSecretsStep.js";
+import { cloudflarePhase } from "./cloudflareStep.js";
+import { testRfqPhase } from "./testRfqStep.js";
 
 type OnboardPaths = {
   secretsFile: string;
@@ -49,37 +85,147 @@ type OnboardPaths = {
   tmsAdapterConfigPath: string;
   agentConfigPath: string;
   apiBaseUrl: string;
+  flow: FlowOnboardPaths;
 };
 
 function resolvePaths(env: NodeJS.ProcessEnv): OnboardPaths {
+  const secretsFile =
+    env.QUOTEOPS_SECRETS_ENV_FILE ??
+    "/opt/quoteops-v1/secrets/client.env";
+  const home = env.QUOTEOPS_HOME ?? dirname(dirname(secretsFile));
+  const settingsDir = env.QUOTEOPS_SETTINGS_DIR ?? join(home, "settings");
+  const agentConfigPath =
+    env.QUOTEOPS_AGENT_CONFIG_PATH ??
+    join(home, "connectors/agent/agent-config.yaml");
+  const tmsAdapterConfigPath =
+    env.QUOTEOPS_TMS_ADAPTER_CONFIG_PATH ??
+    join(home, "connectors/tms-adapter.yaml");
+  const apiBaseUrl =
+    env.QUOTEOPS_ONBOARD_API_URL ?? "http://quoteops-api:8080";
   return {
-    secretsFile: env.QUOTEOPS_SECRETS_ENV_FILE ?? "/opt/quoteops-v1/secrets/client.env",
-    manifestPath: env.QUOTEOPS_MANIFEST_PATH ?? "/opt/quoteops-v1/manifests/client-manifest.yaml",
-    tmsAdapterConfigPath:
-      env.QUOTEOPS_TMS_ADAPTER_CONFIG_PATH ?? "/opt/quoteops-v1/connectors/tms-adapter.yaml",
-    agentConfigPath:
-      env.QUOTEOPS_AGENT_CONFIG_PATH ?? "/opt/quoteops-v1/connectors/agent/agent-config.yaml",
-    apiBaseUrl: env.QUOTEOPS_ONBOARD_API_URL ?? "http://quoteops-api:8080"
+    secretsFile,
+    manifestPath:
+      env.QUOTEOPS_MANIFEST_PATH ??
+      join(home, "manifests/client-manifest.yaml"),
+    tmsAdapterConfigPath,
+    agentConfigPath,
+    apiBaseUrl,
+    flow: {
+      apiBaseUrl,
+      agentConfigFile: agentConfigPath,
+      clientSecretsFile: secretsFile,
+      cloudflareSecretsFile:
+        env.QUOTEOPS_CLOUDFLARE_ENV_FILE ??
+        join(home, "secrets/cloudflare.env"),
+      aiValidationReceiptFile:
+        env.QUOTEOPS_AI_VALIDATION_RECEIPT_PATH ??
+        join(settingsDir, "ai-provider-validation.json"),
+      mailboxProbeReceiptFile:
+        env.QUOTEOPS_MAILBOX_PROBE_RECEIPT_PATH ??
+        join(settingsDir, "mailbox-probe.json"),
+      knowledgeReceiptFile:
+        env.QUOTEOPS_KNOWLEDGE_RECEIPT_PATH ??
+        join(settingsDir, "knowledge-ingest.json"),
+      settingsDir,
+      onboardingStateFile:
+        env.QUOTEOPS_ONBOARDING_STATE_PATH ??
+        join(settingsDir, "onboarding-state.json"),
+      tmsAdapterConfigFile: tmsAdapterConfigPath,
+      tmsProbeFile:
+        env.QUOTEOPS_TMS_PROBE_PATH ?? join(settingsDir, "tms-probe.json"),
+      testRfqReceiptFile:
+        env.QUOTEOPS_TEST_RFQ_RECEIPT_PATH ??
+        join(settingsDir, "test-rfq.json")
+    }
   };
 }
 
 async function main(argv: string[]): Promise<void> {
   const paths = resolvePaths(process.env);
-  const flag = argv.find((arg) => arg.startsWith("--"));
+  const flag = argv.find((arg) =>
+    ["--sync-units", "--map-tms"].includes(arg)
+  );
+  const selection = parseOnboardingSelection(argv);
 
   // subcommands re-run a single step (unit alta / re-mapping / re-ingest anytime)
   if (flag === "--sync-units") return void (await stepSyncUnits(paths, null));
   if (flag === "--map-tms") return void (await stepTms(paths, null));
-  if (flag === "--ingest") return void (await stepIngest(paths, null));
 
   await bootAnimation();
   line(renderBanner());
   line(`\n${paint(ansi.cyan + ansi.bold, "Bienvenido.")} Voy a guiarte por la puesta en marcha del appliance.`);
 
+  if (argv.includes("--allow-static-guidance")) {
+    await runLegacyOnboarding(paths);
+    return;
+  }
+
+  const answersFile = argumentValue(argv, "--answers-file");
+  if (argv.includes("--answers-file") && !answersFile) {
+    throw new OnboardingError("onboarding_answers_invalid", { exitCode: 2 });
+  }
+  let answers: OnboardingAnswers | null = null;
+  if (answersFile) {
+    assertAcceptanceAnswersInvocation(
+      answersFile,
+      process.env.QUOTEOPS_ACCEPTANCE_MODE
+    );
+    answers = await readValidatedAcceptanceAnswersFile(
+      answersFile,
+      ACCEPTANCE_ANSWERS_ROOT
+    );
+  }
+  const context: OnboardingContext = {
+    io: {
+      ask,
+      askMasked,
+      confirm,
+      select: async <T extends string>(
+        prompt: string,
+        options: Array<{ value: T; label: string }>
+      ) => (await select(prompt, options)) as T,
+      info,
+      warn
+    },
+    env: process.env,
+    paths: paths.flow,
+    guided: answers === null,
+    answers,
+    fetch,
+    stateStore: createFileOnboardingStateStore(
+      paths.flow.onboardingStateFile
+    ),
+    ...(answersFile ? { answersRoot: ACCEPTANCE_ANSWERS_ROOT } : {})
+  };
+  if (argv.includes("--ingest")) {
+    await runKnowledgeIngestion(context);
+    return;
+  }
+
+  const result = await runOnboarding({
+    phases: onboardingPhases(paths),
+    context,
+    selection
+  });
+  line(section("Onboarding completo"));
+  ok(
+    `Fases listas: ${result.completed_phases.join(", ") || "ninguna"}.`
+  );
+  if (result.public_url) info(`URL pública: ${result.public_url}`);
+  info(
+    "Si capturaste secretos nuevos, reinicia el stack para aplicarlos: docker compose up -d"
+  );
+}
+
+async function runLegacyOnboarding(paths: OnboardPaths): Promise<void> {
   const copilot = await stepAiKey(paths);
   await stepSecrets(paths, copilot);
-  await stepTms(paths, copilot);
-  const configuredProfileIds = await stepSyncUnits(paths, copilot);
+  const tmsEnv = await stepTms(paths, copilot);
+  const configuredProfileIds = await stepSyncUnits(
+    paths,
+    copilot,
+    tmsEnv
+  );
   await stepAuthorization(paths, copilot);
   await stepValidatePricing(paths, copilot, configuredProfileIds);
   await stepIngest(paths, copilot);
@@ -89,10 +235,117 @@ async function main(argv: string[]): Promise<void> {
   info("Si capturaste secretos nuevos, reinicia el stack para aplicarlos: docker compose up -d");
 }
 
+function onboardingPhases(paths: OnboardPaths): OnboardingPhase[] {
+  const tmsPhase: OnboardingPhase = {
+    id: "tms",
+    async isComplete(context) {
+      return isTmsPhaseComplete(context);
+    },
+    async run(context) {
+      const tmsEnv = await stepTms(
+        paths,
+        context.copilot ?? null,
+        context
+      );
+      context.env = tmsEnv as NodeJS.ProcessEnv;
+    }
+  };
+  const unitsPhase: OnboardingPhase = {
+    id: "units",
+    async isComplete() {
+      const manifest = await readManifest(paths.manifestPath);
+      return Boolean(
+        manifest?.vehicle_profiles?.some(
+          (profile) => profile.performance_source === "tms"
+        )
+      );
+    },
+    async run(context) {
+      if (!context.guided) {
+        throw new OnboardingError("onboarding_pending", { phase: "units" });
+      }
+      await stepSyncUnits(
+        paths,
+        context.copilot ?? null,
+        context.env
+      );
+    }
+  };
+  const authorizationPhase: OnboardingPhase = {
+    id: "authorization",
+    async isComplete() {
+      try {
+        const config = parseYaml(
+          await readFile(paths.agentConfigPath, "utf8")
+        ) as {
+          authorization?: {
+            approver_email?: unknown;
+            allowed_domains?: unknown;
+          };
+        };
+        return (
+          typeof config.authorization?.approver_email === "string" &&
+          Array.isArray(config.authorization.allowed_domains)
+        );
+      } catch {
+        return false;
+      }
+    },
+    async run(context) {
+      if (!context.guided) {
+        throw new OnboardingError("onboarding_pending", {
+          phase: "authorization"
+        });
+      }
+      await stepAuthorization(paths, context.copilot ?? null);
+    }
+  };
+  const pricingPhase: OnboardingPhase = {
+    id: "pricing",
+    async isComplete() {
+      const manifest = await readManifest(paths.manifestPath);
+      return Boolean(
+        manifest?.vehicle_profiles?.length &&
+          manifest.vehicle_profiles.every(
+            (profile) =>
+              Number.isFinite(profile.margin_target_pct) &&
+              Number.isFinite(profile.minimum_margin_pct)
+          )
+      );
+    },
+    async run(context) {
+      if (!context.guided) {
+        throw new OnboardingError("onboarding_pending", { phase: "pricing" });
+      }
+      await stepValidatePricing(
+        paths,
+        context.copilot ?? null,
+        (await readManifest(paths.manifestPath))?.vehicle_profiles?.map(
+          (profile) => profile.vehicle_profile_id
+        ) ?? []
+      );
+    }
+  };
+  return [
+    aiProviderPhase,
+    licenseActivationPhase,
+    cloudflarePhase,
+    applianceSecretsPhase,
+    tmsPhase,
+    unitsPhase,
+    authorizationPhase,
+    pricingPhase,
+    knowledgePhase,
+    testRfqPhase
+  ];
+}
+
 async function stepAiKey(paths: OnboardPaths): Promise<Copilot | null> {
   line(section("Paso 1 · Inteligencia Artificial"));
   info("Tu clave de IA enciende el copiloto que guía este onboarding.");
-  info("Se guarda cifrada localmente; el copiloto nunca ve tus otros secretos.");
+  info(
+    "Se guarda localmente en un archivo accesible sólo por root (`0600`); el copiloto nunca ve tus otros secretos."
+  );
 
   const provider = (await select("¿Qué proveedor de IA usarás?", [
     { value: "openrouter", label: "OpenRouter (recomendado)" },
@@ -141,48 +394,122 @@ async function stepSecrets(paths: OnboardPaths, copilot: Copilot | null): Promis
   }
 }
 
-async function stepTms(paths: OnboardPaths, copilot: Copilot | null): Promise<void> {
+async function stepTms(
+  paths: OnboardPaths,
+  copilot: Copilot | null,
+  context?: OnboardingContext
+): Promise<Record<string, string | undefined>> {
   line(section("Paso 3 · Conexión al TMS"));
   await guide(
     copilot,
     "El TMS es la fuente de verdad de rendimientos, unidades, zonas e histórico.",
-    "Explica los tres niveles de integración TMS: file_import (exportaciones CSV), http (API moderna) y sql (base de datos del TMS casero)."
+    "Explica las integraciones TMS: API REST QuoteOps v1, REST avanzada existente, exportaciones CSV y SQL."
   );
 
-  const provider = (await select("¿Cómo conecta el TMS del cliente?", [
-    { value: "file_import", label: "Exportaciones CSV (file_import)" },
-    { value: "http", label: "API HTTP moderna" },
-    { value: "sql", label: "Base SQL profesional (Cloud SQL / Azure SQL / otra)" }
-  ])) as "file_import" | "http" | "sql";
+  if (context?.answers?.tms) {
+    const result = await configureTmsHttpV1(
+      {
+        baseUrl: context.answers.tms.base_url,
+        apiKey: context.answers.tms.api_key,
+        sampleQuery: context.answers.tms.sample_query
+      },
+      context
+    );
+    ok("Contrato REST QuoteOps v1 validado en vivo.");
+    return result.env;
+  }
+  if (context && !context.guided) {
+    throw new OnboardingError("onboarding_pending", { phase: "tms" });
+  }
+
+  const choose =
+    context?.io.select.bind(context.io) ??
+    (async <T extends string>(
+      prompt: string,
+      options: Array<{ value: T; label: string }>
+    ) => (await select(prompt, options)) as T);
+  const provider = await choose(
+    "¿Cómo conecta el TMS del cliente?",
+    [
+      {
+        value: "http_v1",
+        label: "API REST QuoteOps v1 (recomendado)"
+      },
+      {
+        value: "http_legacy",
+        label: "Configuración REST avanzada existente"
+      },
+      { value: "file_import", label: "Exportaciones CSV" },
+      { value: "sql", label: "SQL" }
+    ]
+  );
+  const askText = context?.io.ask.bind(context.io) ?? ask;
+  const askSecret = context?.io.askMasked.bind(context.io) ?? askMasked;
+  const runtimeContext = context ?? {
+    env: process.env,
+    fetch,
+    paths: paths.flow
+  };
 
   let yaml: string;
   if (provider === "file_import") {
     yaml = buildTmsAdapterYaml({ provider: "file_import" });
     info("Deja los CSV canónicos en el directorio de connectors/tms.");
-  } else if (provider === "http") {
-    const baseUrlEnv = "TMS_HTTP_BASE_URL";
-    const baseUrl = await ask("URL base de la API del TMS (https://…)");
-    if (baseUrl) await writeSecret(paths.secretsFile, baseUrlEnv, baseUrl);
-    yaml = buildTmsAdapterYaml({
-      provider: "http",
-      base_url_env: baseUrlEnv,
-      endpoints: {
-        search_historical_quotes_endpoint_path: await ask(
-          "Ruta de histórico de cotizaciones",
-          "/quotes/historical"
-        ),
-        get_units_endpoint_path: await ask("Ruta de unidades", "/units"),
-        get_unit_performance_endpoint_path: await ask("Ruta de rendimientos", "/units/performance"),
-        get_availability_zones_endpoint_path: await ask("Ruta de zonas de disponibilidad", "/zones")
-      }
-    });
+  } else if (provider === "http_v1" || provider === "http_legacy") {
+    const baseUrl = await askText(
+      "URL base HTTPS del TMS (sólo origen, sin ruta)"
+    );
+    const apiKey = await askSecret("Bearer token del TMS");
+    const sampleQuery = await captureHistoricalProbeQuery(askText);
+    const result =
+      provider === "http_v1"
+        ? await configureTmsHttpV1(
+            { baseUrl, apiKey, sampleQuery },
+            runtimeContext
+          )
+        : await configureLegacyCustomHttp(
+            {
+              baseUrl,
+              apiKey,
+              sampleQuery,
+              endpoints: {
+                health_endpoint_path: await askText(
+                  "Ruta de health",
+                  "/health"
+                ),
+                search_historical_quotes_endpoint_path: await askText(
+                  "Ruta de histórico de cotizaciones",
+                  "/historical-quotes/search"
+                ),
+                get_units_endpoint_path: await askText(
+                  "Ruta de unidades",
+                  "/units"
+                ),
+                get_unit_performance_endpoint_path: await askText(
+                  "Ruta de rendimientos",
+                  "/unit-performance"
+                ),
+                get_availability_zones_endpoint_path: await askText(
+                  "Ruta de zonas de disponibilidad",
+                  "/availability-zones"
+                ),
+                write_quote_endpoint_path: await askText(
+                  "Ruta de escritura de cotizaciones",
+                  "/quotes"
+                )
+              }
+            },
+            runtimeContext
+          );
+    ok("TMS validado en vivo sin ejecutar writeback.");
+    return result.env;
   } else {
     const dialect = (await select("¿Motor de la base SQL?", [
       { value: "postgres", label: "PostgreSQL (Google Cloud SQL / otra)" },
       { value: "mysql", label: "MySQL (Google Cloud SQL / otra)" },
       { value: "mssql", label: "SQL Server (Azure SQL / otra)" }
     ])) as "postgres" | "mysql" | "mssql";
-    const url = await askMasked("Cadena de conexión de la base SQL (usuario read-only)");
+    const url = await askSecret("Cadena de conexión de la base SQL (usuario read-only)");
     if (url) await writeSecret(paths.secretsFile, "TMS_SQL_URL", url);
     await guide(
       copilot,
@@ -201,6 +528,33 @@ async function stepTms(paths: OnboardPaths, copilot: Copilot | null): Promise<vo
 
   await writeFile(paths.tmsAdapterConfigPath, yaml, "utf8");
   ok(`Configuración del TMS escrita en ${paths.tmsAdapterConfigPath}.`);
+  return context?.env ?? process.env;
+}
+
+async function captureHistoricalProbeQuery(
+  askText: (prompt: string, initial?: string) => Promise<string>
+): Promise<HistoricalSearchQuery> {
+  return {
+    request_id: `onboarding-tms-${Date.now()}`,
+    origin: {
+      city: await askText("Ciudad origen de prueba"),
+      state: await askText("Estado origen de prueba"),
+      country: await askText("País origen ISO-2", "MX")
+    },
+    destination: {
+      city: await askText("Ciudad destino de prueba"),
+      state: await askText("Estado destino de prueba"),
+      country: await askText("País destino ISO-2", "MX")
+    },
+    vehicle_profile_id:
+      (await askText("ID de unidad/perfil de prueba (opcional)")) ||
+      undefined,
+    time_window: {
+      from: await askText("Ventana histórica desde (YYYY-MM-DD)"),
+      to: await askText("Ventana histórica hasta (YYYY-MM-DD)")
+    },
+    max_results: 20
+  };
 }
 
 async function captureSqlQueries(): Promise<Record<string, string>> {
@@ -218,7 +572,11 @@ async function captureSqlQueries(): Promise<Record<string, string>> {
   return queries;
 }
 
-async function stepSyncUnits(paths: OnboardPaths, copilot: Copilot | null): Promise<string[]> {
+async function stepSyncUnits(
+  paths: OnboardPaths,
+  copilot: Copilot | null,
+  env: Record<string, string | undefined> = process.env
+): Promise<string[]> {
   line(section("Paso 4 · Sincronizar unidades desde el TMS"));
   await guide(
     copilot,
@@ -229,7 +587,10 @@ async function stepSyncUnits(paths: OnboardPaths, copilot: Copilot | null): Prom
   let performance: TmsCanonicalPerformance[];
   const spin = createSpinner("Consultando rendimientos del TMS…");
   try {
-    const adapter = await createTmsAdapterFromConfig(paths.tmsAdapterConfigPath, { env: process.env });
+    const adapter = await createTmsAdapterFromConfig(
+      paths.tmsAdapterConfigPath,
+      { env }
+    );
     performance = await adapter.getUnitPerformance();
     spin.stop(`Recibidos ${performance.length} tipos de unidad.`);
   } catch (error) {
@@ -489,10 +850,14 @@ async function stepIngest(paths: OnboardPaths, copilot: Copilot | null): Promise
   line(section("Paso 7 · Cerebro vectorial (criterio comercial)"));
   await guide(
     copilot,
-    "Cargo los documentos de criterio comercial al almacén vectorial local.",
-    "Explica que este paso ingiere los documentos de criterio comercial del cliente al cerebro vectorial local y que los embeddings nunca salen del appliance."
+    "El texto se envía al proveedor de embeddings configurado; los vectores y la base de QuoteOps permanecen locales.",
+    "Explica que el texto de los documentos se envía al proveedor de embeddings configurado, mientras los vectores y la base de QuoteOps permanecen locales."
   );
-  if (!(await confirm("¿Ingerir los documentos de conocimiento ahora?"))) {
+  if (
+    !(await confirm(
+      "¿Aceptas transferir el texto al proveedor de embeddings e ingerirlo ahora?"
+    ))
+  ) {
     info("Puedes hacerlo luego con: onboard --ingest");
     return;
   }
@@ -500,11 +865,20 @@ async function stepIngest(paths: OnboardPaths, copilot: Copilot | null): Promise
   const response = await postJson(`${paths.apiBaseUrl}/api/knowledge/ingest`, {});
   spin.stop();
   if (!response.ok) {
-    warn(`Ingesta no disponible (${response.status}): ${JSON.stringify(response.body)}`);
-    return;
+    throw new OnboardingError("knowledge_ingest_failed");
   }
-  const body = response.body as { document_count?: number };
-  ok(`Ingeridos ${body.document_count ?? 0} documento(s) al cerebro vectorial.`);
+  const body = response.body as {
+    document_count?: number;
+    ingested?: Array<{ chunk_count?: number }>;
+  };
+  const chunks = (body.ingested ?? []).reduce(
+    (sum, item) => sum + (item.chunk_count ?? 0),
+    0
+  );
+  if ((body.document_count ?? 0) <= 0 || chunks <= 0) {
+    throw new OnboardingError("knowledge_ingest_empty");
+  }
+  ok(`Ingeridos ${body.document_count} documento(s) al cerebro vectorial.`);
 }
 
 async function guide(copilot: Copilot | null, fallback: string, context: string): Promise<void> {
@@ -545,7 +919,84 @@ async function postJson(
   }
 }
 
+function argumentValue(argv: string[], flag: string): string | null {
+  const index = argv.indexOf(flag);
+  if (index < 0) return null;
+  const value = argv[index + 1];
+  if (!value || value.startsWith("--")) {
+    throw new OnboardingError("onboarding_argument_missing", {
+      exitCode: 2
+    });
+  }
+  return value;
+}
+
+async function exists(path: string): Promise<boolean> {
+  try {
+    await readFile(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function isTmsPhaseComplete(
+  context: OnboardingContext
+): Promise<boolean> {
+  try {
+    const config = await loadTmsAdapterConfig(
+      context.paths.tmsAdapterConfigFile
+    );
+    if (config.provider !== "http") return true;
+    const expectedContract =
+      config.contract === "quoteops-tms-http-v1"
+        ? "quoteops-tms-http-v1"
+        : "legacy-custom-http-canonical-output-v1";
+    if (
+      context.answers?.tms &&
+      expectedContract !== "quoteops-tms-http-v1"
+    ) {
+      return false;
+    }
+    if (context.answers?.tms) {
+      const configured = await readEnvFileValues(
+        context.paths.clientSecretsFile
+      );
+      const desiredKey = await readSingleLineSecret(
+        context.answers.tms.api_key,
+        context
+      );
+      if (
+        configured.get("TMS_HTTP_BASE_URL") !==
+          validateTmsBaseUrl(
+            context.answers.tms.base_url,
+            context.env.QUOTEOPS_ACCEPTANCE_MODE
+          ) ||
+        configured.get("TMS_API_KEY") !== desiredKey
+      ) {
+        return false;
+      }
+    }
+    const credentialRevision = await readTmsCredentialRevision(
+      join(context.paths.settingsDir, "tms-credential-revision")
+    );
+    return (
+      credentialRevision >= 1 &&
+      (await hasMatchingTmsProbeReceipt({
+        adapterConfigPath: context.paths.tmsAdapterConfigFile,
+        receiptPath: context.paths.tmsProbeFile,
+        credentialRevision,
+        expectedContract
+      }))
+    );
+  } catch {
+    return false;
+  }
+}
+
 main(process.argv.slice(2)).catch((error) => {
-  fail((error as Error).message);
-  process.exit(1);
+  const onboardingError =
+    error instanceof OnboardingError ? error : null;
+  fail(onboardingError?.code ?? (error as Error).message);
+  process.exitCode = onboardingError?.exitCode ?? 1;
 });

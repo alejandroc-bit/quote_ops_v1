@@ -1,0 +1,382 @@
+openapi: 3.1.0
+info:
+  title: QuoteOps TMS HTTP Contract
+  version: 1.0.0
+security:
+  - bearerAuth: []
+paths:
+  /quoteops/v1/health:
+    get:
+      operationId: health
+      responses:
+        "200":
+          description: Contract health and capabilities
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TmsHttpV1Health"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /quoteops/v1/historical-quotes/search:
+    post:
+      operationId: searchHistoricalQuotes
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TmsHttpV1HistoricalSearchRequest"
+            examples:
+              historical_search:
+                $ref: "#/components/examples/historical_search"
+      responses:
+        "200":
+          description: Canonical historical quote rows
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/HistoricalQuoteRecord"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /quoteops/v1/units:
+    get:
+      operationId: getUnits
+      responses:
+        "200":
+          description: Canonical units
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/TmsCanonicalUnit"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /quoteops/v1/unit-performance:
+    get:
+      operationId: getUnitPerformance
+      responses:
+        "200":
+          description: Canonical unit performance
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/TmsCanonicalPerformance"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /quoteops/v1/availability-zones:
+    get:
+      operationId: getAvailabilityZones
+      responses:
+        "200":
+          description: Canonical availability zones
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/TmsCanonicalAvailabilityZone"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /quoteops/v1/quotes:
+    post:
+      operationId: writeQuote
+      description: >-
+        quote_id is the idempotency key. Repeating the same quote_id and body
+        returns the original result; a conflicting body returns 409.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/WriteQuoteInput"
+            examples:
+              quote_write:
+                $ref: "#/components/examples/quote_write"
+      responses:
+        "200":
+          description: Original or newly written quote result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WriteQuoteResult"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalError"
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+  responses:
+    BadRequest:
+      description: Invalid request
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/TmsHttpV1Error"
+    Unauthorized:
+      description: Missing or invalid Bearer token
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/TmsHttpV1Error"
+    Conflict:
+      description: quote_id was already used with a different body
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/TmsHttpV1Error"
+    InternalError:
+      description: TMS internal error
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/TmsHttpV1Error"
+  schemas:
+    TmsHttpV1HistoricalSearchRequest:
+      type: object
+      properties:
+        request_id:
+          type: string
+          minLength: 1
+        origin:
+          type: object
+          properties:
+            city: {type: string, minLength: 1}
+            state: {type: string, minLength: 1}
+            country: {type: string, minLength: 2, maxLength: 2}
+          required: [city, state, country]
+          additionalProperties: false
+        destination:
+          type: object
+          properties:
+            city: {type: string, minLength: 1}
+            state: {type: string, minLength: 1}
+            country: {type: string, minLength: 2, maxLength: 2}
+          required: [city, state, country]
+          additionalProperties: false
+        vehicle_profile_id: {type: [string, "null"], minLength: 1}
+        equipment_request: {type: [string, "null"], minLength: 1}
+        customer_id: {type: [string, "null"], minLength: 1}
+        customer_type: {type: [string, "null"], minLength: 1}
+        cargo:
+          type: object
+          properties:
+            commodity: {type: [string, "null"], minLength: 1}
+            commodity_category: {type: [string, "null"], minLength: 1}
+            sector: {type: [string, "null"], minLength: 1}
+            weight_kg: {type: [number, "null"], minimum: 0}
+            hazmat: {type: [boolean, "null"]}
+            temperature_controlled: {type: [boolean, "null"]}
+          additionalProperties: false
+        service_type: {type: [string, "null"], minLength: 1}
+        time_window:
+          type: object
+          properties:
+            from: {type: string}
+            to: {type: string}
+          required: [from, to]
+          additionalProperties: false
+        max_results: {type: integer, minimum: 1, maximum: 500}
+      required: [request_id, origin, destination, time_window]
+      additionalProperties: false
+    HistoricalQuoteRecord:
+      type: object
+      properties:
+        quote_id: {type: [string, "null"], minLength: 1}
+        rfq_id: {type: [string, "null"], minLength: 1}
+        lane_id: {type: [string, "null"], minLength: 1}
+        customer_id: {type: [string, "null"], minLength: 1}
+        origin_city: {type: string, minLength: 1}
+        origin_state: {type: string, minLength: 1}
+        origin_country: {type: string, minLength: 2, maxLength: 2}
+        destination_city: {type: string, minLength: 1}
+        destination_state: {type: string, minLength: 1}
+        destination_country: {type: string, minLength: 2, maxLength: 2}
+        vehicle_profile_id: {type: string, minLength: 1}
+        equipment_request: {type: [string, "null"], minLength: 1}
+        commodity: {type: [string, "null"], minLength: 1}
+        commodity_category: {type: [string, "null"], minLength: 1}
+        sector: {type: [string, "null"], minLength: 1}
+        weight_kg: {type: [number, "null"], minimum: 0}
+        rate_mxn: {type: number, minimum: 0}
+        direct_cost_mxn: {type: [number, "null"], minimum: 0}
+        margin_pct: {type: [number, "null"]}
+        quoted_at: {type: string, format: date-time}
+        service_type: {type: [string, "null"], minLength: 1}
+        status: {type: [string, "null"], minLength: 1}
+      required:
+        - origin_city
+        - origin_state
+        - origin_country
+        - destination_city
+        - destination_state
+        - destination_country
+        - vehicle_profile_id
+        - rate_mxn
+        - quoted_at
+      additionalProperties: false
+    TmsHttpV1Health:
+      type: object
+      properties:
+        ok: {type: boolean, enum: [true]}
+        status: {type: string, enum: [ok]}
+        contract_version: {type: string, enum: [quoteops-tms-http-v1]}
+        capabilities:
+          type: object
+          properties:
+            historical_quotes: {type: boolean, enum: [true]}
+            units: {type: boolean, enum: [true]}
+            unit_performance: {type: boolean, enum: [true]}
+            availability_zones: {type: boolean, enum: [true]}
+            write_quote: {type: boolean, enum: [true]}
+          required:
+            - historical_quotes
+            - units
+            - unit_performance
+            - availability_zones
+            - write_quote
+          additionalProperties: false
+      required: [ok, status, contract_version, capabilities]
+      additionalProperties: false
+    TmsCanonicalUnit:
+      type: object
+      properties:
+        unit_id: {type: string, minLength: 1}
+        current_lat:
+          allOf:
+            - anyOf:
+                - {type: number}
+                - {type: string}
+            - {type: number, minimum: -90, maximum: 90}
+        current_lng:
+          allOf:
+            - anyOf:
+                - {type: number}
+                - {type: string}
+            - {type: number, minimum: -180, maximum: 180}
+        status:
+          type: string
+          enum: [Available, En_Ruta, Mantenimiento]
+        next_destination_city: {type: string, minLength: 1}
+      required: [unit_id, current_lat, current_lng, status]
+      additionalProperties: false
+    TmsCanonicalPerformance:
+      type: object
+      properties:
+        unit_type: {type: string, minLength: 1}
+        kpl_yield:
+          allOf:
+            - anyOf:
+                - {type: number}
+                - {type: string}
+            - {type: number, minimum: 0}
+        real_cost_per_km:
+          allOf:
+            - anyOf:
+                - {type: number}
+                - {type: string}
+            - {type: number, minimum: 0}
+      required: [unit_type, kpl_yield, real_cost_per_km]
+      additionalProperties: false
+    TmsCanonicalAvailabilityZone:
+      type: object
+      properties:
+        zone_id: {type: string, minLength: 1}
+        city: {type: string, minLength: 1}
+        state: {type: string, minLength: 1}
+        country: {type: string, minLength: 2, maxLength: 2}
+        available_units:
+          allOf:
+            - anyOf:
+                - {type: number}
+                - {type: string}
+            - {type: integer, minimum: 0}
+      required: [zone_id, city, state, country, available_units]
+      additionalProperties: false
+    WriteQuoteInput:
+      type: object
+      properties:
+        quote_id: {type: string, minLength: 1}
+        rfq_id: {type: string, minLength: 1}
+        lane_id: {type: string, minLength: 1}
+        rate_mxn: {type: number, minimum: 0}
+        currency: {type: string, enum: [MXN]}
+        metadata:
+          type: object
+          additionalProperties: {}
+      required: [quote_id, rfq_id, lane_id, rate_mxn, currency]
+      additionalProperties: false
+    WriteQuoteResult:
+      type: object
+      properties:
+        quote_id: {type: string, minLength: 1}
+        status: {type: string, minLength: 1}
+      required: [quote_id, status]
+      additionalProperties: false
+    TmsHttpV1Error:
+      type: object
+      properties:
+        error: {type: string, minLength: 1}
+        message: {type: string, minLength: 1}
+        request_id: {type: string, minLength: 1}
+      required: [error, message]
+      additionalProperties: false
+  examples:
+    historical_search:
+      value:
+        request_id: MAC-E2E-PROBE
+        origin: {city: Guadalajara, state: Jalisco, country: MX}
+        destination: {city: Monterrey, state: Nuevo Leon, country: MX}
+        vehicle_profile_id: T3S3_53_DRYVAN
+        time_window: {from: "2026-01-01", to: "2026-12-31"}
+        max_results: 20
+    unit:
+      value:
+        unit_id: T3S3_53_DRYVAN
+        current_lat: 20.6597
+        current_lng: -103.3496
+        status: Available
+        next_destination_city: Monterrey
+    performance:
+      value:
+        unit_type: T3S3_53_DRYVAN
+        kpl_yield: 2.8
+        real_cost_per_km: 8.5
+    zone:
+      value:
+        zone_id: ZONA-GDL
+        city: Guadalajara
+        state: Jalisco
+        country: MX
+        available_units: 4
+    quote_write:
+      value:
+        quote_id: QUOTE-MAC-E2E-001
+        rfq_id: RFQ-2026-000001
+        lane_id: RFQ-2026-000001-L01
+        rate_mxn: 19850
+        currency: MXN
+        metadata: {}

@@ -1,0 +1,48 @@
+client_id: RESAUX
+business_units:
+  - business_unit_id: RESAUX_DRY_VAN
+    requester_email_domains:
+      - resaux.io
+    keywords:
+      - caja seca
+      - dry van
+      - full
+    default: true
+vehicle_profiles:
+  - vehicle_profile_id: T3S3_53_DRYVAN
+    business_unit_id: RESAUX_DRY_VAN
+    keywords:
+      - caja seca
+      - dry van
+      - full
+      - "53"
+    payload_capacity_kg: 29000
+    fuel_loaded_km_per_l: 2.8
+    fuel_empty_km_per_l: 3.2
+    operator_cost_per_km_mxn: 2.75
+    pricing_model: profitability
+    diesel_price_mxn_per_liter: 29
+    margin_target_pct: 0.2
+    minimum_margin_pct: 0.12
+    maintenance_per_km_mxn: 3.6
+    tires_per_km_mxn: 2.01
+    fixed_overhead_per_km_mxn: 3.625
+    depreciation_per_km_mxn: 3.1792
+    insurance_rate: 0.003
+    insurance_min_mxn: 1200
+    profitability_rb_table:
+      - max_km: 100
+        rb_pct: 0.6
+      - max_km: 500
+        rb_pct: 0.6
+      - max_km: 1000
+        rb_pct: 0.57
+      - max_km: 2000
+        rb_pct: 0.55
+      - max_km: 3000
+        rb_pct: 0.52
+      - max_km: null
+        rb_pct: 0.5
+    performance_source: tms
+route_policy:
+  sakbe_required: true

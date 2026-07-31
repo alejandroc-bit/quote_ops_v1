@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import type { PublishedApplianceRelease } from "@quoteops/shared";
 import {
   applyMinimalHeartbeat,
   applyQuoteCounters,
@@ -14,6 +15,26 @@ const client = createMinimalClientRecord({
   authorized_email: "ops@nmx.example",
   created_at: "2026-06-25T12:00:00.000Z"
 });
+const release: PublishedApplianceRelease = {
+  manifest: {
+    schema_version: 1,
+    version: "v0.2.0",
+    git_sha: "b".repeat(40),
+    platform: "linux/amd64",
+    images: {
+      agent: `agent:v0.2.0@sha256:${"1".repeat(64)}`,
+      api: `api:v0.2.0@sha256:${"2".repeat(64)}`,
+      web: `web:v0.2.0@sha256:${"3".repeat(64)}`,
+      postgres: `postgres:16@sha256:${"4".repeat(64)}`,
+      redis: `redis:7@sha256:${"5".repeat(64)}`,
+      caddy: `caddy:2@sha256:${"6".repeat(64)}`,
+      cloudflared: `cloudflared:2025.7.0@sha256:${"7".repeat(64)}`
+    },
+    files_sha256: { "install.sh": "8".repeat(64) },
+    created_at: "2026-06-25T12:00:00.000Z"
+  },
+  bundle_sha256: "a".repeat(64)
+};
 
 describe("minimal control-plane registry", () => {
   it("tracks only activation state, AI key status and aggregate counters", () => {
@@ -116,13 +137,14 @@ describe("minimal control-plane registry", () => {
       client,
       control_plane_url: "https://quoteops-control-plane-staging.vercel.app/",
       registration_token: "registration-token-secret",
-      expires_at: "2026-06-25T13:00:00.000Z"
+      expires_at: "2026-06-25T13:00:00.000Z",
+      release
     });
 
     expect(pack.registration_token).toBe("registration-token-secret");
     expect(pack.control_plane_url).toBe("https://quoteops-control-plane-staging.vercel.app");
     expect(pack.install_command).toContain(
-      "curl -fsSL https://quoteops-control-plane-staging.vercel.app/api/install/$QUOTEOPS_REGISTRATION_TOKEN | bash"
+      'curl --proto "=https" --proto-redir "=https" --tlsv1.2'
     );
     expect(pack.install_command).not.toContain("registration-token-secret");
     expect(Object.values(pack.files).join("\n")).not.toContain("registration-token-secret");

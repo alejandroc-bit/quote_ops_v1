@@ -4,14 +4,48 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { calculateQuote, type QuoteCoreInput } from "@quoteops/quote-core";
 import {
+  historicalQuoteRecordSchema,
+  TMS_HTTP_V1_CONTRACT,
+  TMS_HTTP_V1_PATHS
+} from "@quoteops/contracts";
+import {
   FileImportTmsAdapter,
   HttpTmsAdapter,
+  TmsAdapterError,
   createTmsAdapterFromConfig,
   type HistoricalSearchQuery,
   type TmsAdapter
 } from "../src/index";
 
 const tempDirs: string[] = [];
+
+describe("TMS HTTP v1 contract", () => {
+  it("publishes the canonical contract identity, paths, and historical row schema", () => {
+    expect(TMS_HTTP_V1_CONTRACT).toBe("quoteops-tms-http-v1");
+    expect(TMS_HTTP_V1_PATHS).toEqual({
+      health: "/quoteops/v1/health",
+      historical_quotes: "/quoteops/v1/historical-quotes/search",
+      units: "/quoteops/v1/units",
+      unit_performance: "/quoteops/v1/unit-performance",
+      availability_zones: "/quoteops/v1/availability-zones",
+      write_quote: "/quoteops/v1/quotes"
+    });
+
+    expect(
+      historicalQuoteRecordSchema.parse({
+        origin_city: "Monterrey",
+        origin_state: "Nuevo León",
+        origin_country: "MX",
+        destination_city: "Saltillo",
+        destination_state: "Coahuila",
+        destination_country: "MX",
+        vehicle_profile_id: "DRY_VAN_53",
+        rate_mxn: 18500,
+        quoted_at: "2026-07-29T18:00:00.000Z"
+      })
+    ).toBeTruthy();
+  });
+});
 
 afterEach(async () => {
   await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
@@ -131,6 +165,28 @@ health_endpoint_path: /ready
       "Bearer test-token"
     );
   });
+
+  it("rejects a literal authorization secret in HTTP config", async () => {
+    const configPath = await createTempFile(
+      "tms-adapter.yaml",
+      `
+provider: http
+base_url_env: TMS_BASE_URL
+headers:
+  authorization: "Bearer embedded-secret"
+`
+    );
+
+    await expect(
+      createTmsAdapterFromConfig(configPath, {
+        env: { TMS_BASE_URL: "https://tms.example.test" }
+      })
+    ).rejects.toMatchObject({
+      name: "TmsAdapterError",
+      code: "tms_config_embedded_secret",
+      details: { header: "authorization" }
+    });
+  });
 });
 
 describe("FileImportTmsAdapter", () => {
@@ -202,6 +258,160 @@ describe("FileImportTmsAdapter", () => {
 });
 
 describe("HttpTmsAdapter", () => {
+  it("analyzes strict canonical historical rows locally", async () => {
+    const scripted = createScriptedFetch(jsonResponse([canonicalHistoricalRow()]));
+    const adapter = new HttpTmsAdapter({
+      baseUrl: "https://tms.example.test",
+      fetch: scripted.fetch
+    });
+
+    const analysis = await adapter.searchHistoricalQuotes(exactRouteQuery);
+
+    expect(analysis.request_id).toBe(exactRouteQuery.request_id);
+    expect(analysis.comparables).toContainEqual(
+      expect.objectContaining({
+        layer: "route_unit_cost",
+        count: 1,
+        median_rate_mxn: 18500
+      })
+    );
+  });
+
+  it("keeps legacy data envelopes compatible while analyzing their rows locally", async () => {
+    const scripted = createScriptedFetch(
+      jsonResponse({ data: [canonicalHistoricalRow()] })
+    );
+    const adapter = new HttpTmsAdapter({
+      baseUrl: "https://tms.example.test",
+      fetch: scripted.fetch
+    });
+
+    const analysis = await adapter.searchHistoricalQuotes(exactRouteQuery);
+
+    expect(analysis.comparables).toContainEqual(
+      expect.objectContaining({ layer: "route_unit_cost", count: 1 })
+    );
+  });
+
+  it("preserves an existing aggregated HistoricalAnalysis response", async () => {
+    const existing = {
+      request_id: exactRouteQuery.request_id,
+      search_layers: ["route_unit_cost"],
+      time_window: exactRouteQuery.time_window,
+      comparables: [
+        {
+          layer: "route_unit_cost",
+          match_quality: "upstream_analysis",
+          count: 2,
+          min_rate_mxn: 18000,
+          median_rate_mxn: 19000,
+          max_rate_mxn: 20000
+        }
+      ],
+      insufficient_data: []
+    };
+    const scripted = createScriptedFetch(jsonResponse(existing));
+    const adapter = new HttpTmsAdapter({
+      baseUrl: "https://tms.example.test",
+      fetch: scripted.fetch
+    });
+
+    await expect(adapter.searchHistoricalQuotes(exactRouteQuery)).resolves.toEqual(
+      existing
+    );
+  });
+
+  it("converts malformed historical rows to a safe connector schema error", async () => {
+    const scripted = createScriptedFetch(
+      jsonResponse([{ ...canonicalHistoricalRow(), unexpected: "legacy-only" }])
+    );
+    const adapter = new HttpTmsAdapter({
+      baseUrl: "https://tms.example.test/sensitive/path",
+      headers: { authorization: "Bearer secret-token" },
+      fetch: scripted.fetch
+    });
+
+    const error = await adapter
+      .searchHistoricalQuotes(exactRouteQuery)
+      .catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(TmsAdapterError);
+    expect(error).toMatchObject({
+      code: "invalid_response_schema",
+      details: {
+        issues: expect.arrayContaining([
+          expect.objectContaining({
+            path: expect.any(Array),
+            code: expect.any(String),
+            message: expect.any(String)
+          })
+        ])
+      }
+    });
+    expect(JSON.stringify(error)).not.toContain("secret-token");
+    expect(JSON.stringify(error)).not.toContain("sensitive/path");
+  });
+
+  it("times out every canonical non-health operation with a safe error", async () => {
+    const adapter = new HttpTmsAdapter({
+      baseUrl: "https://tms.example.test/private",
+      headers: { authorization: "Bearer secret-token" },
+      endpoints: { writeQuote: "/quoteops/v1/quotes" },
+      timeoutMs: 5,
+      fetch: abortableNeverSettlingFetch
+    });
+    const operations = [
+      () => adapter.searchHistoricalQuotes(exactRouteQuery),
+      () => adapter.getUnits(),
+      () => adapter.getUnitPerformance(),
+      () => adapter.getAvailabilityZones(),
+      () =>
+        adapter.writeQuoteResult({
+          quote_id: "QUOTE-TIMEOUT",
+          rfq_id: "RFQ-TIMEOUT",
+          lane_id: "RFQ-TIMEOUT-L01",
+          rate_mxn: 18500,
+          currency: "MXN"
+        })
+    ];
+
+    for (const operation of operations) {
+      const error = await operation().catch((caught: unknown) => caught);
+      expect(error).toBeInstanceOf(TmsAdapterError);
+      expect(error).toMatchObject({ code: "request_timeout" });
+      expect(error.status).toBeUndefined();
+      expect(error.details).toBeUndefined();
+      expect(JSON.stringify(error)).not.toContain("secret-token");
+      expect(JSON.stringify(error)).not.toContain("/private");
+    }
+  });
+
+  it("applies the configured timeout to health without throwing", async () => {
+    const adapter = new HttpTmsAdapter({
+      baseUrl: "https://tms.example.test",
+      timeoutMs: 5,
+      fetch: abortableNeverSettlingFetch
+    });
+
+    await expect(adapter.healthCheck()).resolves.toMatchObject({
+      ok: false,
+      status: "failed"
+    });
+  });
+
+  it.each([0, -1, 1.5, Number.POSITIVE_INFINITY])(
+    "rejects invalid timeoutMs %s",
+    (timeoutMs) => {
+      expect(
+        () =>
+          new HttpTmsAdapter({
+            baseUrl: "https://tms.example.test",
+            timeoutMs
+          })
+      ).toThrowError(TmsAdapterError);
+    }
+  );
+
   it("reports write quote as unavailable when the TMS has no writeback endpoint", async () => {
     const scripted = createScriptedFetch(jsonResponse({ ok: true }));
     const adapter = new HttpTmsAdapter({
@@ -383,6 +593,44 @@ function jsonResponse(body: unknown, status = 200): Response {
     headers: { "content-type": "application/json" }
   });
 }
+
+function canonicalHistoricalRow(): Record<string, unknown> {
+  return {
+    quote_id: "QUOTE-HTTP-1",
+    origin_city: "Monterrey",
+    origin_state: "Nuevo Leon",
+    origin_country: "MX",
+    destination_city: "Saltillo",
+    destination_state: "Coahuila",
+    destination_country: "MX",
+    vehicle_profile_id: "T3S2_53_DRYVAN",
+    equipment_request: "caja seca 53",
+    commodity: "autopartes",
+    commodity_category: "industrial",
+    sector: "manufactura",
+    weight_kg: 12000,
+    rate_mxn: 18500,
+    direct_cost_mxn: 14000,
+    margin_pct: 0.24,
+    quoted_at: "2026-06-15T00:00:00.000Z",
+    service_type: "spot",
+    status: "won"
+  };
+}
+
+const abortableNeverSettlingFetch = (async (
+  _input: URL | RequestInfo,
+  init?: RequestInit
+) =>
+  new Promise<Response>((_resolve, reject) => {
+    const signal = init?.signal;
+    if (!signal) return;
+    if (signal.aborted) {
+      reject(signal.reason);
+      return;
+    }
+    signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+  })) as typeof fetch;
 
 const quoteCoreInput: QuoteCoreInput = {
   rfq: {

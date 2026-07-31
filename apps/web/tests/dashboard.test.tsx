@@ -66,7 +66,7 @@ describe("Separated product shells", () => {
 
     expect(await screen.findByText(/Sesión iniciada como ops@inducta.example/i)).toBeInTheDocument();
     expect(
-      screen.getByRole("heading", { name: /Clientes autorizados/i })
+      await screen.findByRole("heading", { name: /Clientes autorizados/i })
     ).toBeInTheDocument();
     expect(
       screen.getByRole("navigation", { name: /Navegación del plano de control/i })

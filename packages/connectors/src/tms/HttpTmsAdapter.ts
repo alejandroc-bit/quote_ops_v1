@@ -3,6 +3,7 @@ import {
   agreementSchema,
   customerSchema,
   historicalAnalysisSchema,
+  tmsHttpV1HistoricalResponseSchema,
   rfqSchema,
   shipmentSchema,
   tmsCanonicalAvailabilityZoneSchema,
@@ -40,6 +41,10 @@ import {
   type TmsAdapterHealthResult,
   type UnitPositionsQuery
 } from "./TmsAdapter.js";
+import {
+  analyzeHistoricalQuotes,
+  coerceHistoricalQuoteRecord
+} from "./historicalAnalysis.js";
 
 type EndpointResolver<TArgs extends unknown[] = []> = string | ((...args: TArgs) => string);
 
@@ -64,6 +69,7 @@ export interface HttpTmsAdapterConfig {
   headers?: Record<string, string> | (() => Record<string, string> | Promise<Record<string, string>>);
   endpoints?: HttpTmsAdapterEndpoints;
   fetch?: typeof fetch;
+  timeoutMs?: number;
 }
 
 const defaultReadEndpoints: Required<
@@ -90,11 +96,17 @@ const unitPositionArraySchema = z.array(unitPositionSchema);
 const unitArraySchema = z.array(tmsCanonicalUnitSchema);
 const performanceArraySchema = z.array(tmsCanonicalPerformanceSchema);
 const availabilityZoneArraySchema = z.array(tmsCanonicalAvailabilityZoneSchema);
+const historicalHttpResponseSchema = z.union([
+  historicalAnalysisSchema,
+  tmsHttpV1HistoricalResponseSchema
+]);
+const DEFAULT_TIMEOUT_MS = 10_000;
 
 export class HttpTmsAdapter implements TmsAdapter {
   private readonly baseUrl: string;
   private readonly headers?: HttpTmsAdapterConfig["headers"];
   private readonly fetchFn: typeof fetch;
+  private readonly timeoutMs: number;
   private readonly endpoints: Required<
     Omit<HttpTmsAdapterEndpoints, "writeQuote" | "writeStatus">
   > &
@@ -106,10 +118,22 @@ export class HttpTmsAdapter implements TmsAdapter {
         code: "base_url_missing"
       });
     }
+    if (
+      config.timeoutMs !== undefined &&
+      (!Number.isFinite(config.timeoutMs) ||
+        !Number.isInteger(config.timeoutMs) ||
+        config.timeoutMs <= 0)
+    ) {
+      throw new TmsAdapterError(
+        "HttpTmsAdapter timeoutMs must be a positive finite integer",
+        { code: "invalid_timeout" }
+      );
+    }
 
     this.baseUrl = config.baseUrl.endsWith("/") ? config.baseUrl : `${config.baseUrl}/`;
     this.headers = config.headers;
     this.fetchFn = config.fetch ?? fetch;
+    this.timeoutMs = config.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     this.endpoints = {
       ...defaultReadEndpoints,
       ...config.endpoints,
@@ -125,7 +149,8 @@ export class HttpTmsAdapter implements TmsAdapter {
     try {
       const response = await this.fetchFn(this.urlFor(resolveEndpoint(this.endpoints.health, [])), {
         method: "GET",
-        headers: await this.requestHeaders(false)
+        headers: await this.requestHeaders(false),
+        signal: AbortSignal.timeout(this.timeoutMs)
       });
       const body = await parseJsonBody(response);
       const bodyOk = isRecord(body) && typeof body.ok === "boolean" ? body.ok : true;
@@ -174,7 +199,27 @@ export class HttpTmsAdapter implements TmsAdapter {
   }
 
   async searchHistoricalQuotes(query: HistoricalSearchQuery): Promise<HistoricalAnalysis> {
-    return this.post(this.endpoints.searchHistoricalQuotes, [], query, historicalAnalysisSchema);
+    const parsed = await this.post(
+      this.endpoints.searchHistoricalQuotes,
+      [],
+      query,
+      historicalHttpResponseSchema
+    );
+    const legacyAnalysis = historicalAnalysisSchema.safeParse(parsed);
+    if (legacyAnalysis.success) {
+      return legacyAnalysis.data;
+    }
+    if (!Array.isArray(parsed)) {
+      throw new TmsAdapterError("TMS response failed schema validation", {
+        code: "invalid_response_schema"
+      });
+    }
+
+    const records = parsed
+      .map((row) => coerceHistoricalQuoteRecord(row))
+      .filter((row): row is NonNullable<typeof row> => row !== null);
+
+    return analyzeHistoricalQuotes(records, query);
   }
 
   async searchHistoricalShipments(query: HistoricalSearchQuery): Promise<Shipment[]> {
@@ -296,21 +341,43 @@ export class HttpTmsAdapter implements TmsAdapter {
     init: RequestInit,
     schema: z.ZodType<T, z.ZodTypeDef, unknown>
   ): Promise<T> {
-    const response = await this.fetchFn(url, {
-      ...init,
-      headers: await this.requestHeaders(init.body !== undefined)
-    });
-    const body = await parseJsonBody(response);
-
-    if (!response.ok) {
-      throw new TmsAdapterError(`TMS request failed with status ${response.status}`, {
-        code: "http_request_failed",
-        status: response.status,
-        details: body
+    try {
+      const response = await this.fetchFn(url, {
+        ...init,
+        headers: await this.requestHeaders(init.body !== undefined),
+        signal: AbortSignal.timeout(this.timeoutMs)
       });
-    }
+      const body = await parseJsonBody(response);
 
-    return schema.parse(unwrapData(body));
+      if (!response.ok) {
+        throw new TmsAdapterError(`TMS request failed with status ${response.status}`, {
+          code: "http_request_failed",
+          status: response.status,
+          details: body
+        });
+      }
+
+      return schema.parse(unwrapData(body));
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        throw new TmsAdapterError("TMS response failed schema validation", {
+          code: "invalid_response_schema",
+          details: {
+            issues: error.issues.map(({ path, code, message }) => ({
+              path,
+              code,
+              message
+            }))
+          }
+        });
+      }
+      if (isTimeoutError(error)) {
+        throw new TmsAdapterError("TMS request timed out", {
+          code: "request_timeout"
+        });
+      }
+      throw error;
+    }
   }
 
   private async requestHeaders(hasBody: boolean): Promise<Record<string, string>> {
@@ -327,6 +394,13 @@ export class HttpTmsAdapter implements TmsAdapter {
   private urlFor(path: string): URL {
     return /^https?:\/\//i.test(path) ? new URL(path) : new URL(path, this.baseUrl);
   }
+}
+
+function isTimeoutError(error: unknown): boolean {
+  return (
+    error instanceof Error &&
+    (error.name === "TimeoutError" || error.name === "AbortError")
+  );
 }
 
 function resolveEndpoint<TArgs extends unknown[]>(

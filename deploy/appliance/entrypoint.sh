@@ -1,5 +1,6 @@
 #!/usr/bin/env sh
 set -eu
+umask 077
 
 case "${QUOTEOPS_SERVICE:-api}" in
   api)

@@ -1,15 +1,28 @@
+import { createHash } from "node:crypto";
+import { spawnSync } from "node:child_process";
 import { type IncomingMessage, ServerResponse } from "node:http";
 import { Duplex, Readable } from "node:stream";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { gzipSync } from "node:zlib";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import tar from "tar-stream";
 import { createControlPlaneApi } from "../src/index";
 import {
+  canonicalizeInstallPack,
   createFileControlPlaneData,
   createInMemoryControlPlaneData,
-  type ControlPlaneData
+  MAX_RELEASE_ARCHIVE_BYTES,
+  type ControlPlaneData,
+  type RegistrationTokenRecord,
+  type ReleaseRecord
 } from "../src/data/index";
+import {
+  MAX_INSTALLER_RESPONSE_BYTES,
+  renderInstallerScript,
+  validateReleaseArchive
+} from "../src/installerScript";
 import {
   generateLicenseKeyPair,
   verifyInstallationLicense,
@@ -36,9 +49,65 @@ describe("minimal control-plane API", () => {
     });
   });
 
+  it("renders the stable one-command bootstrap without exposing credentials", async () => {
+    const applianceReleaseRoot = await createBootstrapReleaseFixture();
+    const api = await startApi({
+      applianceReleaseRoot,
+      applianceReleaseVersion: "v0.2.0",
+      controlPlaneUrl: "https://control.quoteops.example"
+    });
+    const response = await api.getTextWithHeaders("/install/quoteops", {
+      host: "attacker.example",
+      forwarded: "host=attacker.example",
+      "x-forwarded-host": "attacker.example"
+    });
+
+    expect(response.status).toBe(200);
+    expect(response.headers["content-type"]).toContain("text/x-shellscript");
+    expect(response.headers["cache-control"]).toBe("no-store");
+    expect(response.headers["referrer-policy"]).toBe("no-referrer");
+    expect(response.text).toContain(
+      'CONTROL_PLANE_URL="${QUOTEOPS_CONTROL_PLANE_URL:-https://control.quoteops.example}"'
+    );
+    expect(response.text).not.toContain("attacker.example");
+    expect(response.text).toContain('read -r -s -p "Registration token: "');
+    expect(response.text).toContain('header = "Authorization: Bearer %s"');
+    expect(response.text).toContain('QUOTEOPS_REGISTRATION_TOKEN_FILE="$TOKEN_FILE"');
+    expect(response.text).toContain('bash "$INSTALLER_FILE" "$@" </dev/tty');
+    expect(response.text).toContain('bash "$INSTALLER_FILE" "$@" </dev/null');
+    expect(response.text).not.toContain("/api/install/$QUOTEOPS_REGISTRATION_TOKEN");
+  });
+
+  it("fails closed when the deployed bootstrap is missing or fails its detached checksum", async () => {
+    const emptyRoot = await mkdtemp(join(tmpdir(), "quoteops-bootstrap-missing-"));
+    tempDirs.push(emptyRoot);
+    const missing = await startApi({
+      applianceReleaseRoot: emptyRoot,
+      applianceReleaseVersion: "v0.2.0"
+    });
+    expect((await missing.getText("/install/quoteops")).status).toBe(503);
+
+    const corruptRoot = await createBootstrapReleaseFixture("0".repeat(64));
+    const corrupt = await startApi({
+      applianceReleaseRoot: corruptRoot,
+      applianceReleaseVersion: "v0.2.0"
+    });
+    expect((await corrupt.getText("/install/quoteops")).status).toBe(503);
+  });
+
   it("creates a client, generates an install pack and activates with a signed license", async () => {
     const keyPair = generateLicenseKeyPair();
+    const baseData = createInMemoryControlPlaneData();
+    let tokenConsumptionTransitions = 0;
+    const data: ControlPlaneData = {
+      ...baseData,
+      async markRegistrationTokenUsed(tokenHash, usedAt) {
+        tokenConsumptionTransitions += 1;
+        return baseData.markRegistrationTokenUsed(tokenHash, usedAt);
+      }
+    };
     const api = await startApi({
+      data,
       keyPair,
       tokenGenerator: () => "registration-token-1",
       now: () => new Date("2026-06-25T12:00:00.000Z")
@@ -85,14 +154,23 @@ describe("minimal control-plane API", () => {
       expected_installation_id: "nmx-prod-001"
     });
 
+    // Simulate response loss: retry the same activation after the first request
+    // committed both the licensed installation and token consumption.
     const reused = await api.post("/api/onboarding/activate", {
       client_id: "NMX",
       installation_id: "nmx-prod-001",
       email: "ops@nmx.example",
       registration_token: "registration-token-1"
     });
-    expect(reused.status).toBe(403);
-    expect(reused.body.error).toBe("registration_token_used");
+    expect(reused.status).toBe(200);
+    expect(reused.body.activated).toBe(true);
+    verifyInstallationLicense(reused.body.license as InstallationLicense, {
+      public_key_pem: keyPair.public_key_pem,
+      now: "2026-06-25T12:01:00.000Z",
+      expected_client_id: "NMX",
+      expected_installation_id: "nmx-prod-001"
+    });
+    expect(tokenConsumptionTransitions).toBe(1);
   });
 
   it("fails closed on admin routes without a valid Supabase session", async () => {
@@ -243,8 +321,12 @@ describe("minimal control-plane API", () => {
     expect(data.profiles.has("switch-user")).toBe(false);
   });
 
-  it("serves a self-extracting installer script for a valid registration token", async () => {
+  it("pins and serves an immutable install pack through Bearer authentication", async () => {
+    const data = createInMemoryControlPlaneData();
+    const release = await createTestRelease("v0.2.0", "fixture-a");
+    await data.upsertRelease(release);
     const api = await startApi({
+      data,
       tokenGenerator: () => "installer-token-1",
       now: () => new Date("2026-06-25T12:00:00.000Z")
     });
@@ -254,28 +336,249 @@ describe("minimal control-plane API", () => {
       legal_name: "Autolineas NuevoMex",
       authorized_email: "ops@nmx.example"
     });
-    await api.post("/api/admin/clients/NMX/install-pack", {});
+    const issued = await api.post("/api/admin/clients/NMX/install-pack", {});
+    expect(issued.status).toBe(201);
+    const { registration_token: registrationToken, ...issuedPackWithoutToken } =
+      issued.body.install_pack;
+    const savedToken = await data.getRegistrationToken(sha256(registrationToken));
+    expect(savedToken).not.toBeNull();
+    expect(savedToken!.release_version).toBe("v0.2.0");
+    expect(savedToken!.bundle_sha256).toBe(release.bundle_sha256);
+    expect(savedToken!.install_pack_snapshot).toEqual(issuedPackWithoutToken);
+    expect(savedToken!.pack_sha256).toBe(
+      sha256(canonicalizeInstallPack(issuedPackWithoutToken))
+    );
+    expect(JSON.stringify(savedToken!.install_pack_snapshot)).not.toContain(
+      registrationToken
+    );
 
-    const missing = await api.getText("/api/install/unknown-token");
+    const anonymous = await api.getText("/api/install");
+    expect(anonymous.status).toBe(401);
+    const missing = await api.getText("/api/install", "Bearer unknown-token");
     expect(missing.status).toBe(404);
+    const legacyPath = await api.getText(`/api/install/${registrationToken}`);
+    expect(legacyPath.status).toBe(404);
 
-    const installer = await api.getText("/api/install/installer-token-1");
+    const installer = await api.getText(
+      "/api/install",
+      `Bearer ${registrationToken}`
+    );
     expect(installer.status).toBe(200);
+    expect(installer.headers["cache-control"]).toBe("no-store");
+    expect(installer.headers["referrer-policy"]).toBe("no-referrer");
     expect(installer.text.startsWith("#!/usr/bin/env bash")).toBe(true);
     expect(installer.text).toContain("--client 'NMX'");
     expect(installer.text).toContain("--installation-id 'nmx-prod-001'");
-    expect(installer.text).toContain("QUOTEOPS_REGISTRATION_TOKEN:?");
+    expect(installer.text).toContain("--version 'v0.2.0'");
+    expect(installer.text).toContain("--guided");
+    expect(installer.text).toContain('"$@"');
     // the token authorizes the download but is never embedded in the script
-    expect(installer.text).not.toContain("installer-token-1");
+    expect(installer.text).not.toContain(registrationToken);
 
     await api.post("/api/onboarding/activate", {
       client_id: "NMX",
       installation_id: "nmx-prod-001",
       email: "ops@nmx.example",
-      registration_token: "installer-token-1"
+      registration_token: registrationToken
     });
-    const used = await api.getText("/api/install/installer-token-1");
+    const used = await api.getText("/api/install", `Bearer ${registrationToken}`);
     expect(used.status).toBe(403);
+  });
+
+  it("keeps an old token byte-pinned across release and overlay drift", async () => {
+    const data = createInMemoryControlPlaneData();
+    const releaseA = await createTestRelease("v0.2.0", "runtime-fixture-a");
+    await data.upsertRelease(releaseA);
+    const generatedTokens = ["drift-token-a", "drift-token-b"];
+    const api = await startApi({
+      data,
+      tokenGenerator: () => generatedTokens.shift()!,
+      now: () => new Date("2026-06-25T12:00:00.000Z")
+    });
+    await api.post("/api/admin/clients", {
+      client_id: "DRIFT",
+      legal_name: "Overlay Fixture A",
+      authorized_email: "ops@drift.example"
+    });
+    const issuedA = await api.post("/api/admin/clients/DRIFT/install-pack", {});
+    const snapshotA = { ...issuedA.body.install_pack };
+    delete snapshotA.registration_token;
+
+    const releaseB = await createTestRelease("v0.2.1", "runtime-fixture-b");
+    await data.upsertRelease(releaseB);
+    const client = await data.getClient("DRIFT");
+    await data.upsertClient({ ...client!, legal_name: "Overlay Fixture B" });
+    const issuedB = await api.post("/api/admin/clients/DRIFT/install-pack", {});
+    expect(issuedB.body.install_pack.release.version).toBe("v0.2.1");
+
+    const oldInstaller = await api.getText(
+      "/api/install",
+      "Bearer drift-token-a"
+    );
+    expect(oldInstaller.status).toBe(200);
+    expect(oldInstaller.text).toContain(
+      Buffer.from(releaseA.archive_bytes).toString("base64")
+    );
+    expect(oldInstaller.text).not.toContain(
+      Buffer.from(releaseB.archive_bytes).toString("base64")
+    );
+    expect(oldInstaller.text).toContain(
+      Buffer.from(snapshotA.files["client-manifest.yaml"], "utf8").toString(
+        "base64"
+      )
+    );
+    expect(oldInstaller.text).not.toContain(
+      Buffer.from(
+        issuedB.body.install_pack.files["client-manifest.yaml"],
+        "utf8"
+      ).toString("base64")
+    );
+    expect(oldInstaller.text).toContain("--version 'v0.2.0'");
+    expect(oldInstaller.text).not.toContain("v0.2.1");
+  });
+
+  it.each([
+    "snapshot",
+    "pack_hash",
+    "release_version",
+    "bundle_hash"
+  ] as const)("fails closed when the stored %s is tampered", async (field) => {
+    const data = createInMemoryControlPlaneData();
+    await data.upsertRelease(await createTestRelease("v0.2.0", "tamper"));
+    const api = await startApi({
+      data,
+      tokenGenerator: () => "tamper-token",
+      now: () => new Date("2026-06-25T12:00:00.000Z")
+    });
+    await api.post("/api/admin/clients", {
+      client_id: "TAMPER",
+      legal_name: "Tamper Client",
+      authorized_email: "ops@tamper.example"
+    });
+    await api.post("/api/admin/clients/TAMPER/install-pack", {});
+    const stored = data.tokens.get(sha256("tamper-token"))!;
+    if (field === "snapshot") {
+      stored.install_pack_snapshot.install_command += " changed";
+    } else if (field === "pack_hash") {
+      stored.pack_sha256 = "0".repeat(64);
+    } else if (field === "release_version") {
+      stored.release_version = "v0.2.1";
+    } else {
+      stored.bundle_sha256 = "0".repeat(64);
+    }
+
+    const response = await api.getText(
+      "/api/install",
+      "Bearer tamper-token"
+    );
+    expect(response.status).toBe(403);
+    expect(response.text).not.toContain("#!/usr/bin/env bash");
+  });
+
+  it.each(["../escape", "/tmp/escape", "install.sh"])(
+    "rejects client overlay path %s before rendering",
+    async (path) => {
+      const data = createInMemoryControlPlaneData();
+      await data.upsertRelease(await createTestRelease("v0.2.0", "overlay"));
+      const api = await startApi({
+        data,
+        tokenGenerator: () => "overlay-token",
+        now: () => new Date("2026-06-25T12:00:00.000Z")
+      });
+      await api.post("/api/admin/clients", {
+        client_id: "OVERLAY",
+        legal_name: "Overlay Client",
+        authorized_email: "ops@overlay.example"
+      });
+      await api.post("/api/admin/clients/OVERLAY/install-pack", {});
+      const stored = data.tokens.get(sha256("overlay-token"))!;
+      stored.install_pack_snapshot.files[path] = "malicious";
+      stored.pack_sha256 = sha256(
+        canonicalizeInstallPack(stored.install_pack_snapshot)
+      );
+
+      const response = await api.getText(
+        "/api/install",
+        "Bearer overlay-token"
+      );
+      expect(response.status).toBe(503);
+      expect(response.text).not.toContain("#!/usr/bin/env bash");
+    }
+  );
+
+  it("rejects a client overlay that collides with an archive runtime entry", async () => {
+    const data = createInMemoryControlPlaneData();
+    await data.upsertRelease(
+      await createTestRelease("v0.2.0", "runtime-collision", {
+        "client-manifest.yaml": "runtime-owned\n"
+      })
+    );
+    const api = await startApi({
+      data,
+      tokenGenerator: () => "runtime-collision-token",
+      now: () => new Date("2026-06-25T12:00:00.000Z")
+    });
+    await api.post("/api/admin/clients", {
+      client_id: "COLLISION",
+      legal_name: "Collision Client",
+      authorized_email: "ops@collision.example"
+    });
+    await api.post("/api/admin/clients/COLLISION/install-pack", {});
+
+    const response = await api.getText(
+      "/api/install",
+      "Bearer runtime-collision-token"
+    );
+    expect(response.status).toBe(503);
+    expect(response.text).not.toContain("#!/usr/bin/env bash");
+  });
+
+  it("stops on a corrupted embedded archive before invoking install.sh", async () => {
+    const data = createInMemoryControlPlaneData();
+    await data.upsertRelease(await createTestRelease("v0.2.0", "must-not-run"));
+    const api = await startApi({
+      data,
+      tokenGenerator: () => "corruption-token",
+      now: () => new Date("2026-06-25T12:00:00.000Z")
+    });
+    await api.post("/api/admin/clients", {
+      client_id: "CORRUPT",
+      legal_name: "Corruption Client",
+      authorized_email: "ops@corrupt.example"
+    });
+    await api.post("/api/admin/clients/CORRUPT/install-pack", {});
+    const installer = await api.getText(
+      "/api/install",
+      "Bearer corruption-token"
+    );
+    const match = installer.text.match(
+      /printf '%s' '([A-Za-z0-9+/=]+)' \| decode_base64 > "\$archive_file"/
+    );
+    expect(match?.[1]).toBeTruthy();
+    const encoded = match![1]!;
+    const tampered =
+      installer.text.replace(
+        encoded,
+        `${encoded[0] === "A" ? "B" : "A"}${encoded.slice(1)}`
+      );
+    const dir = await mkdtemp(join(tmpdir(), "quoteops-corrupt-installer-"));
+    tempDirs.push(dir);
+    const tokenFile = join(dir, "registration-token");
+    await writeFile(tokenFile, "corruption-token\n", { mode: 0o600 });
+    const result = spawnSync("bash", ["-c", tampered], {
+      cwd: dir,
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        TMPDIR: dir,
+        QUOTEOPS_REGISTRATION_TOKEN_FILE: tokenFile
+      }
+    });
+    expect(result.status).not.toBe(0);
+    expect(`${result.stdout}\n${result.stderr}`).not.toContain("must-not-run");
+    await expect(readFile(join(dir, "current"))).rejects.toMatchObject({
+      code: "ENOENT"
+    });
   });
 
   it("does not issue a license to a suspended client", async () => {
@@ -300,6 +603,50 @@ describe("minimal control-plane API", () => {
 
     expect(activated.status).toBe(403);
     expect(activated.body.error).toBe("client_not_active");
+  });
+
+  it.each(["", "http://quoteops.example/path"])(
+    "fails install-pack issuance closed for control-plane origin %j",
+    async (controlPlaneUrl) => {
+      const api = await startApi({ controlPlaneUrl });
+      await api.post("/api/admin/clients", {
+        client_id: "ORIGIN",
+        legal_name: "Origin Client",
+        authorized_email: "ops@origin.example"
+      });
+      const response = await api.post(
+        "/api/admin/clients/ORIGIN/install-pack",
+        {}
+      );
+      expect(response.status).toBe(503);
+      expect(response.body.error).toBe("control_plane_origin_missing");
+    }
+  );
+
+  it("requires reissue for a legacy token without a complete release pin", async () => {
+    const release = await createTestRelease("v0.2.0", "legacy-token");
+    const data = createInMemoryControlPlaneData({
+      tokens: [
+        {
+          token: sha256("legacy-token"),
+          client_id: "LEGACY",
+          tenant_id: "tenant:LEGACY",
+          installation_id: "legacy-prod-001",
+          expires_at: "9999-01-01T00:00:00.000Z",
+          used_at: null
+        } as unknown as RegistrationTokenRecord & { tenant_id: string }
+      ],
+      releases: [release]
+    });
+    const api = await startApi({ data });
+    const response = await api.getText(
+      "/api/install",
+      "Bearer legacy-token"
+    );
+    expect(response.status).toBe(403);
+    expect(JSON.parse(response.text)).toMatchObject({
+      error: "registration_token_reissue_required"
+    });
   });
 
   it("rejects expired registration tokens", async () => {
@@ -481,9 +828,8 @@ describe("minimal control-plane API", () => {
   });
 
   it("uses the activated install-pack token as the bound credential for every ingest endpoint", async () => {
-    const data = createInMemoryControlPlaneData({
-      releases: [{ version: "v1.2.0", notes: "Stable" }]
-    });
+    const stableRelease = await createTestRelease("v1.2.0", "Stable");
+    const data = createInMemoryControlPlaneData({ releases: [stableRelease] });
     const api = await startApi({
       data,
       tokenGenerator: () => "issued-appliance-token",
@@ -535,6 +881,12 @@ describe("minimal control-plane API", () => {
     expect([heartbeat.status, counters.status, sentinel.status, usage.status, release.status])
       .toEqual([202, 202, 201, 202, 200]);
     expect(heartbeat.body.latest_version).toBe("v1.2.0");
+    expect(release.body).toEqual({
+      version: stableRelease.version,
+      notes: stableRelease.notes,
+      bundle_sha256: stableRelease.bundle_sha256,
+      manifest: stableRelease.manifest
+    });
 
     const wrongInstallation = await api.post("/api/sentinel/reports", {
       installation_id: "other-prod-001",
@@ -543,6 +895,152 @@ describe("minimal control-plane API", () => {
       stats: { runs: 1, errors: 0, interrupts: 0, avg_node_ms: 20 }
     }, authorization);
     expect(wrongInstallation.status).toBe(403);
+  });
+
+  it("downloads every exact registered release with installation authentication", async () => {
+    const oldRelease = await createTestRelease("v0.2.0", "Historical");
+    const currentRelease = await createTestRelease("v0.2.1", "Current");
+    const data = createInMemoryControlPlaneData({
+      releases: [oldRelease, currentRelease]
+    });
+    const api = await startApi({
+      data,
+      tokenGenerator: () => "release-download-installation-token",
+      now: () => new Date("2026-07-29T18:00:00.000Z")
+    });
+    await api.post("/api/admin/clients", {
+      client_id: "DOWNLOAD",
+      legal_name: "Release Download Client",
+      authorized_email: "ops@download.example"
+    });
+    await api.post("/api/admin/clients/DOWNLOAD/install-pack", {});
+    await api.post("/api/onboarding/activate", {
+      client_id: "DOWNLOAD",
+      installation_id: "download-prod-001",
+      email: "ops@download.example",
+      registration_token: "release-download-installation-token"
+    });
+
+    expect((await api.get("/api/releases/v0.2.0/appliance", null)).status).toBe(401);
+    for (const expected of [oldRelease, currentRelease]) {
+      const response = await api.getBinary(
+        `/api/releases/${expected.version}/appliance`,
+        "Bearer release-download-installation-token"
+      );
+      expect(response.status).toBe(200);
+      expect(response.headers["content-type"]).toMatch(/application\/gzip/);
+      expect(response.headers["cache-control"]).toBe("private, no-store");
+      expect(response.headers["x-quoteops-version"]).toBe(expected.version);
+      expect(response.headers["x-quoteops-sha256"]).toBe(expected.bundle_sha256);
+      expect(response.bytes).toEqual(Buffer.from(expected.archive_bytes));
+    }
+
+    const unavailable = await api.get(
+      "/api/releases/v0.2.2/appliance",
+      "Bearer release-download-installation-token"
+    );
+    expect(unavailable.status).toBe(404);
+    expect(unavailable.body.error).toBe("release_not_available");
+  });
+
+  it("syncs only verified bundled bytes with a dedicated constant-time machine credential", async () => {
+    const root = await mkdtemp(join(tmpdir(), "quoteops-release-sync-"));
+    tempDirs.push(root);
+    const releaseDir = join(root, "v0.2.1");
+    await mkdir(releaseDir);
+    const bundledRelease = await createTestRelease("v0.2.1", "Bundled");
+    const archiveName = "quoteops-appliance-v0.2.1.tar.gz";
+    await writeFile(join(releaseDir, archiveName), bundledRelease.archive_bytes);
+    await writeFile(join(releaseDir, "release.json"), bundledRelease.manifest_bytes);
+    await writeFile(
+      join(releaseDir, "SHA256SUMS"),
+      [
+        `${bundledRelease.bundle_sha256}  ${archiveName}`,
+        `${sha256(bundledRelease.manifest_bytes)}  release.json`
+      ].join("\n") + "\n"
+    );
+
+    const data = createInMemoryControlPlaneData({
+      releases: [await createTestRelease("v0.2.0", "Historical")]
+    });
+    const releaseSyncToken = "release-sync-token-0123456789abcdef";
+    const api = await startApi({
+      data,
+      applianceReleaseRoot: root,
+      applianceReleaseVersion: "v0.2.1",
+      releaseSyncToken
+    });
+
+    expect(
+      (await api.post("/api/internal/releases/sync-bundled", {}, null)).status
+    ).toBe(401);
+    expect(
+      (
+        await api.post(
+          "/api/internal/releases/sync-bundled",
+          {},
+          "Bearer wrong-release-sync-token-0123456789abcdef"
+        )
+      ).status
+    ).toBe(401);
+    const synced = await api.post(
+      "/api/internal/releases/sync-bundled",
+      {},
+      `Bearer ${releaseSyncToken}`
+    );
+    expect(synced.status).toBe(200);
+    expect(synced.body).toEqual({
+      version: bundledRelease.version,
+      bundle_sha256: bundledRelease.bundle_sha256,
+      synced: true
+    });
+    expect(
+      (
+        await api.post(
+          "/api/internal/releases/sync-bundled",
+          {},
+          `Bearer ${releaseSyncToken}`
+        )
+      ).status
+    ).toBe(200);
+    expect((await data.getRelease("v0.2.0"))?.version).toBe("v0.2.0");
+    expect((await data.getRelease("v0.2.1"))?.bundle_sha256).toBe(
+      bundledRelease.bundle_sha256
+    );
+
+    const conflicting = await createTestRelease("v0.2.1", "Conflict");
+    await writeFile(join(releaseDir, archiveName), conflicting.archive_bytes);
+    await writeFile(join(releaseDir, "release.json"), conflicting.manifest_bytes);
+    await writeFile(
+      join(releaseDir, "SHA256SUMS"),
+      [
+        `${conflicting.bundle_sha256}  ${archiveName}`,
+        `${sha256(conflicting.manifest_bytes)}  release.json`
+      ].join("\n") + "\n"
+    );
+    const conflict = await api.post(
+      "/api/internal/releases/sync-bundled",
+      {},
+      `Bearer ${releaseSyncToken}`
+    );
+    expect(conflict.status).toBe(409);
+    expect(conflict.body.error).toBe("release_conflict");
+
+    const disabled = await startApi({
+      data,
+      applianceReleaseRoot: root,
+      applianceReleaseVersion: "v0.2.1",
+      releaseSyncToken: "too-short"
+    });
+    expect(
+      (
+        await disabled.post(
+          "/api/internal/releases/sync-bundled",
+          {},
+          "Bearer too-short"
+        )
+      ).status
+    ).toBe(503);
   });
 
   it("serves tenant ingests from the default in-memory unified data store", async () => {
@@ -592,20 +1090,24 @@ describe("minimal control-plane API", () => {
       created_at: "2026-07-12T00:00:00.000Z",
       status: "active"
     });
+    const release = await createTestRelease("v0.2.0", "mismatch-release");
     const data = createInMemoryControlPlaneData({
       clients: [client],
       tokens: [{
-        token: "mismatched-token",
-        client_id: "MISMATCH",
+        ...createTestTokenRecord(
+          "mismatched-token",
+          "MISMATCH",
+          "mismatch-prod-001",
+          release
+        ),
         tenant_id: "tenant-a",
-        installation_id: "mismatch-prod-001",
-        expires_at: "9999-01-01T00:00:00.000Z",
         used_at: "2026-07-12T00:00:00.000Z"
       }],
       installations: [{
         tenant_id: "tenant:MISMATCH",
         installation_id: "mismatch-prod-001"
-      }]
+      }],
+      releases: [release]
     });
     const api = await startApi({ data });
 
@@ -620,16 +1122,19 @@ describe("minimal control-plane API", () => {
   });
 
   it("ingests a strict aggregate sentinel report for the token tenant", async () => {
+    const release = await createTestRelease("v0.2.0", "sentinel-release");
     const data = createInMemoryControlPlaneData({
       tokens: [{
-        token: "installation-token",
-        client_id: "TENANT-A",
+        ...createTestTokenRecord(
+          "installation-token",
+          "TENANT-A",
+          "tenant-a-prod-001",
+          release
+        ),
         tenant_id: "tenant-a",
-        installation_id: "tenant-a-prod-001",
-        expires_at: "9999-01-01T00:00:00.000Z",
-        used_at: null
       }],
-      installations: [{ tenant_id: "tenant-a", installation_id: "tenant-a-prod-001" }]
+      installations: [{ tenant_id: "tenant-a", installation_id: "tenant-a-prod-001" }],
+      releases: [release]
     });
     const api = await startApi({ data });
 
@@ -700,16 +1205,19 @@ describe("minimal control-plane API", () => {
   });
 
   it("upserts strict daily aggregate usage without duplicating retries", async () => {
+    const release = await createTestRelease("v0.2.0", "usage-release");
     const data = createInMemoryControlPlaneData({
       tokens: [{
-        token: "usage-token",
-        client_id: "TENANT-B",
+        ...createTestTokenRecord(
+          "usage-token",
+          "TENANT-B",
+          "tenant-b-prod-001",
+          release
+        ),
         tenant_id: "tenant-b",
-        installation_id: "tenant-b-prod-001",
-        expires_at: "9999-01-01T00:00:00.000Z",
-        used_at: null
       }],
-      installations: [{ tenant_id: "tenant-b", installation_id: "tenant-b-prod-001" }]
+      installations: [{ tenant_id: "tenant-b", installation_id: "tenant-b-prod-001" }],
+      releases: [release]
     });
     const api = await startApi({ data });
 
@@ -760,14 +1268,17 @@ describe("minimal control-plane API", () => {
   });
 
   it("returns the latest release and only allowlisted heartbeat settings", async () => {
+    const previousRelease = await createTestRelease("v1.9.0", "Previous");
+    const currentRelease = await createTestRelease("v1.10.0", "Current");
     const data = createInMemoryControlPlaneData({
       tokens: [{
-        token: "release-token",
-        client_id: "SYNC",
+        ...createTestTokenRecord(
+          "release-token",
+          "SYNC",
+          "sync-prod-001",
+          currentRelease
+        ),
         tenant_id: "tenant:SYNC",
-        installation_id: "sync-prod-001",
-        expires_at: "9999-01-01T00:00:00.000Z",
-        used_at: null
       }],
       installations: [
         {
@@ -781,9 +1292,8 @@ describe("minimal control-plane API", () => {
         }
       ],
       releases: [
-        { version: "v1.9.0", notes: "Previous" },
-        { version: "v1.10.0", notes: "Current" },
-        { version: "v9.0.0-rc.1", notes: "Must not enter stable channel" }
+        previousRelease,
+        currentRelease
       ]
     });
     const api = await startApi({
@@ -847,7 +1357,12 @@ describe("minimal control-plane API", () => {
 
     const latest = await api.get("/api/releases/latest", "Bearer release-token");
     expect(latest.status).toBe(200);
-    expect(latest.body).toEqual({ version: "v1.10.0", notes: "Current" });
+    expect(latest.body).toEqual({
+      version: currentRelease.version,
+      notes: currentRelease.notes,
+      bundle_sha256: currentRelease.bundle_sha256,
+      manifest: currentRelease.manifest
+    });
 
     const anonymous = await api.get("/api/releases/latest", null);
     expect(anonymous.status).toBe(401);
@@ -889,6 +1404,137 @@ describe("minimal control-plane API", () => {
     expect(login.status).toBe(200);
     expect(activated.status).toBe(200);
   });
+
+  it.each([
+    {
+      label: "absolute path",
+      entries: [{ name: "/escape", contents: "x" }]
+    },
+    {
+      label: "parent traversal",
+      entries: [{ name: "../escape", contents: "x" }]
+    },
+    {
+      label: "symlink",
+      entries: [
+        { name: "install.sh", contents: "", type: "symlink" as const, linkname: "../escape" }
+      ]
+    },
+    {
+      label: "hardlink",
+      entries: [
+        { name: "install.sh", contents: "", type: "link" as const, linkname: "release.env" }
+      ]
+    },
+    {
+      label: "directory",
+      entries: [{ name: "install.sh", contents: "", type: "directory" as const }]
+    },
+    {
+      label: "duplicate",
+      entries: [
+        { name: "install.sh", contents: "a" },
+        { name: "install.sh", contents: "b" }
+      ]
+    }
+  ])("rejects a release archive containing a $label", async ({ entries }) => {
+    const release = await createTestRelease("v0.2.0", "archive-security");
+    const archiveBytes = await createTarGzip(entries);
+    expect(() =>
+      validateReleaseArchive({
+        archiveBytes,
+        bundleSha256: sha256(archiveBytes),
+        manifest: release.manifest
+      })
+    ).toThrow();
+  });
+
+  it("rejects newline and heredoc-delimiter archive-name injection before rendering", async () => {
+    const release = await createTestRelease("v0.2.0", "heredoc-injection");
+    const archiveBytes = await createTarGzip([
+      {
+        name: "release.json\nQUOTEOPS_EXPECTED_NAMES",
+        contents: "{}\n"
+      }
+    ]);
+    const bundleSha256 = sha256(archiveBytes);
+    expect(() =>
+      renderInstallerScript({
+        pack: {
+          client_id: "INJECT",
+          installation_id: "inject-prod-001",
+          expires_at: "2026-06-25T13:00:00.000Z",
+          control_plane_url:
+            "https://quoteops-control-plane-staging.vercel.app",
+          install_command: "sudo bash quoteops-bootstrap.sh",
+          release: {
+            version: release.version,
+            bundle_sha256: bundleSha256
+          },
+          files: {}
+        },
+        archiveBytes,
+        bundleSha256,
+        manifest: release.manifest
+      })
+    ).toThrow("unsafe_archive_path");
+  });
+
+  it("enforces the raw release and rendered installer size caps", async () => {
+    const exactData = createInMemoryControlPlaneData();
+    const exact = await createTestRelease("v0.2.0", "exact-cap");
+    exact.archive_bytes = Buffer.alloc(MAX_RELEASE_ARCHIVE_BYTES);
+    exact.bundle_sha256 = sha256(exact.archive_bytes);
+    expect(exactData.upsertRelease(exact)).toMatchObject({
+      version: "v0.2.0"
+    });
+
+    const oversizedData = createInMemoryControlPlaneData();
+    const oversized = await createTestRelease("v0.2.0", "oversized");
+    oversized.archive_bytes = Buffer.alloc(MAX_RELEASE_ARCHIVE_BYTES + 1);
+    oversized.bundle_sha256 = sha256(oversized.archive_bytes);
+    expect(() => oversizedData.upsertRelease(oversized)).toThrow(
+      "release_archive_too_large"
+    );
+
+    const release = await createTestRelease("v0.2.0", "response-cap");
+    const basePack = {
+      client_id: "CAP",
+      installation_id: "cap-prod-001",
+      expires_at: "2026-06-25T13:00:00.000Z",
+      control_plane_url: "https://quoteops-control-plane-staging.vercel.app",
+      install_command: "sudo bash quoteops-bootstrap.sh",
+      release: {
+        version: release.version,
+        bundle_sha256: release.bundle_sha256
+      },
+      files: {
+        "client-manifest.yaml": "x".repeat(2_900_000)
+      }
+    };
+    const withinLimit = renderInstallerScript({
+      pack: basePack,
+      archiveBytes: Buffer.from(release.archive_bytes),
+      bundleSha256: release.bundle_sha256,
+      manifest: release.manifest
+    });
+    expect(Buffer.byteLength(withinLimit, "utf8")).toBeLessThanOrEqual(
+      MAX_INSTALLER_RESPONSE_BYTES
+    );
+    expect(() =>
+      renderInstallerScript({
+        pack: {
+          ...basePack,
+          files: {
+            "client-manifest.yaml": "x".repeat(3_100_000)
+          }
+        },
+        archiveBytes: Buffer.from(release.archive_bytes),
+        bundleSha256: release.bundle_sha256,
+        manifest: release.manifest
+      })
+    ).toThrow("installer_response_too_large");
+  });
 });
 
 describe("Supabase control-plane migration", () => {
@@ -899,6 +1545,13 @@ describe("Supabase control-plane migration", () => {
     );
     const unifiedStoreSql = await readFile(
       new URL("../../../supabase/migrations/0002_unify_client_store.sql", import.meta.url),
+      "utf8"
+    );
+    const pinnedInstallerSql = await readFile(
+      new URL(
+        "../../../supabase/migrations/0003_pin_install_packs_to_releases.sql",
+        import.meta.url
+      ),
       "utf8"
     );
     const tables = [
@@ -988,6 +1641,20 @@ describe("Supabase control-plane migration", () => {
     expect(unifiedStoreSql).toMatch(
       /grant select, insert, update, delete on table[\s\S]*?to quoteops_cp;/i
     );
+    for (const column of [
+      "release_version",
+      "bundle_sha256",
+      "install_pack",
+      "pack_sha256",
+      "manifest",
+      "manifest_bytes",
+      "archive"
+    ]) {
+      expect(pinnedInstallerSql).toContain(`add column if not exists ${column}`);
+    }
+    expect(pinnedInstallerSql).toContain(
+      "registration_token_reissue_required"
+    );
   });
 });
 
@@ -999,14 +1666,26 @@ async function startApi(options: {
   now?: () => Date;
   tokenGenerator?: () => string;
   tokenTtlMinutes?: number;
+  controlPlaneUrl?: string;
+  applianceReleaseRoot?: string;
+  applianceReleaseVersion?: string;
+  releaseSyncToken?: string | null;
   data?: ControlPlaneData;
   verifySessionToken?: (token: string) => Promise<{ user_id: string; email: string } | null>;
   isVendorAdminEmail?: (email: string) => boolean;
 } = {}) {
+  const data = options.data ?? createInMemoryControlPlaneData();
+  if (!(await data.latestRelease())) {
+    await data.upsertRelease(await createTestRelease("v0.2.0", "default-test-release"));
+  }
+  const controlPlaneUrl =
+    options.controlPlaneUrl === undefined
+      ? "https://quoteops-control-plane-staging.vercel.app"
+      : options.controlPlaneUrl;
   const app = createControlPlaneApi({
-    controlPlaneUrl: "https://quoteops-control-plane-staging.vercel.app",
+    controlPlaneUrl,
     verifyAdminToken: async (token) => (token === TEST_ADMIN_TOKEN ? "ops@e2e.example" : null),
-    data: createInMemoryControlPlaneData(),
+    data,
     ...options
   });
 
@@ -1021,11 +1700,195 @@ async function startApi(options: {
     ) {
       return directRequest(app, "POST", path, body, authorization);
     },
-    async getText(path: string) {
-      const response = await directRequest(app, "GET", path, undefined, null);
-      return { status: response.status, text: response.text };
+    async getText(path: string, authorization: string | null = null) {
+      const response = await directRequest(app, "GET", path, undefined, authorization);
+      return {
+        status: response.status,
+        text: response.text,
+        headers: response.headers
+      };
+    },
+    async getBinary(path: string, authorization: string | null = null) {
+      const response = await directRequest(app, "GET", path, undefined, authorization);
+      return {
+        status: response.status,
+        bytes: response.bytes,
+        headers: response.headers
+      };
+    },
+    async getTextWithHeaders(path: string, headers: Record<string, string>) {
+      const response = await directRequest(app, "GET", path, undefined, null, headers);
+      return {
+        status: response.status,
+        text: response.text,
+        headers: response.headers
+      };
     }
   };
+}
+
+async function createBootstrapReleaseFixture(
+  bootstrapChecksum?: string
+): Promise<string> {
+  const root = await mkdtemp(join(tmpdir(), "quoteops-bootstrap-release-"));
+  tempDirs.push(root);
+  const releaseDir = join(root, "v0.2.0");
+  await mkdir(releaseDir);
+  const bootstrap = await readFile(
+    join(process.cwd(), "deploy", "appliance", "bootstrap.sh")
+  );
+  await writeFile(join(releaseDir, "bootstrap.sh"), bootstrap);
+  await writeFile(
+    join(releaseDir, "SHA256SUMS"),
+    `${bootstrapChecksum ?? sha256(bootstrap)}  bootstrap.sh\n`
+  );
+  return root;
+}
+
+async function createTestRelease(
+  version: string,
+  marker: string,
+  runtimeFiles: Record<string, string> = {}
+): Promise<ReleaseRecord> {
+  const imageDigest = (digit: string) => digit.repeat(64);
+  const releaseEnv = [
+    `QUOTEOPS_VERSION=${version}`,
+    "QUOTEOPS_PLATFORM=linux/amd64",
+    `QUOTEOPS_AGENT_IMAGE=quoteops-agent:${version}@sha256:${imageDigest("1")}`,
+    `QUOTEOPS_API_IMAGE=quoteops-api:${version}@sha256:${imageDigest("2")}`,
+    `QUOTEOPS_WEB_IMAGE=quoteops-web:${version}@sha256:${imageDigest("3")}`,
+    `QUOTEOPS_POSTGRES_IMAGE=postgres:16@sha256:${imageDigest("4")}`,
+    `QUOTEOPS_REDIS_IMAGE=redis:7@sha256:${imageDigest("5")}`,
+    `QUOTEOPS_CADDY_IMAGE=caddy:2@sha256:${imageDigest("6")}`,
+    `QUOTEOPS_CLOUDFLARED_IMAGE=cloudflare/cloudflared:2025.7.0@sha256:${imageDigest("7")}`,
+    ""
+  ].join("\n");
+  const files = {
+    "Caddyfile": `# ${marker}\n`,
+    "docker-compose.yml": `# ${marker}\nservices: {}\n`,
+    "install.sh": `#!/usr/bin/env bash\nset -euo pipefail\nprintf '%s\\n' '${marker}'\n`,
+    "release.env": releaseEnv,
+    ...runtimeFiles
+  };
+  const manifest = {
+    schema_version: 1 as const,
+    version,
+    git_sha: "b".repeat(40),
+    platform: "linux/amd64" as const,
+    images: {
+      agent: `quoteops-agent:${version}@sha256:${imageDigest("1")}`,
+      api: `quoteops-api:${version}@sha256:${imageDigest("2")}`,
+      web: `quoteops-web:${version}@sha256:${imageDigest("3")}`,
+      postgres: `postgres:16@sha256:${imageDigest("4")}`,
+      redis: `redis:7@sha256:${imageDigest("5")}`,
+      caddy: `caddy:2@sha256:${imageDigest("6")}`,
+      cloudflared: `cloudflare/cloudflared:2025.7.0@sha256:${imageDigest("7")}`
+    },
+    files_sha256: Object.fromEntries(
+      Object.entries(files).map(([name, contents]) => [name, sha256(contents)])
+    ),
+    created_at: "2026-06-25T12:00:00.000Z"
+  };
+  const manifestBytes = Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`, "utf8");
+  const payloadEntries = {
+    ...files,
+    "release.json": manifestBytes
+  };
+  const payloadSums =
+    Object.entries(payloadEntries)
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([name, contents]) => `${sha256(contents)}  ${name}`)
+      .join("\n") + "\n";
+  const archiveEntries = {
+    ...payloadEntries,
+    PAYLOAD_SHA256SUMS: payloadSums
+  };
+  const archiveBytes = await createTarGzip(
+    Object.entries(archiveEntries)
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([name, contents]) => ({ name, contents }))
+  );
+  return {
+    version,
+    notes: marker,
+    bundle_sha256: sha256(archiveBytes),
+    manifest,
+    manifest_bytes: manifestBytes,
+    archive_bytes: archiveBytes,
+    published_at: "2026-06-25T12:00:00.000Z"
+  };
+}
+
+type TestTarEntry = {
+  name: string;
+  contents: string | Uint8Array;
+  type?: "file" | "directory" | "symlink" | "link";
+  linkname?: string;
+};
+
+async function createTarGzip(entries: TestTarEntry[]): Promise<Buffer> {
+  const pack = tar.pack();
+  const archivePromise = collectStream(pack);
+  for (const entry of entries) {
+    await new Promise<void>((resolve, reject) => {
+      pack.entry(
+        {
+          name: entry.name,
+          mode: entry.name.endsWith(".sh") ? 0o755 : 0o644,
+          uid: 0,
+          gid: 0,
+          ...(entry.type ? { type: entry.type } : {}),
+          ...(entry.linkname ? { linkname: entry.linkname } : {})
+        },
+        entry.contents,
+        (error) => (error ? reject(error) : resolve())
+      );
+    });
+  }
+  pack.finalize();
+  return gzipSync(await archivePromise);
+}
+
+function createTestTokenRecord(
+  token: string,
+  clientId: string,
+  installationId: string,
+  release: ReleaseRecord
+): RegistrationTokenRecord {
+  const expiresAt = "9999-01-01T00:00:00.000Z";
+  const installPackSnapshot = {
+    client_id: clientId,
+    installation_id: installationId,
+    expires_at: expiresAt,
+    control_plane_url: "https://quoteops-control-plane-staging.vercel.app",
+    install_command: "sudo bash quoteops-bootstrap.sh",
+    release: {
+      version: release.version,
+      bundle_sha256: release.bundle_sha256
+    },
+    files: {}
+  };
+  return {
+    token: sha256(token),
+    client_id: clientId,
+    installation_id: installationId,
+    expires_at: expiresAt,
+    used_at: null,
+    release_version: release.version,
+    bundle_sha256: release.bundle_sha256,
+    install_pack_snapshot: installPackSnapshot,
+    pack_sha256: sha256(canonicalizeInstallPack(installPackSnapshot))
+  };
+}
+
+async function collectStream(stream: Readable): Promise<Buffer> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of stream) chunks.push(Buffer.from(chunk));
+  return Buffer.concat(chunks);
+}
+
+function sha256(value: string | Uint8Array): string {
+  return createHash("sha256").update(value).digest("hex");
 }
 
 async function directRequest(
@@ -1033,8 +1896,15 @@ async function directRequest(
   method: "GET" | "POST",
   path: string,
   body: Record<string, unknown> | undefined,
-  authorization: string | null
-): Promise<{ status: number; body: Record<string, any>; text: string }> {
+  authorization: string | null,
+  requestHeaders: Record<string, string> = {}
+): Promise<{
+  status: number;
+  body: Record<string, any>;
+  text: string;
+  bytes: Buffer;
+  headers: ReturnType<ServerResponse["getHeaders"]>;
+}> {
   const payload = body === undefined ? "" : JSON.stringify(body);
   const socket = new Duplex({
     read() {},
@@ -1060,7 +1930,8 @@ async function directRequest(
             "content-length": String(Buffer.byteLength(payload))
           }
         : {}),
-      ...(authorization ? { authorization } : {})
+      ...(authorization ? { authorization } : {}),
+      ...requestHeaders
     }
   });
 
@@ -1085,7 +1956,8 @@ async function directRequest(
   app(req, res);
   await finished;
 
-  const text = Buffer.concat(chunks).toString("utf8");
+  const bytes = Buffer.concat(chunks);
+  const text = bytes.toString("utf8");
   const contentType = String(res.getHeader("content-type") ?? "");
   return {
     status: res.statusCode,
@@ -1093,6 +1965,8 @@ async function directRequest(
       text && contentType.includes("application/json")
         ? (JSON.parse(text) as Record<string, any>)
         : {},
-    text
+    text,
+    bytes,
+    headers: res.getHeaders()
   };
 }

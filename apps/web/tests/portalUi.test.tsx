@@ -2,6 +2,7 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { ClientProfilePage } from "../src/pages/clientProfile";
+import { ClientSetupWizard } from "../src/pages/clientSetupWizard";
 import { SentinelReportsPage } from "../src/pages/sentinelReports";
 import { isUpdateAvailable, parsePdfTemplate } from "../src/lib/portalSettings";
 import * as controlPlaneApi from "../src/api/controlPlaneApi";
@@ -137,5 +138,39 @@ describe("SentinelReportsPage", () => {
     expect(await screen.findByText(/Semana del 2026-07-06/i)).toBeInTheDocument();
     expect(screen.getByText(/12 corridas/i)).toBeInTheDocument();
     expect(screen.getByText(/Semana estable/)).toBeInTheDocument();
+  });
+});
+
+describe("ClientSetupWizard", () => {
+  it("shows safe Cloudflare readiness without rendering secret or metric names", () => {
+    const setup = {
+      activation: {
+        required: true,
+        status: "unlocked",
+        client_id: "cliente-demo",
+        installation_id: "cliente-demo-prod-001"
+      },
+      tunnel: {
+        provider: "cloudflare",
+        required: true,
+        status: "pending_manual_public_validation",
+        public_hostname: "quotes.client.example",
+        last_checked_at: "2026-07-30T00:00:00.000Z"
+      },
+      required_steps: ["connect_cloudflare"]
+    } as const;
+
+    render(<ClientSetupWizard setup={setup} />);
+
+    expect(screen.getByText("Publicar con Cloudflare")).toBeInTheDocument();
+    expect(screen.getByText("quotes.client.example")).toBeInTheDocument();
+    expect(
+      screen.getByText("pending_manual_public_validation")
+    ).toBeInTheDocument();
+    expect(document.body.textContent).not.toContain("TUNNEL_TOKEN");
+    expect(document.body.textContent).not.toContain(
+      "cloudflared_tunnel_ha_connections"
+    );
+    expect(document.body.textContent).not.toContain("CF-Access-Client-Id");
   });
 });

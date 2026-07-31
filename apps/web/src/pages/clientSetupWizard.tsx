@@ -1,6 +1,7 @@
 import { FormEvent, useState } from "react";
 import {
   BookOpen,
+  Cloud,
   Database,
   KeyRound,
   Mail,
@@ -34,6 +35,13 @@ const setupSteps: Array<{
     detail:
       "Guarda localmente las llaves del TMS, correo, SAKBE, modelo y embeddings.",
     icon: KeyRound
+  },
+  {
+    id: "connect_cloudflare",
+    title: "Publicar con Cloudflare",
+    detail:
+      "Conecta el túnel nombrado del cliente y confirma que Cloudflare Access protege el dominio.",
+    icon: Cloud
   },
   {
     id: "connect_tms",
@@ -155,6 +163,13 @@ export function ClientSetupWizard({ setup }: ClientSetupWizardProps) {
               <Icon size={18} aria-hidden />
               <strong>{step.title}</strong>
               <small>{step.detail}</small>
+              {step.id === "connect_cloudflare" ? (
+                <small>
+                  <span>{setup.tunnel?.public_hostname ?? "Hostname pendiente"}</span>
+                  {" · "}
+                  <span>{setup.tunnel?.status ?? "pending_manual_public_validation"}</span>
+                </small>
+              ) : null}
               <span className={required ? "status status-amber" : "status status-green"}>
                 {required ? "Pendiente" : "Listo"}
               </span>

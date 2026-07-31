@@ -1,4 +1,10 @@
-export type TmsCapability = "historical_quotes" | "writeback" | "health_check";
+export type TmsCapability =
+  | "historical_quotes"
+  | "units"
+  | "unit_performance"
+  | "availability_zones"
+  | "writeback"
+  | "health_check";
 
 export type ClientQuestionnaireInput = {
   legal_data: {
@@ -10,7 +16,7 @@ export type ClientQuestionnaireInput = {
   tms: {
     provider: string;
     base_url: string | null;
-    auth_type: "api_key" | "oauth" | "none";
+    auth_type: "api_key" | "none";
     capabilities: TmsCapability[];
     historical_quotes_source: "api" | "csv" | "database" | null;
     writeback_target: "api" | "csv" | "database" | null;

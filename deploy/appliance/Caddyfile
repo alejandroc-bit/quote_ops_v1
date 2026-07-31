@@ -1,3 +1,5 @@
+# Production is an internal HTTP origin; Cloudflare terminates TLS and the
+# named tunnel routes the customer-owned hostname to caddy:80.
 {$QUOTEOPS_SITE_ADDRESS} {
 	encode zstd gzip
 

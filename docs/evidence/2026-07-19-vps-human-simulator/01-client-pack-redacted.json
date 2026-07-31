@@ -1,0 +1,10 @@
+{
+  "client_id": "RESAUX",
+  "authorized_user": "alejandro@resaux.io",
+  "installation_id": "resaux-prod-001",
+  "version": "v0.1.7",
+  "registration_token": "[REDACTED_ONE_USE]",
+  "control_plane_url": "https://quote-ops-portal.vercel.app",
+  "mailbox_user": "[REDACTED_MANAGED_RESEND_ADDRESS]",
+  "mailbox_from": "cotizaciones@inducta.io"
+}

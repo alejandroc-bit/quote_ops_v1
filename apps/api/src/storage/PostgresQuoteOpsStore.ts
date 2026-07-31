@@ -232,6 +232,38 @@ export class PostgresQuoteOpsStore implements QuoteOpsStore {
     );
   }
 
+  async claimAgentRunForResume(runId: string, decision: ApprovalDecision): Promise<boolean> {
+    await this.ensureSchema();
+
+    const result = await this.pool.query(
+      `
+      with claimed as (
+        update quote_runs
+           set status = 'running', summary = 'Approval resume claimed', updated_at = now()
+         where run_id = $1 and status = 'waiting_approval'
+        returning run_id
+      )
+      insert into agent_approval_decisions (run_id, action, rate_mxn, reason, email_sent, decided_at)
+      select run_id, $2, $3, $4, $5, $6 from claimed
+      on conflict (run_id) do update set
+        action = excluded.action,
+        rate_mxn = excluded.rate_mxn,
+        reason = excluded.reason,
+        email_sent = excluded.email_sent,
+        decided_at = excluded.decided_at
+      `,
+      [
+        runId,
+        decision.action,
+        decision.rate_mxn ?? null,
+        decision.reason ?? null,
+        decision.email_sent,
+        decision.decided_at
+      ]
+    );
+    return result.rowCount === 1;
+  }
+
   async getApprovalDecision(runId: string): Promise<ApprovalDecision | null> {
     await this.ensureSchema();
 

@@ -1,22 +1,85 @@
+import type { PublishedApplianceRelease } from "@quoteops/shared";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { z } from "zod";
 import type { MinimalClientRecord } from "./minimalRegistry.js";
+
+const TMS_HTTP_V1_OPENAPI = readFileSync(
+  fileURLToPath(
+    new URL(
+      "../../../docs/integrations/tms-http-v1.openapi.yaml",
+      import.meta.url
+    )
+  ),
+  "utf8"
+);
+const TMS_HTTP_V1_GUIDE = readFileSync(
+  fileURLToPath(
+    new URL(
+      "../../../docs/integrations/tms-http-v1.md",
+      import.meta.url
+    )
+  ),
+  "utf8"
+);
 
 export type InstallPack = {
   client_id: string;
   installation_id: string;
-  registration_token: string;
   expires_at: string;
   control_plane_url: string;
   install_command: string;
+  release: {
+    version: string;
+    bundle_sha256: string;
+  };
   files: Record<string, string>;
 };
+
+export type IssuedInstallPack = InstallPack & {
+  registration_token: string;
+};
+
+export const installPackSchema = z
+  .object({
+    client_id: z.string().min(1),
+    installation_id: z.string().min(1),
+    expires_at: z.string().datetime({ offset: true }),
+    control_plane_url: z
+      .string()
+      .url()
+      .refine((value) => {
+        try {
+          return normalizeControlPlaneOrigin(value) === value;
+        } catch {
+          return false;
+        }
+      }, "normalized HTTPS origin required"),
+    install_command: z.string().min(1),
+    release: z
+      .object({
+        version: z.string().regex(/^v\d+\.\d+\.\d+$/),
+        bundle_sha256: z.string().regex(/^[a-f0-9]{64}$/)
+      })
+      .strict(),
+    files: z.record(z.string().min(1), z.string())
+  })
+  .strict();
+
+export function parseInstallPack(value: unknown): InstallPack {
+  return installPackSchema.parse(value);
+}
 
 export function createInstallPack(input: {
   client: MinimalClientRecord;
   control_plane_url: string;
   registration_token: string;
   expires_at: string;
-}): InstallPack {
-  const controlPlaneUrl = input.control_plane_url.replace(/\/+$/, "");
+  release: PublishedApplianceRelease;
+}): IssuedInstallPack {
+  const controlPlaneUrl = normalizeControlPlaneOrigin(input.control_plane_url, {
+    allowLocal: process.env.QUOTEOPS_ALLOW_LOCAL_ORIGIN === "1"
+  });
   const { client } = input;
   const installationId = client.installation.installation_id;
 
@@ -26,16 +89,16 @@ export function createInstallPack(input: {
     registration_token: input.registration_token,
     expires_at: input.expires_at,
     control_plane_url: controlPlaneUrl,
-    // single physical line on purpose: a backslash-newline continuation is
-    // fragile to copy/paste (web renderers and chat UIs can swap the space
-    // after it for a non-breaking/zero-width char, which then makes the
-    // shell fail to find "bash"). No angle brackets in the placeholder
-    // either, since those look like they should stay in the string.
-    install_command: `QUOTEOPS_REGISTRATION_TOKEN="PASTE_YOUR_TOKEN_HERE" bash -c 'curl -fsSL ${controlPlaneUrl}/api/install/$QUOTEOPS_REGISTRATION_TOKEN | bash'`,
+    install_command: `bash -c 'set -Eeuo pipefail; bootstrap="$(mktemp "\${TMPDIR:-/tmp}/quoteops-bootstrap.XXXXXX")"; trap '\\''rm -f "$bootstrap"'\\'' EXIT INT TERM; curl --proto "=https" --proto-redir "=https" --tlsv1.2 -fsSL "${controlPlaneUrl}/install/quoteops" -o "$bootstrap"; sudo bash "$bootstrap"'`,
+    release: {
+      version: input.release.manifest.version,
+      bundle_sha256: input.release.bundle_sha256
+    },
     files: {
       "client-manifest.yaml": renderClientManifest(client),
       "criteria-template.yaml": renderCriteriaTemplate(client),
       "connectors/agent/agent-config.yaml": renderAgentConfigTemplate(),
+      "connectors/knowledge/README.md": renderKnowledgeReadme(),
       "connectors/tms-adapter.yaml": renderTmsAdapterTemplate(),
       "connectors/tms/rfqs.csv": renderRfqCsvTemplate(),
       "connectors/tms/historical-quotes.csv": renderHistoricalQuotesCsvTemplate(),
@@ -48,10 +111,34 @@ export function createInstallPack(input: {
       "connectors/tms/availability-zones.csv": renderAvailabilityZonesCsvTemplate(),
       "connectors/tms/quote-writebacks.jsonl": "",
       "connectors/tms/status-writebacks.jsonl": "",
+      "connectors/tms-http-v1.openapi.yaml": TMS_HTTP_V1_OPENAPI,
+      "connectors/tms-http-v1.md": TMS_HTTP_V1_GUIDE,
       "connectors/tms-http-contract.md": renderHttpContract(),
       "connectors/tms-sql-contract.md": renderSqlContract()
     }
   };
+}
+
+export function normalizeControlPlaneOrigin(
+  value: string,
+  options: { allowLocal?: boolean } = {}
+): string {
+  const url = new URL(value);
+  const isLocalHttp =
+    options.allowLocal === true &&
+    url.protocol === "http:" &&
+    (url.hostname === "127.0.0.1" || url.hostname === "localhost");
+  if (
+    !(url.protocol === "https:" || isLocalHttp) ||
+    url.username ||
+    url.password ||
+    url.pathname !== "/" ||
+    url.search ||
+    url.hash
+  ) {
+    throw new Error("control_plane_origin_invalid");
+  }
+  return url.origin;
 }
 
 function renderClientManifest(client: MinimalClientRecord): string {
@@ -160,9 +247,14 @@ function renderAgentConfigTemplate(): string {
   return [
     "model:",
     "  provider: openrouter",
-    "  model_name: nvidia/nemotron-3-ultra-550b-a55b:free",
+    "  model_name: openai/gpt-4o-mini",
     "  temperature: 0",
     "  api_key_env: OPENROUTER_API_KEY",
+    "embeddings:",
+    "  provider: gemini",
+    "  model: text-embedding-004",
+    "  api_key_env: QUOTEOPS_EMBEDDING_API_KEY",
+    "  base_url: null",
     "authorization:",
     "  tools:",
     "    email.intake:",
@@ -193,6 +285,23 @@ function renderAgentConfigTemplate(): string {
     "#   poll_interval_ms: 60000",
     "#   imap_host: null        # imap provider only",
     "#   imap_port: null"
+  ].join("\n");
+}
+
+function renderKnowledgeReadme(): string {
+  return [
+    "# Documentos de conocimiento de QuoteOps",
+    "",
+    "Coloca aquí tus documentos de conocimiento: hasta 20 archivos `.md`, `.txt`",
+    "o `.json`, de máximo 5 MiB cada uno. El onboarding los copiará con permisos",
+    "`0600` y nombres seguros.",
+    "",
+    "Antes de crear embeddings se solicitará consentimiento explícito: el texto",
+    "de los documentos se envía al proveedor de embeddings configurado. Los",
+    "vectores resultantes y la base de datos de QuoteOps permanecen locales.",
+    "",
+    "Este README es sólo una guía y nunca se ingiere como fuente.",
+    ""
   ].join("\n");
 }
 

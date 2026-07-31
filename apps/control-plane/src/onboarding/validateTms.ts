@@ -16,9 +16,13 @@ export function validateTms(tms: ClientQuestionnaireInput["tms"]): OnboardingRea
   const capabilities = {
     historical_quotes:
       capabilitySet.has("historical_quotes") && tms.historical_quotes_source !== null,
+    units: capabilitySet.has("units"),
+    unit_performance: capabilitySet.has("unit_performance"),
+    availability_zones: capabilitySet.has("availability_zones"),
     writeback: capabilitySet.has("writeback") && tms.writeback_target !== null,
     health_check: capabilitySet.has("health_check")
   };
+  const isQuoteOpsHttpV1 = tms.provider === "quoteops-tms-http-v1";
 
   if (!tms.base_url && tms.provider !== "file-import") {
     blockingIssues.push("tms_base_url_missing");
@@ -36,8 +40,26 @@ export function validateTms(tms: ClientQuestionnaireInput["tms"]): OnboardingRea
   }
 
   if (!capabilities.health_check) {
-    warnings.push("tms_health_check_missing");
-    nextActions.push("add_tms_health_check");
+    if (isQuoteOpsHttpV1) {
+      blockingIssues.push("tms_health_check_missing");
+      nextActions.push("configure_tms_health_check");
+    } else {
+      warnings.push("tms_health_check_missing");
+      nextActions.push("add_tms_health_check");
+    }
+  }
+
+  if (isQuoteOpsHttpV1) {
+    for (const capability of [
+      "units",
+      "unit_performance",
+      "availability_zones"
+    ] as const) {
+      if (!capabilities[capability]) {
+        blockingIssues.push(`tms_${capability}_missing`);
+        nextActions.push(`configure_tms_${capability}`);
+      }
+    }
   }
 
   if (blockingIssues.length === 0) {

@@ -21,6 +21,7 @@ export type WorkflowNodeStatus =
 export type SetupStepId =
   | "activate_license"
   | "configure_secrets"
+  | "connect_cloudflare"
   | "connect_tms"
   | "map_tms"
   | "connect_knowledge_base"
@@ -34,6 +35,20 @@ export type SetupState = {
     status: "locked" | "unlocked" | string;
     client_id: string | null;
     installation_id: string | null;
+  };
+  tunnel: {
+    provider: "cloudflare";
+    required: true;
+    status:
+      | "missing_config"
+      | "missing_token"
+      | "starting"
+      | "ready"
+      | "unreachable"
+      | "access_unprotected"
+      | "pending_manual_public_validation";
+    public_hostname: string | null;
+    last_checked_at: string;
   };
   required_steps: SetupStepId[];
 };

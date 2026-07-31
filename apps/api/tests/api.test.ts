@@ -1,20 +1,26 @@
+import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { type IncomingMessage, ServerResponse } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Duplex, Readable } from "node:stream";
-import { afterEach, describe, expect, it } from "vitest";
+import { gzipSync } from "node:zlib";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import tar from "tar-stream";
 import {
   createApplianceWorkflowTools,
+  buildLocalSetupState,
   createInMemoryQuoteOpsStore,
   createQuoteOpsApi,
   startControlPlaneSyncScheduler,
-  type QuoteOpsApiDependencies
+  type QuoteOpsApiDependencies,
+  type TunnelReadinessProbe
 } from "../src/index";
 import { createControlPlaneApi } from "../../control-plane-api/src/index";
 import {
   createInMemoryControlPlaneData,
-  type ControlPlaneData
+  type ControlPlaneData,
+  type ReleaseRecord
 } from "../../control-plane-api/src/data/index";
 import { quoteLane } from "../../agent/src/graph/nodes/quote";
 import { loadPdfTemplate } from "../../agent/src/pdf/quotePdf";
@@ -47,6 +53,7 @@ afterEach(async () => {
     process.env.QUOTEOPS_INSTALLATION_ID = originalInstallationId;
   }
   await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
+  readyEnvDir = null;
 });
 
 describe("QuoteOps API", () => {
@@ -130,6 +137,62 @@ describe("QuoteOps API", () => {
         approval_required: false
       })
     );
+  });
+
+  it("reuses a structurally identical deterministic Playground run and rejects conflicts", async () => {
+    const writeback = vi.fn(async () => ({
+      status: "written" as const,
+      quote_id: "QUOTE-READINESS-1"
+    }));
+    const baseUrl = await startApi({
+      defaultManifest: Promise.resolve(workflowInput.manifest),
+      defaultTools: { ...workflowInput.tools, writeback }
+    });
+    const request = {
+      run_id: "RUN-READINESS-IDEMPOTENT-001",
+      request_sha256: "a".repeat(64),
+      origin_city: "Guadalajara",
+      origin_state: "Jalisco",
+      destination_city: "Monterrey",
+      destination_state: "Nuevo Leon",
+      equipment_request: "caja seca 53",
+      vehicle_profile_id: "T3S2_53_DRYVAN",
+      weight_kg: 18000,
+      commodity: "general",
+      sector: "industrial",
+      value_mxn: 250000,
+      business_unit_id: "general"
+    };
+    const submit = () =>
+      fetch(`${baseUrl}/api/playground/rfqs`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(request)
+      });
+
+    const first = await submit();
+    const duplicate = await submit();
+    const conflict = await fetch(`${baseUrl}/api/playground/rfqs`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        ...request,
+        destination_city: "Saltillo"
+      })
+    });
+    await waitForWorkflow(baseUrl, request.run_id);
+    for (let attempt = 0; attempt < 25 && writeback.mock.calls.length === 0; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+
+    expect(first.status).toBe(202);
+    expect(duplicate.status).toBe(202);
+    expect((await duplicate.json()).run_id).toBe(request.run_id);
+    expect(conflict.status).toBe(409);
+    expect(await conflict.json()).toEqual({
+      error: "playground_run_conflict"
+    });
+    expect(writeback.mock.calls.length).toBeLessThanOrEqual(1);
   });
 
   it("lists submitted RFQs and exposes a minimal approval envelope", async () => {
@@ -612,9 +675,8 @@ describe("QuoteOps API", () => {
   });
 
   it("syncs only minimal heartbeat and aggregate counters to the control plane", async () => {
-    const data = createInMemoryControlPlaneData({
-      releases: [{ version: "v1.1.0", notes: "Stable" }]
-    });
+    const data = createInMemoryControlPlaneData();
+    await data.upsertRelease(await createApiTestRelease("v1.1.0", "Stable"));
     const cloudBaseUrl = await startCloudTestServer("unused-token", data);
     await fetch(`${cloudBaseUrl}/api/admin/clients`, {
       method: "POST",
@@ -677,7 +739,7 @@ describe("QuoteOps API", () => {
         expect(syncBody.heartbeat).toEqual({
           client_id: "cliente-demo",
           ai_key_status: "configured",
-          onboarding_status: "ready",
+          onboarding_status: "licensed",
           version: "v1.0.0"
         });
         expect(syncBody.counters).toEqual({
@@ -698,7 +760,7 @@ describe("QuoteOps API", () => {
         });
         const cloudBody = await cloudClients.json();
         expect(cloudBody.items[0].installation.ai_key_status).toBe("configured");
-        expect(cloudBody.items[0].installation.onboarding_status).toBe("ready");
+        expect(cloudBody.items[0].installation.onboarding_status).toBe("licensed");
         expect(cloudBody.items[0].counters).toEqual({
           total: 1,
           validated: 1,
@@ -866,6 +928,7 @@ describe("QuoteOps API", () => {
           expect.arrayContaining([
             "activate_license",
             "configure_secrets",
+            "connect_cloudflare",
             "connect_tms",
             "map_tms",
             "connect_knowledge_base",
@@ -874,6 +937,15 @@ describe("QuoteOps API", () => {
             "run_test_rfq"
           ])
         );
+        expect(body.tunnel).toEqual({
+          provider: "cloudflare",
+          required: true,
+          status: "missing_config",
+          public_hostname: null,
+          last_checked_at: expect.any(String)
+        });
+        expect(body.required_steps).toContain("connect_cloudflare");
+        expect(serialized).not.toContain("TUNNEL_TOKEN");
         expect(serialized).not.toContain("compras@cliente.com");
         expect(serialized).not.toContain("raw_rfq");
         expect(serialized).not.toContain("TMS_API_KEY");
@@ -881,6 +953,158 @@ describe("QuoteOps API", () => {
       }
     );
   });
+
+  it("derives tunnel readiness only from connections, Access evidence, and a matching authenticated-origin receipt", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "quoteops-tunnel-state-"));
+    tempDirs.push(dir);
+    const configPath = join(dir, "cloudflare.json");
+    const receiptPath = join(dir, "cloudflare-public-validation.json");
+    await writeFile(
+      configPath,
+      JSON.stringify({
+        provider: "cloudflare",
+        public_hostname: "quotes.client.example",
+        origin_url: "http://caddy:80"
+      })
+    );
+    const env = {
+      QUOTEOPS_INSTALLATION_ID: "cliente-demo-prod-001",
+      QUOTEOPS_VERSION: "v0.2.0",
+      QUOTEOPS_CLOUDFLARE_CONFIG_PATH: configPath,
+      QUOTEOPS_CLOUDFLARE_PUBLIC_VALIDATION_RECEIPT_PATH: receiptPath,
+      TUNNEL_TOKEN: ""
+    };
+    const publicProtected = new Response(null, {
+      status: 403,
+      headers: { server: "cloudflare", "cf-ray": "abc-MTY" }
+    });
+
+    const zeroConnections: TunnelReadinessProbe = {
+      getHaConnections: async () => 0,
+      fetchPublic: vi.fn(async () => publicProtected)
+    };
+    const zero = await buildLocalSetupState({
+      env,
+      manifest: workflowInput.manifest,
+      testRfqReady: true,
+      tunnelReadinessProbe: zeroConnections
+    });
+    expect(zero.tunnel.status).toBe("starting");
+    expect(zero.required_steps).toContain("connect_cloudflare");
+    expect(zeroConnections.fetchPublic).not.toHaveBeenCalled();
+
+    const unprotected = await buildLocalSetupState({
+      env,
+      manifest: workflowInput.manifest,
+      testRfqReady: true,
+      tunnelReadinessProbe: {
+        getHaConnections: async () => 1,
+        fetchPublic: async () => Response.json({ ok: true })
+      }
+    });
+    expect(unprotected.tunnel.status).toBe("access_unprotected");
+
+    const protectedWithoutReceipt = await buildLocalSetupState({
+      env,
+      manifest: workflowInput.manifest,
+      testRfqReady: true,
+      tunnelReadinessProbe: {
+        getHaConnections: async () => 1,
+        fetchPublic: async () => publicProtected
+      }
+    });
+    expect(protectedWithoutReceipt.tunnel.status).toBe(
+      "pending_manual_public_validation"
+    );
+
+    await writeFile(
+      receiptPath,
+      JSON.stringify({
+        public_hostname: "quotes.client.example",
+        version: "v0.1.9",
+        client_id: "cliente-demo",
+        installation_id: "wrong-installation",
+        authenticated_origin: true
+      })
+    );
+    const mismatched = await buildLocalSetupState({
+      env,
+      manifest: workflowInput.manifest,
+      testRfqReady: true,
+      tunnelReadinessProbe: {
+        getHaConnections: async () => 1,
+        fetchPublic: async () => publicProtected
+      }
+    });
+    expect(mismatched.tunnel.status).toBe("pending_manual_public_validation");
+
+    await writeFile(
+      receiptPath,
+      JSON.stringify({
+        public_hostname: "quotes.client.example",
+        version: "v0.2.0",
+        client_id: "cliente-demo",
+        installation_id: "cliente-demo-prod-001",
+        authenticated_origin: true
+      })
+    );
+    const ready = await buildLocalSetupState({
+      env,
+      manifest: workflowInput.manifest,
+      testRfqReady: true,
+      tunnelReadinessProbe: {
+        getHaConnections: async () => 1,
+        fetchPublic: async () => publicProtected
+      }
+    });
+    expect(ready.tunnel).toMatchObject({
+      provider: "cloudflare",
+      required: true,
+      status: "ready",
+      public_hostname: "quotes.client.example"
+    });
+    expect(ready.required_steps).not.toContain("connect_cloudflare");
+    expect(JSON.stringify(ready)).not.toContain("TUNNEL_TOKEN");
+  });
+
+  it("marks an unreachable public tunnel probe safely without exposing response data", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "quoteops-tunnel-timeout-"));
+    tempDirs.push(dir);
+    const configPath = join(dir, "cloudflare.json");
+    await writeFile(
+      configPath,
+      JSON.stringify({
+        provider: "cloudflare",
+        public_hostname: "quotes.client.example",
+        origin_url: "http://caddy:80"
+      })
+    );
+    const probe: TunnelReadinessProbe = {
+      getHaConnections: async () => 1,
+      fetchPublic: vi.fn(
+        async (_url, init) =>
+          await new Promise<Response>((_resolve, reject) => {
+            init?.signal?.addEventListener("abort", () => reject(new Error("secret-body")), {
+              once: true
+            });
+          })
+      )
+    };
+    const state = await buildLocalSetupState({
+      env: {
+        QUOTEOPS_INSTALLATION_ID: "cliente-demo-prod-001",
+        QUOTEOPS_VERSION: "v0.2.0",
+        QUOTEOPS_CLOUDFLARE_CONFIG_PATH: configPath,
+        TUNNEL_TOKEN: "present"
+      },
+      manifest: workflowInput.manifest,
+      testRfqReady: true,
+      tunnelReadinessProbe: probe
+    });
+
+    expect(state.tunnel.status).toBe("unreachable");
+    expect(JSON.stringify(state)).not.toContain("secret-body");
+  }, 5_000);
 
   it("unlocks setup only when the signed license verifies for the local installation", async () => {
     const keyPair = generateLicenseKeyPair();
@@ -978,7 +1202,7 @@ describe("QuoteOps API", () => {
     );
   });
 
-  it("propagates the control plane rejection code instead of an opaque 500", async () => {
+  it("reuses a completed control-plane activation after response loss", async () => {
     const cloudBaseUrl = await startCloudTestServer("registration-token-reused");
     await fetch(`${cloudBaseUrl}/api/admin/clients`, {
       method: "POST",
@@ -1018,8 +1242,8 @@ describe("QuoteOps API", () => {
         });
         expect(first.status).toBe(200);
 
-        // the token was consumed by the first activation: the cloud answers
-        // 403 registration_token_used and the appliance must not mask it
+        // The first response can be lost. Retrying must recreate the current
+        // license response without consuming the token a second time.
         const reused = await fetch(`${baseUrl}/api/onboarding/activate`, {
           method: "POST",
           headers: { "content-type": "application/json" },
@@ -1027,9 +1251,12 @@ describe("QuoteOps API", () => {
         });
         const reusedBody = await reused.json();
 
-        expect(reused.status).toBe(403);
-        expect(reusedBody.error).toBe("registration_token_used");
-        expect(reusedBody.message).toContain("Generate install pack");
+        expect(reused.status).toBe(200);
+        expect(reusedBody).toMatchObject({
+          activated: true,
+          client_id: "cliente-demo",
+          installation_id: "cliente-demo-prod-001"
+        });
       }
     );
   });
@@ -1077,6 +1304,430 @@ describe("QuoteOps API", () => {
 
         expect(response.status).toBe(200);
         expect(body.required_steps).not.toContain("configure_secrets");
+      }
+    );
+  });
+
+  it("derives setup and heartbeat readiness from the configured NVIDIA NIM and Resend providers", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "quoteops-provider-readiness-"));
+    tempDirs.push(dir);
+    const agentConfigPath = join(dir, "agent-config.yaml");
+    const malformedAgentConfigPath = join(dir, "malformed-agent-config.yaml");
+    await writeFile(
+      agentConfigPath,
+      [
+        "model:",
+        "  provider: openai",
+        "  model_name: nvidia/llama-3.3-nemotron-super-49b-v1",
+        "  temperature: 0",
+        "  api_key_env: NVIDIA_NIM_API_KEY",
+        "authorization:",
+        "  tools: {}",
+        "mailbox:",
+        "  provider: resend",
+        ""
+      ].join("\n"),
+      "utf8"
+    );
+    await writeFile(malformedAgentConfigPath, "model: not-an-object\n", "utf8");
+    const providerMailboxReceiptPath = join(dir, "mailbox-probe.json");
+    const providerCredentialRevisionPath = join(
+      dir,
+      "appliance-secrets-credential.json"
+    );
+    await writeFile(
+      providerCredentialRevisionPath,
+      JSON.stringify({ schema_version: 1, credential_revision: 1 })
+    );
+    await writeFile(
+      providerMailboxReceiptPath,
+      JSON.stringify({
+        schema_version: 1,
+        provider: "resend",
+        status: "ok",
+        agent_config_sha256: createHash("sha256")
+          .update(await readFile(agentConfigPath))
+          .digest("hex"),
+        credential_revision: 1,
+        validated_at: "2026-07-01T00:00:00.000Z",
+        code: "message_accepted"
+      })
+    );
+    const cloudBaseUrl = await startCloudTestServer("provider-ready-token");
+    await fetch(`${cloudBaseUrl}/api/admin/clients`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${TEST_ADMIN_TOKEN}` },
+      body: JSON.stringify({
+        client_id: "cliente-demo",
+        legal_name: "Cliente Demo SA de CV",
+        authorized_email: "ops@cliente.com"
+      })
+    });
+    await fetch(`${cloudBaseUrl}/api/admin/clients/cliente-demo/install-pack`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${TEST_ADMIN_TOKEN}` },
+      body: "{}"
+    });
+    await fetch(`${cloudBaseUrl}/api/onboarding/activate`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        client_id: "cliente-demo",
+        installation_id: "cliente-demo-prod-001",
+        email: "ops@cliente.com",
+        registration_token: "provider-ready-token"
+      })
+    });
+
+    const providerReadyEnv = await setupReadyEnv({
+      QUOTEOPS_AGENT_CONFIG_PATH: agentConfigPath,
+      QUOTEOPS_CONTROL_PLANE_URL: cloudBaseUrl,
+      QUOTEOPS_REGISTRATION_TOKEN: "provider-ready-token",
+      QUOTEOPS_VERSION: "v1.0.0",
+      NVIDIA_NIM_API_KEY: "nim-present",
+      RESEND_API_KEY: "resend-present",
+      MAILBOX_FROM: "quotes@example.com",
+      MAILBOX_PASSWORD: "",
+      MAILBOX_OAUTH_CLIENT_ID: "",
+      MAILBOX_OAUTH_CLIENT_SECRET: "",
+      MAILBOX_OAUTH_REFRESH_TOKEN: "",
+      OPENROUTER_API_KEY: "",
+      QUOTEOPS_EMBEDDING_API_KEY: "",
+      TMS_API_KEY: "",
+      QUOTEOPS_MAILBOX_PROBE_RECEIPT_PATH: providerMailboxReceiptPath,
+      QUOTEOPS_APPLIANCE_CREDENTIAL_REVISION_PATH:
+        providerCredentialRevisionPath
+    });
+
+    await withEnv(providerReadyEnv, async () => {
+      const baseUrl = await startApi({
+        defaultManifest: Promise.resolve(workflowInput.manifest)
+      });
+      const setupResponse = await fetch(`${baseUrl}/api/setup-state`);
+      const setup = await setupResponse.json();
+
+      expect(setupResponse.status).toBe(200);
+      expect(setup.required_steps).not.toContain("configure_secrets");
+      expect(setup.required_steps).not.toContain("connect_mailbox");
+
+      const syncResponse = await fetch(`${baseUrl}/api/control-plane/sync-minimal`, {
+        method: "POST"
+      });
+      const sync = await syncResponse.json();
+      expect(syncResponse.status).toBe(202);
+      expect(sync.heartbeat.ai_key_status).toBe("configured");
+    });
+
+    clearApplianceTestApps();
+
+    await withEnv(
+      { ...providerReadyEnv, NVIDIA_NIM_API_KEY: "" },
+      async () => {
+        const baseUrl = await startApi({
+          defaultManifest: Promise.resolve(workflowInput.manifest)
+        });
+        const response = await fetch(`${baseUrl}/api/setup-state`);
+        const setup = await response.json();
+
+        expect(response.status).toBe(200);
+        expect(setup.required_steps).toContain("configure_secrets");
+      }
+    );
+
+    clearApplianceTestApps();
+
+    await withEnv(
+      { ...providerReadyEnv, RESEND_API_KEY: "" },
+      async () => {
+        const baseUrl = await startApi({
+          defaultManifest: Promise.resolve(workflowInput.manifest)
+        });
+        const response = await fetch(`${baseUrl}/api/setup-state`);
+        const setup = await response.json();
+
+        expect(response.status).toBe(200);
+        expect(setup.required_steps).not.toContain("configure_secrets");
+        expect(setup.required_steps).toContain("connect_mailbox");
+      }
+    );
+
+    clearApplianceTestApps();
+
+    await withEnv(
+      { ...providerReadyEnv, QUOTEOPS_AGENT_CONFIG_PATH: join(dir, "missing-agent-config.yaml") },
+      async () => {
+        const baseUrl = await startApi({
+          defaultManifest: Promise.resolve(workflowInput.manifest)
+        });
+        const response = await fetch(`${baseUrl}/api/setup-state`);
+        const setup = await response.json();
+
+        expect(response.status).toBe(200);
+        expect(setup.required_steps).toContain("configure_secrets");
+        expect(setup.required_steps).toContain("connect_mailbox");
+      }
+    );
+
+    clearApplianceTestApps();
+
+    await withEnv(
+      { ...providerReadyEnv, QUOTEOPS_AGENT_CONFIG_PATH: malformedAgentConfigPath },
+      async () => {
+        const baseUrl = await startApi({
+          defaultManifest: Promise.resolve(workflowInput.manifest)
+        });
+        const response = await fetch(`${baseUrl}/api/setup-state`);
+        const setup = await response.json();
+
+        expect(response.status).toBe(200);
+        expect(setup.required_steps).toContain("configure_secrets");
+        expect(setup.required_steps).toContain("connect_mailbox");
+      }
+    );
+  });
+
+  it("keeps the TMS connection step pending until the configured adapter and its environment resolve", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "quoteops-tms-connection-readiness-"));
+    tempDirs.push(dir);
+    const malformedAdapterPath = join(dir, "malformed-tms-adapter.yaml");
+    const httpAdapterPath = join(dir, "http-tms-adapter.yaml");
+    const fileImportAdapterPath = join(dir, "file-import-tms-adapter.yaml");
+    const usableRfqPath = join(dir, "rfqs.csv");
+    const usableWritebackPath = join(dir, "writebacks", "quotes.ndjson");
+    const notADirectoryPath = join(dir, "not-a-directory");
+    await writeFile(malformedAdapterPath, "provider: unsupported\n", "utf8");
+    await writeFile(
+      fileImportAdapterPath,
+      [
+        "provider: file_import",
+        "rfqs_path_env: CLIENT_RFQS_PATH",
+        "quote_writebacks_path_env: CLIENT_QUOTE_WRITEBACKS_PATH",
+        ""
+      ].join("\n"),
+      "utf8"
+    );
+    await writeFile(usableRfqPath, "rfq_id,lane_id\n", "utf8");
+    await mkdir(join(dir, "writebacks"), { recursive: true });
+    await writeFile(notADirectoryPath, "not a directory\n", "utf8");
+    await writeFile(
+      httpAdapterPath,
+      [
+        "provider: http",
+        "base_url_env: TMS_HTTP_BASE_URL",
+        "headers:",
+        "  Authorization: Bearer \${TMS_HTTP_TOKEN}",
+        ""
+      ].join("\n"),
+      "utf8"
+    );
+
+    const expectPendingConnection = async (overrides: Record<string, string>) => {
+      await withEnv(await setupReadyEnv(overrides), async () => {
+        const baseUrl = await startApi({
+          defaultManifest: Promise.resolve(workflowInput.manifest)
+        });
+        const response = await fetch(`${baseUrl}/api/setup-state`);
+        const setup = await response.json();
+
+        expect(response.status).toBe(200);
+        expect(setup.required_steps).toContain("connect_tms");
+      });
+      clearApplianceTestApps();
+    };
+
+    await expectPendingConnection({
+      QUOTEOPS_TMS_ADAPTER_CONFIG_PATH: join(dir, "missing-tms-adapter.yaml")
+    });
+    await expectPendingConnection({
+      QUOTEOPS_TMS_ADAPTER_CONFIG_PATH: malformedAdapterPath
+    });
+    await expectPendingConnection({
+      QUOTEOPS_TMS_ADAPTER_CONFIG_PATH: fileImportAdapterPath,
+      CLIENT_RFQS_PATH: "",
+      CLIENT_QUOTE_WRITEBACKS_PATH: usableWritebackPath
+    });
+    await expectPendingConnection({
+      QUOTEOPS_TMS_ADAPTER_CONFIG_PATH: fileImportAdapterPath,
+      CLIENT_RFQS_PATH: join(dir, "missing-rfqs.csv"),
+      CLIENT_QUOTE_WRITEBACKS_PATH: usableWritebackPath
+    });
+    // A file used as a would-be parent is deterministically unusable on both
+    // root and unprivileged test runs; chmod alone is not reliable for root.
+    await expectPendingConnection({
+      QUOTEOPS_TMS_ADAPTER_CONFIG_PATH: fileImportAdapterPath,
+      CLIENT_RFQS_PATH: usableRfqPath,
+      CLIENT_QUOTE_WRITEBACKS_PATH: join(notADirectoryPath, "quotes.ndjson")
+    });
+    await expectPendingConnection({
+      QUOTEOPS_TMS_ADAPTER_CONFIG_PATH: httpAdapterPath,
+      TMS_HTTP_BASE_URL: "",
+      TMS_HTTP_TOKEN: ""
+    });
+    await expectPendingConnection({
+      QUOTEOPS_TMS_ADAPTER_CONFIG_PATH: httpAdapterPath,
+      TMS_HTTP_BASE_URL: "https://tms.example.test",
+      TMS_HTTP_TOKEN: ""
+    });
+
+    await withEnv(
+      await setupReadyEnv({
+        QUOTEOPS_TMS_ADAPTER_CONFIG_PATH: fileImportAdapterPath,
+        CLIENT_RFQS_PATH: usableRfqPath,
+        CLIENT_QUOTE_WRITEBACKS_PATH: usableWritebackPath
+      }),
+      async () => {
+        const baseUrl = await startApi({
+          defaultManifest: Promise.resolve(workflowInput.manifest)
+        });
+        const response = await fetch(`${baseUrl}/api/setup-state`);
+        const setup = await response.json();
+
+        expect(response.status).toBe(200);
+        expect(setup.required_steps).not.toContain("connect_tms");
+      }
+    );
+  });
+
+  it("requires an exact live receipt for canonical and legacy HTTP readiness", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "quoteops-tms-receipt-readiness-"));
+    tempDirs.push(dir);
+    const adapterPath = join(dir, "tms-adapter.yaml");
+    const receiptPath = join(dir, "tms-probe.json");
+    const revisionPath = join(dir, "tms-credential-revision");
+    const canonicalConfig = [
+      "provider: http",
+      "contract: quoteops-tms-http-v1",
+      "base_url_env: TMS_HTTP_BASE_URL",
+      "headers:",
+      "  authorization: Bearer ${TMS_API_KEY}",
+      "health_endpoint_path: /quoteops/v1/health",
+      "search_historical_quotes_endpoint_path: /quoteops/v1/historical-quotes/search",
+      "get_units_endpoint_path: /quoteops/v1/units",
+      "get_unit_performance_endpoint_path: /quoteops/v1/unit-performance",
+      "get_availability_zones_endpoint_path: /quoteops/v1/availability-zones",
+      "write_quote_endpoint_path: /quoteops/v1/quotes",
+      ""
+    ].join("\n");
+    await writeFile(adapterPath, canonicalConfig);
+    await writeFile(
+      revisionPath,
+      JSON.stringify({ schema_version: 1, credential_revision: 2 })
+    );
+    const env = await setupReadyEnv({
+      QUOTEOPS_TMS_ADAPTER_CONFIG_PATH: adapterPath,
+      QUOTEOPS_TMS_PROBE_PATH: receiptPath,
+      QUOTEOPS_TMS_CREDENTIAL_REVISION_PATH: revisionPath,
+      TMS_HTTP_BASE_URL: "https://tms.client.example",
+      TMS_API_KEY: "configured"
+    });
+
+    const readRequiredSteps = async (): Promise<string[]> => {
+      let requiredSteps: string[] = [];
+      await withEnv(env, async () => {
+        const baseUrl = await startApi({
+          defaultManifest: Promise.resolve(workflowInput.manifest)
+        });
+        const response = await fetch(`${baseUrl}/api/setup-state`);
+        requiredSteps = (await response.json()).required_steps;
+      });
+      clearApplianceTestApps();
+      return requiredSteps;
+    };
+
+    expect(await readRequiredSteps()).toContain("connect_tms");
+    expect(await readRequiredSteps()).not.toContain("map_tms");
+
+    const canonicalHash = createHash("sha256")
+      .update(await readFile(adapterPath))
+      .digest("hex");
+    await writeFile(
+      receiptPath,
+      JSON.stringify({
+        contract: "quoteops-tms-http-v1",
+        adapter_config_sha256: canonicalHash,
+        credential_revision: 2,
+        base_url_origin: "https://tms.client.example",
+        validated_at: "2026-07-29T18:00:00.000Z",
+        checks: {
+          health: "ok",
+          historical_quotes: "ok",
+          units: "ok",
+          unit_performance: "ok",
+          availability_zones: "ok",
+          write_quote_declared: "ok"
+        }
+      })
+    );
+    expect(await readRequiredSteps()).not.toContain("connect_tms");
+    expect(await readRequiredSteps()).not.toContain("map_tms");
+
+    const legacyConfig = canonicalConfig
+      .replace("contract: quoteops-tms-http-v1\n", "")
+      .replace("/quoteops/v1/health", "/health")
+      .replace(
+        "/quoteops/v1/historical-quotes/search",
+        "/historical-quotes/search"
+      )
+      .replace("/quoteops/v1/units", "/units")
+      .replace("/quoteops/v1/unit-performance", "/unit-performance")
+      .replace("/quoteops/v1/availability-zones", "/availability-zones")
+      .replace("/quoteops/v1/quotes", "/quotes");
+    await writeFile(adapterPath, legacyConfig);
+    expect(await readRequiredSteps()).toContain("connect_tms");
+    expect(await readRequiredSteps()).toContain("map_tms");
+
+    await writeFile(
+      receiptPath,
+      JSON.stringify({
+        contract: "legacy-custom-http-canonical-output-v1",
+        adapter_config_sha256: createHash("sha256")
+          .update(await readFile(adapterPath))
+          .digest("hex"),
+        credential_revision: 2,
+        base_url_origin: "https://tms.client.example",
+        validated_at: "2026-07-29T18:00:00.000Z",
+        checks: {
+          health: "ok",
+          historical_quotes: "ok",
+          units: "ok",
+          unit_performance: "ok",
+          availability_zones: "ok",
+          write_quote_configured: "ok"
+        }
+      })
+    );
+    expect(await readRequiredSteps()).not.toContain("connect_tms");
+    expect(await readRequiredSteps()).not.toContain("map_tms");
+  });
+
+  it("does not treat staged knowledge or mailbox env keys as completed receipts", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "quoteops-receipt-gates-"));
+    tempDirs.push(dir);
+    await mkdir(join(dir, "knowledge"), { recursive: true });
+    await writeFile(join(dir, "knowledge", "staged.md"), "# staged only\n");
+
+    await withEnv(
+      await setupReadyEnv({
+        QUOTEOPS_KNOWLEDGE_DIR: join(dir, "knowledge"),
+        QUOTEOPS_KNOWLEDGE_RECEIPT_PATH: join(
+          dir,
+          "missing-knowledge-receipt.json"
+        ),
+        QUOTEOPS_MAILBOX_PROBE_RECEIPT_PATH: join(
+          dir,
+          "missing-mailbox-receipt.json"
+        )
+      }),
+      async () => {
+        const baseUrl = await startApi({
+          defaultManifest: Promise.resolve(workflowInput.manifest)
+        });
+        const response = await fetch(`${baseUrl}/api/setup-state`);
+        const setup = await response.json();
+
+        expect(response.status).toBe(200);
+        expect(setup.required_steps).toContain("connect_knowledge_base");
+        expect(setup.required_steps).toContain("connect_mailbox");
       }
     );
   });
@@ -1138,13 +1789,119 @@ async function startCloudTestServer(
   registrationToken: string,
   data: ControlPlaneData = createInMemoryControlPlaneData()
 ): Promise<string> {
+  if (!(await data.latestRelease())) {
+    await data.upsertRelease(
+      await createApiTestRelease("v1.0.0", "API integration test release")
+    );
+  }
+  installFetchRouter();
+  const baseUrl = `https://quoteops-cloud-${++nextTestAppId}.test`;
   const app = createControlPlaneApi({
     verifyAdminToken: async (token) => (token === TEST_ADMIN_TOKEN ? "ops@e2e.example" : null),
     tokenGenerator: () => registrationToken,
     now: () => new Date("2026-06-25T12:00:00.000Z"),
-    data
+    data,
+    controlPlaneUrl: baseUrl
   });
-  return registerTestApp("cloud", app);
+  testApps.set(baseUrl, app);
+  cloudOrigins.add(baseUrl);
+  return baseUrl;
+}
+
+async function createApiTestRelease(
+  version: string,
+  notes: string
+): Promise<ReleaseRecord> {
+  const digest = (digit: string) => digit.repeat(64);
+  const images = {
+    agent: `quoteops-agent:${version}@sha256:${digest("1")}`,
+    api: `quoteops-api:${version}@sha256:${digest("2")}`,
+    web: `quoteops-web:${version}@sha256:${digest("3")}`,
+    postgres: `postgres:16@sha256:${digest("4")}`,
+    redis: `redis:7@sha256:${digest("5")}`,
+    caddy: `caddy:2@sha256:${digest("6")}`,
+    cloudflared: `cloudflare/cloudflared:2025.7.0@sha256:${digest("7")}`
+  };
+  const releaseEnv = [
+    `QUOTEOPS_VERSION=${version}`,
+    "QUOTEOPS_PLATFORM=linux/amd64",
+    `QUOTEOPS_AGENT_IMAGE=${images.agent}`,
+    `QUOTEOPS_API_IMAGE=${images.api}`,
+    `QUOTEOPS_WEB_IMAGE=${images.web}`,
+    `QUOTEOPS_POSTGRES_IMAGE=${images.postgres}`,
+    `QUOTEOPS_REDIS_IMAGE=${images.redis}`,
+    `QUOTEOPS_CADDY_IMAGE=${images.caddy}`,
+    `QUOTEOPS_CLOUDFLARED_IMAGE=${images.cloudflared}`,
+    ""
+  ].join("\n");
+  const files = {
+    "install.sh": "#!/usr/bin/env bash\nset -euo pipefail\n",
+    "release.env": releaseEnv
+  };
+  const manifest = {
+    schema_version: 1 as const,
+    version,
+    git_sha: "b".repeat(40),
+    platform: "linux/amd64" as const,
+    images,
+    files_sha256: Object.fromEntries(
+      Object.entries(files).map(([name, bytes]) => [name, sha256(bytes)])
+    ),
+    created_at: "2026-06-25T12:00:00.000Z"
+  };
+  const manifestBytes = Buffer.from(
+    `${JSON.stringify(manifest, null, 2)}\n`,
+    "utf8"
+  );
+  const payload = {
+    ...files,
+    "release.json": manifestBytes
+  };
+  const payloadSums =
+    Object.entries(payload)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([name, bytes]) => `${sha256(bytes)}  ${name}`)
+      .join("\n") + "\n";
+  const pack = tar.pack();
+  const archivePromise = collectReadable(pack);
+  for (const [name, bytes] of Object.entries({
+    ...payload,
+    PAYLOAD_SHA256SUMS: payloadSums
+  }).sort(([left], [right]) => left.localeCompare(right))) {
+    await new Promise<void>((resolve, reject) => {
+      pack.entry(
+        {
+          name,
+          mode: name.endsWith(".sh") ? 0o755 : 0o644,
+          uid: 0,
+          gid: 0
+        },
+        bytes,
+        (error) => (error ? reject(error) : resolve())
+      );
+    });
+  }
+  pack.finalize();
+  const archiveBytes = gzipSync(await archivePromise);
+  return {
+    version,
+    notes,
+    bundle_sha256: sha256(archiveBytes),
+    manifest,
+    manifest_bytes: manifestBytes,
+    archive_bytes: archiveBytes,
+    published_at: "2026-06-25T12:00:00.000Z"
+  };
+}
+
+async function collectReadable(stream: Readable): Promise<Buffer> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of stream) chunks.push(Buffer.from(chunk));
+  return Buffer.concat(chunks);
+}
+
+function sha256(value: string | Uint8Array): string {
+  return createHash("sha256").update(value).digest("hex");
 }
 
 function registerTestApp(kind: "appliance" | "cloud", app: TestExpressApp): string {
@@ -1334,6 +2091,46 @@ async function setupReadyEnv(
     readyEnvDir = await mkdtemp(join(tmpdir(), "quoteops-ready-env-"));
     tempDirs.push(readyEnvDir);
     await writeFile(join(readyEnvDir, "tms-adapter.yaml"), "provider: file_import\n");
+    await writeFile(
+      join(readyEnvDir, "agent-config.yaml"),
+      [
+        "model:",
+        "  provider: openrouter",
+        "  model_name: nvidia/nemotron-3-ultra-550b-a55b:free",
+        "  temperature: 0",
+        "  api_key_env: OPENROUTER_API_KEY",
+        "authorization:",
+        "  tools: {}",
+        "mailbox:",
+        "  provider: imap",
+        "  auth: password",
+        "  imap_host: imap.cliente.com",
+        "embeddings:",
+        "  provider: openai_compatible",
+        "  model: text-embedding-3-small",
+        "  api_key_env: QUOTEOPS_EMBEDDING_API_KEY",
+        ""
+      ].join("\n"),
+      "utf8"
+    );
+    await writeFile(
+      join(readyEnvDir, "appliance-secrets-credential.json"),
+      JSON.stringify({ schema_version: 1, credential_revision: 1 })
+    );
+    await writeFile(
+      join(readyEnvDir, "mailbox-probe.json"),
+      JSON.stringify({
+        schema_version: 1,
+        provider: "imap",
+        status: "ok",
+        agent_config_sha256: createHash("sha256")
+          .update(await readFile(join(readyEnvDir, "agent-config.yaml")))
+          .digest("hex"),
+        credential_revision: 1,
+        validated_at: "2026-07-01T00:00:00.000Z",
+        code: "authenticated_read_only"
+      })
+    );
     await mkdir(join(readyEnvDir, "knowledge"), { recursive: true });
     await writeFile(join(readyEnvDir, "knowledge", "criterios.md"), "# criterios\n");
   }
@@ -1349,8 +2146,19 @@ async function setupReadyEnv(
     TMS_API_KEY: "tms-present",
     MAILBOX_USER: "agente@cliente.com",
     MAILBOX_PASSWORD: "mailbox-present",
+    MAILBOX_FROM: "",
+    RESEND_API_KEY: "",
+    QUOTEOPS_AGENT_CONFIG_PATH: join(readyEnvDir, "agent-config.yaml"),
     QUOTEOPS_TMS_ADAPTER_CONFIG_PATH: join(readyEnvDir, "tms-adapter.yaml"),
     QUOTEOPS_KNOWLEDGE_DIR: join(readyEnvDir, "knowledge"),
+    QUOTEOPS_MAILBOX_PROBE_RECEIPT_PATH: join(
+      readyEnvDir,
+      "mailbox-probe.json"
+    ),
+    QUOTEOPS_APPLIANCE_CREDENTIAL_REVISION_PATH: join(
+      readyEnvDir,
+      "appliance-secrets-credential.json"
+    ),
     ...overrides
   };
 }
