@@ -26,7 +26,9 @@ export default defineConfig({
       "packages/**/*.test.ts",
       "apps/**/*.test.ts",
       "apps/**/*.test.tsx",
-      "tests/**/*.test.ts"
+      "tests/**/*.test.ts",
+      "deploy/appliance/tests/**/*.test.ts",
+      "scripts/**/*.test.ts"
     ],
     setupFiles: ["./vitest.setup.ts"]
   }

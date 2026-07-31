@@ -18,6 +18,7 @@
     "dev:web": "npm --workspace @quoteops/web run dev",
     "demo:nmx-control-plane": "bash deploy/control-plane/demo-nmx.sh",
     "package:appliance": "node scripts/package-appliance-release.mjs",
+    "dev:install": "bash scripts/dev-install-quoteops.sh",
     "test": "vitest run",
     "test:watch": "vitest",
     "typecheck": "npm run build:ts"
