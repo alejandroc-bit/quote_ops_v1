@@ -140,9 +140,6 @@ export async function runAdminCli(
 }
 
 function createDatabaseData(env: NodeJS.ProcessEnv): ControlPlaneData {
-  if (!env.QUOTEOPS_SUPABASE_DB_URL?.trim() && !env.DATABASE_URL?.trim()) {
-    throw new Error("DATABASE_URL or QUOTEOPS_SUPABASE_DB_URL is required");
-  }
   return createDefaultControlPlaneData(env);
 }
 

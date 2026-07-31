@@ -209,6 +209,32 @@ describe("unified control-plane data", () => {
     expect(await data.listClients()).toEqual([]);
   });
 
+  it("runs the admin CLI against the file store without Postgres", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "quoteops-admin-file-"));
+    tempDirectories.push(directory);
+    const storePath = join(directory, "store.json");
+    const fileData = createFileControlPlaneData(storePath);
+    await fileData.upsertRelease(createTestRelease());
+    const output: string[] = [];
+    const dependencies = {
+      env: { QUOTEOPS_CONTROL_PLANE_STORE_PATH: storePath },
+      now: () => new Date("2026-07-13T12:00:00.000Z"),
+      tokenGenerator: () => "file-store-token",
+      writeLine: (line: string) => output.push(line)
+    };
+
+    await runAdminCli(
+      ["create-client", "FILECLI", "Razón Social", "ops@cliente.mx"],
+      dependencies
+    );
+    await runAdminCli(["list"], dependencies);
+
+    expect(output).toContain("Created FILECLI | Razón Social | filecli-prod-001");
+    expect(output).toContain(
+      "FILECLI | onboarding | filecli-prod-001 | pending | ops@cliente.mx | Razón Social"
+    );
+  });
+
   it("runs the vendor create-client, list and install-pack workflow", async () => {
     const data = createInMemoryControlPlaneData();
     await data.upsertRelease(createTestRelease());
